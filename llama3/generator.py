@@ -60,6 +60,8 @@ class LLaMA:
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
     ):
+        self.args.max_batch_size = max(self.args.max_batch_size, len(prompts))
+
         if max_gen_len is None:
             max_gen_len = self.args.max_seq_len - 1
 

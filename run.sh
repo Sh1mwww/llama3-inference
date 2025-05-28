@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ---------- 参数设定 ----------
-MODEL_PATH=${1:-"/home/roger/.llama/checkpoints/Llama3.2-1B"}
+MODEL_PATH=${1:-"/home/roger/.llama/checkpoints/Llama3.2-3B"}
 DEVICE=${2:-"cuda"}
 PROMPT_DIR="./prompts"
 MAX_GEN_LEN=${3:-64}

@@ -122,6 +122,12 @@ class SelfAttention(nn.Module):
         k = apply_rotary_embeddings(k, freqs_complex)
 
         # 更新 cache
+        if bsz > self.cache_k.size(0):
+            self.cache_k = torch.zeros(
+            bsz, self.cache_k.size(1), self.cache_k.size(2), self.cache_k.size(3),
+            device=self.cache_k.device, dtype=self.cache_k.dtype
+        )
+        self.cache_v = torch.zeros_like(self.cache_k)
         self.cache_k[:bsz, start_pos : start_pos + seqlen] = k
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = v
 
