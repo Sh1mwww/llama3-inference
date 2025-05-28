@@ -133,9 +133,12 @@ class LLaMA:
             out_text.append(self.tokenizer.decode(row))
 
         # 保存 profiling
-        save_name = (
-            f"{Path(self.args.checkpoints_dir).name}_kv_profile.json"
-        )
+        # save_name = (
+        #     f"{Path(self.args.checkpoints_dir).name}_kv_profile.json"
+        # )
+        save_dir = "/home/roger/jsonfile"
+        os.makedirs(save_dir, exist_ok=True)
+        save_name = os.path.join(save_dir, f"{Path(self.args.checkpoints_dir).name}_kv_profile.json")
         with open(save_name, "w", encoding="utf-8") as f:
             json.dump(kv_profile, f, indent=2)
         print(f"[INFO] KV profile saved → {save_name}")
