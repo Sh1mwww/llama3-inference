@@ -13,7 +13,7 @@ def main():
         "--prompt",
         nargs="+",
         required=True,
-        help="支持一次输入多条 prompt，每条用引号包住",
+        help="支持一次输入多条 prompt,每条用引号包住",
     )
     p.add_argument("--max-gen-len", type=int, default=64)
     args = p.parse_args()
