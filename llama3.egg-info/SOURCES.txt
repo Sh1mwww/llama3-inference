@@ -1,0 +1,12 @@
+README.md
+pyproject.toml
+llama3/__init__.py
+llama3/config.py
+llama3/generator.py
+llama3/layers.py
+llama3/model.py
+llama3.egg-info/PKG-INFO
+llama3.egg-info/SOURCES.txt
+llama3.egg-info/dependency_links.txt
+llama3.egg-info/requires.txt
+llama3.egg-info/top_level.txt
