@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .config import ModelArgs
+from .kv_offload import KVOffloader, BLOCK
 
 
 # ---------- 基础工具 ----------
@@ -77,27 +78,41 @@ class SelfAttention(nn.Module):
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        # KV cache 预分配
-        self.register_buffer(
-            "cache_k",
-            torch.zeros(
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-                device=args.device,
-            ),
+        # # KV cache 预分配
+        # self.register_buffer(
+        #     "cache_k",
+        #     torch.zeros(
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_kv_heads,
+        #         self.head_dim,
+        #         device=args.device,
+        #     ),
+        # )
+        # self.register_buffer(
+        #     "cache_v",
+        #     torch.zeros(
+        #         args.max_batch_size,
+        #         args.max_seq_len,
+        #         self.n_kv_heads,
+        #         self.head_dim,
+        #         device=args.device,
+        #     ),
+        # )
+        
+        
+        # CPU-offload 管理器（每层独立）
+        self.block_sz = BLOCK
+        self.offloader = KVOffloader(
+            layers=args.n_layers, 
+            heads=self.n_kv_heads, 
+            dim=self.head_dim,
+            max_seq=args.max_seq_len, 
+            max_batch=args.max_batch_size,
+            hot_window=32,  # 保留最近 32 块 ≈ 2048 token
+            device=args.device,
         )
-        self.register_buffer(
-            "cache_v",
-            torch.zeros(
-                args.max_batch_size,
-                args.max_seq_len,
-                self.n_kv_heads,
-                self.head_dim,
-                device=args.device,
-            ),
-        )
+        
         self.kv_elapsed_time = -1.0
         self.attn_time = -1.0
 
@@ -121,15 +136,27 @@ class SelfAttention(nn.Module):
         v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
         k = apply_rotary_embeddings(k, freqs_complex)
 
-        # 更新 cache
-        if bsz > self.cache_k.size(0):
-            self.cache_k = torch.zeros(
-            bsz, self.cache_k.size(1), self.cache_k.size(2), self.cache_k.size(3),
-            device=self.cache_k.device, dtype=self.cache_k.dtype
-        )
-        self.cache_v = torch.zeros_like(self.cache_k)
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = k
-        self.cache_v[:bsz, start_pos : start_pos + seqlen] = v
+        # # 更新 cache
+        # if bsz > self.cache_k.size(0):
+        #     self.cache_k = torch.zeros(
+        #     bsz, self.cache_k.size(1), self.cache_k.size(2), self.cache_k.size(3),
+        #     device=self.cache_k.device, dtype=self.cache_k.dtype
+        # )
+        # self.cache_v = torch.zeros_like(self.cache_k)
+        # self.cache_k[:bsz, start_pos : start_pos + seqlen] = k
+        # self.cache_v[:bsz, start_pos : start_pos + seqlen] = v
+        
+        
+        # 按 BLOCK 写入 offloader
+        # ◆ 只支持 seqlen==1(decode 阶段)或 seqlen==block_sz(prefill)
+        k = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+        k = apply_rotary_embeddings(k, freqs_complex)
+
+        blk_idx = start_pos //self.block_sz
+        k_block = k.squeeze(1)   # (H, D)  —— 或 k[0, 0]
+        v_block = v.squeeze(1)
+        self.offloader.push(self.layer_id, blk_idx, k_block, v_block)
 
         if torch.cuda.is_available():
             kv_end.record()
@@ -143,10 +170,24 @@ class SelfAttention(nn.Module):
             torch.cuda.synchronize()
             attn_start.record()
 
-        k_full = self.cache_k[:bsz, : start_pos + seqlen]
-        v_full = self.cache_v[:bsz, : start_pos + seqlen]
-        k_full = repeat_kv(k_full, self.n_rep)
-        v_full = repeat_kv(v_full, self.n_rep)
+        # k_full = self.cache_k[:bsz, : start_pos + seqlen]
+        # v_full = self.cache_v[:bsz, : start_pos + seqlen]
+        # k_full = repeat_kv(k_full, self.n_rep)
+        # v_full = repeat_kv(v_full, self.n_rep)
+        
+                # ----- **On-Demand** 取齐所需块 -----
+                
+        needed = torch.arange(0, start_pos + seqlen,
+                             device=x.device) // self.block_sz
+        k_full, v_full = self.offloader.fetch(self.layer_id, needed)
+
+        k_full = k_full.view(-1, self.n_kv_heads, self.head_dim)  # (Nblk*B,H,D)
+        v_full = v_full.view_as(k_full)
+
+        k_full = repeat_kv(k_full[None, ...], self.n_rep)         # (1,Htot,T,D)
+        v_full = repeat_kv(v_full[None, ...], self.n_rep)
+        
+        
 
         q = q.transpose(1, 2)                    # (B,H,T,D)
         k_full = k_full.transpose(1, 2)
@@ -190,6 +231,7 @@ class EncoderBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.attention = SelfAttention(args)
         self.feed_forward = FeedForward(args)
+        self.attention.layer_id = layer_id    
 
     def forward(
         self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor

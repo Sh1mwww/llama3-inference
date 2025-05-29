@@ -109,23 +109,40 @@ class LLaMA:
                 break
 
             # profiling
+            # kv_re_time = sum(self.model.kv_times)
+            # kv_bytes = sum(
+            #     (layer.attention.cache_k[:, :cur_pos].numel()
+            #      + layer.attention.cache_v[:, :cur_pos].numel())
+            #     * layer.attention.cache_k.element_size()
+            #     for layer in self.model.layers
+            # )
+            # kv_profile.append(
+            #     {
+            #         "token_idx": int(cur_pos),
+            #         "phase": "prefill" if cur_pos < max_prompt else "decode",
+            #         "kv_re_ms": float(kv_re_time),
+            #         "kv_kb": float(kv_bytes / 1024),
+            #         "per_layer_kv_ms": self.model.kv_times.copy(),
+            #     }
+            # )
             kv_re_time = sum(self.model.kv_times)
-            kv_bytes = sum(
-                (layer.attention.cache_k[:, :cur_pos].numel()
-                 + layer.attention.cache_v[:, :cur_pos].numel())
-                * layer.attention.cache_k.element_size()
-                for layer in self.model.layers
+            bytes_per_token = (                
+                2 * self.model.args.n_kv_heads
+                * self.model.args.dim // self.model.args.n_heads
+                * self.model.embed_tokens.weight.element_size()
             )
+            kv_bytes = bytes_per_token * cur_pos * self.model.args.n_layers
             kv_profile.append(
                 {
                     "token_idx": int(cur_pos),
                     "phase": "prefill" if cur_pos < max_prompt else "decode",
                     "kv_re_ms": float(kv_re_time),
                     "kv_kb": float(kv_bytes / 1024),
-                    "per_layer_kv_ms": self.model.kv_times.copy(),
                 }
             )
-
+            
+            
+            
         # ---- 输出整理 ----
         out_tokens, out_text = [], []
         for row in tokens.tolist():
