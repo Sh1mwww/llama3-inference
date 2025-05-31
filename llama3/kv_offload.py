@@ -41,7 +41,12 @@ class KVOffloader:
         ]
 
         # 单独的拷贝 stream
-        self.copy_stream = torch.cuda.Stream(device=device)
+        # self.copy_stream = torch.cuda.Stream(device=device)
+        
+        if device.startswith("cuda"):
+            self.copy_stream = torch.cuda.Stream(device=device)
+        else:
+            self.copy_stream = None
 
     # ---------- 接口 ----------
     def push(self, 
@@ -66,6 +71,10 @@ class KVOffloader:
         保证 needed_blocks 在 GPU; 返回 (k_cat, v_cat)
         needed_blocks: LongTensor[B,T] → 按次序去重转一维
         """
+        if self.copy_stream is None and needed_blocks.device.type == "cuda":
+            self.copy_stream = torch.cuda.Stream(
+                device=needed_blocks.device
+            )
         uniq = needed_blocks.unique().tolist()
         misses = [b for b in uniq if b not in self.hot[layer]]
         if misses:
