@@ -18,11 +18,15 @@ class KVOffloader:
                  max_seq: int, 
                  max_batch: int,
                  hot_window: int, 
-                 device: str):
+                 device: str,
+                 dtype_bytes: int):
         
         self.layers = layers
         self.hot_window = hot_window
         self.device = device
+        self.heads = heads
+        self.dtype_bytes = dtype_bytes
+        self.max_batch = max_batch
         args = ModelArgs
         
         max_batch = args.max_batch_size

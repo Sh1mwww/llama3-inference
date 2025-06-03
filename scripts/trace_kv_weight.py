@@ -1,123 +1,97 @@
 #!/usr/bin/env python
 """
-trace_kv_weight.py  ─  Chrome‑trace + CSV profiler for LLaMA‑3 runtime
-====================================================================
-Captures **four**类事件，并追加 I/O 字节与持续时间：
-    ▸ WEIGHT_UPLOAD_Lx          权重 `.to(cuda)`
-    ▸ KV_PUSH_Lx_Bb             KV‑cache GPU→CPU (push)
-    ▸ KV_FETCH_Lx_Bb            KV‑cache CPU→GPU (prefetch)
-    ▸ MHA_Lx  /  FFN_Lx         计算（Self‑Attention & FeedForward）
-
-输出文件：
-    • trace.json          —— Chrome://tracing 可视化时序
-    • trace_summary.csv   —— event,cat,bytes,dur_us  汇总表
-
-用法：
-    python scripts/trace_kv_weight.py \
-        --model-path /path/to/Llama3.2-3B \
-        --prompt "Why is the sky blue?" \
-        --max-gen-len 64 \
-        --device cuda
+trace_kv_weight.py  —  Chrome-trace + CSV profiler  (fixed v1.2)
+---------------------------------------------------------------
+✓ 权重上传：真实 bytes + 时间
+✓ KV push / fetch：按 dim_head 计算 bytes
+✓ MHA / FFN 计算：记录持续时间
+输出：
+    • trace.json           —  Chrome://tracing
+    • trace_summary.csv    —  event,cat,bytes,dur_us
 """
-import argparse, json, os, csv, time, functools, pathlib
-import torch
+import os, json, csv, time, argparse, functools, torch
 from llama3.generator import LLaMA
 from llama3.kv_offload import KVOffloader
 
-# ---------- Chrome trace容器 ----------
-trace_events = []
+# ========== Trace containers ==========
+trace, csv_rows = [], []
 
-def emit(ev_name, cat, start_host_ns, dur_us, bytes_=0):
-    trace_events.append({
+def emit(name, cat, start_ns, dur_us, bytes_=0):
+    trace.append({
         "ph": "X",
-        "name": ev_name,
+        "name": name,
         "cat": cat,
-        "ts": start_host_ns / 1000,   # ns → µs
+        "ts" : start_ns / 1_000,    # µs
         "dur": dur_us,
         "pid": os.getpid(),
         "args": {"bytes": bytes_, "us": dur_us}
     })
-    csv_writer.writerow([ev_name, cat, bytes_, f"{dur_us:.1f}"])
+    csv_rows.append([name, cat, bytes_, f"{dur_us:.1f}"])
 
-# ---------- Weight upload wrapper ----------
+# ---------- 权重上传包装 ----------
+def wrap_to_cuda(module, tag):
+    orig_to = module.to
+    bytes_  = sum(p.numel()*p.element_size() for p in module.parameters())
 
-def wrap_weight_upload(param_module, tag: str):
-    """Wrap `.to()` so第一次上传GPU时计时."""
-    orig_to = param_module.to
-    bytes_ = sum(p.numel()*p.element_size() for p in param_module.parameters(recurse=False))
-    @functools.wraps(orig_to)
-    def patched_to(*args, **kw):
-        if all(p.is_cuda for p in param_module.parameters(recurse=False)):
-            return orig_to(*args, **kw)
-        t0 = time.perf_counter_ns()        # ★ host 起点(ns)
-        start, end = torch.cuda.Event(True), torch.cuda.Event(True)
-        start.record()
-        out = orig_to(*a, **kw)
-        end.record(); torch.cuda.synchronize()
-        dur_us = start.elapsed_time(end) * 1000
-        emit(f"WEIGHT_UPLOAD_{tag}", "weight", t0, dur_us, bytes_)
-        return out
-    param_module.to = patched_to
-
-# ---------- KV push / fetch wrappers ----------
-orig_push  = KVOffloader.push
-orig_fetch = KVOffloader.fetch
-
-def kv_wrapper(orig_fn, tag_push: str, tag_fetch: str):
-    @functools.wraps(orig_fn)
-    def inner(self, layer_id, blocks, *a, **kw):
-        # blocks:  int     for push
-        #          tensor  for fetch
-        s = torch.cuda.Event(True); s.record()
+    def _to(*a, **kw):
+        device = a[1] if len(a) > 1 else kw.get("device", None)
+        if device is None or module.weight.is_cuda:
+            return orig_to(*a, **kw)          # 已在 GPU 或仅 dtype 转换
         host_ns = time.perf_counter_ns()
-
-        out = orig_fn(self, layer_id, blocks, *a, **kw)
-
-        e = torch.cuda.Event(True); e.record()
-        torch.cuda.current_stream().synchronize()
-        dur_us = s.elapsed_time(e) * 1000
-
-        if isinstance(blocks, torch.Tensor):         # --- fetch ---
-            uniq = blocks.unique().tolist()
-            for b in uniq:
-                k, v = self.hot[layer_id][b]          # 已在 hot
-                bytes_ = (k.numel()+v.numel()) * k.element_size()
-                emit(tag_fetch.format(layer_id, b), "kv",
-                     host_ns, dur_us/len(uniq), bytes_)
-        else:                                        # --- push ---
-            k, v = a[0], a[1]                        # push(k,v,...)
-            bytes_ = (k.numel()+v.numel()) * k.element_size()
-            emit(tag_push.format(layer_id, blocks), "kv",
-                 host_ns, dur_us, bytes_)
-        return out
-    return inner
-
-KVOffloader.push  = kv_wrapper(KVOffloader.push ,
-                               "KV_PUSH_L{}_B{}",
-                               "KV_FETCH_L{}_B{}")  # second tag unused here
-KVOffloader.fetch = kv_wrapper(KVOffloader.fetch,
-                               "KV_PUSH_L{}_B{}",   # unused
-                               "KV_FETCH_L{}_B{}")
-
-# ---------- Compute wrappers ----------
-
-def make_compute_wrapper(name: str, layer_id: int, orig_forward):
-    @functools.wraps(orig_forward)
-    def _wrapper(*a, **kw):
-        t0 = time.perf_counter_ns()
         s, e = torch.cuda.Event(True), torch.cuda.Event(True)
         s.record()
-        out = orig_forward(*a, **kw)
-        e.record(); torch.cuda.current_stream().synchronize()
-        dur_us = s.elapsed_time(e) * 1000
-        emit(f"{name}_L{layer_id}", "compute", t0, dur_us)
+        out = orig_to(*a, **kw)               # 真正搬运
+        e.record(); torch.cuda.synchronize()
+        emit(f"WEIGHT_UPLOAD_{tag}", "weight",
+             host_ns, s.elapsed_time(e)*1000, bytes_)
+        return out
+    module.to = _to
+
+# ---------- KV push / fetch 包装 ----------
+orig_push,  orig_fetch = KVOffloader.push, KVOffloader.fetch
+
+def push_wrapper(self, layer, blk, k, v):
+    host_ns = time.perf_counter_ns()
+    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+    s.record()
+    out = orig_push(self, layer, blk, k, v)
+    e.record(); torch.cuda.current_stream().synchronize()
+    dur_us = s.elapsed_time(e)*1000
+    bytes_ = (k.numel()+v.numel())*k.element_size()
+    emit(f"KV_PUSH_L{layer}_B{blk}", "kv", host_ns, dur_us, bytes_)
+    return out
+
+def fetch_wrapper(self, layer, blocks):
+    host_ns = time.perf_counter_ns()
+    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+    s.record()
+    out = orig_fetch(self, layer, blocks)
+    e.record(); torch.cuda.current_stream().synchronize()
+    dur_us = s.elapsed_time(e)*1000
+    uniq = blocks.unique().tolist()
+    per = dur_us/len(uniq)
+    for b in uniq:
+        k, v = self.hot[layer][b]
+        bytes_ = (k.numel()+v.numel())*k.element_size()
+        emit(f"KV_FETCH_L{layer}_B{b}", "kv", host_ns, per, bytes_)
+    return out
+
+KVOffloader.push  = push_wrapper
+KVOffloader.fetch = fetch_wrapper
+
+# ---------- MHA / FFN 计算包装 ----------
+def make_comp(tag, idx, fwd):
+    @functools.wraps(fwd)
+    def _wrapper(*a, **kw):
+        host_ns = time.perf_counter_ns()
+        s,e = torch.cuda.Event(True), torch.cuda.Event(True)
+        s.record(); out = fwd(*a, **kw); e.record(); torch.cuda.synchronize()
+        emit(f"{tag}_L{idx}", "compute", host_ns, s.elapsed_time(e)*1000)
         return out
     return _wrapper
 
-# ---------- Main ----------
-
+# ---------------- Main -----------------
 def main():
-    global csv_writer
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", required=True)
     ap.add_argument("--device", default="cuda")
@@ -125,42 +99,45 @@ def main():
     ap.add_argument("--max-gen-len", type=int, default=64)
     args = ap.parse_args()
 
-    # ---------------- Load model on CPU ----------------
     llama = LLaMA.build(args.model_path, load_model=True, device="cpu")
 
-    # 给所有 Linear/Embedding 包 weight-upload 计时
-    for n, m in llama.model.named_modules():
-        if isinstance(m, (torch.nn.Linear, torch.nn.Embedding)):
-            tag = n.replace(".", "_")
-            wrap_weight_upload(m, tag)
+    # ---- 对齐 dim_head → KVOffloader ----
+    dim_head = llama.args.dim // llama.args.n_heads
+    for blk in llama.model.layers:
+        off = blk.attention.offloader
+        off.dim         = dim_head
+        off.dtype_bytes = 2                          # fp16
+        off.max_batch   = llama.args.max_batch_size
 
-    # ---------------- Move to CUDA & update offloader device ----------------
+    # ---- wrap weight modules ----
+    for name, mod in llama.model.named_modules():
+        if isinstance(mod, (torch.nn.Linear, torch.nn.Embedding)):
+            wrap_to_cuda(mod, name)
+
+    # ---- wrap compute ----
+    for idx, blk in enumerate(llama.model.layers):
+        blk.attention.forward    = make_comp("MHA", idx, blk.attention.forward)
+        blk.feed_forward.forward = make_comp("FFN", idx, blk.feed_forward.forward)
+
+    # ---- 迁移模型到 GPU（触发权重上传） ----
     llama.model.to(args.device)
     llama.args.device = args.device
-    for ly, blk in enumerate(llama.model.layers):
+    
+    for blk in llama.model.layers:
         off = blk.attention.offloader
         off.device = args.device
-        if off.copy_stream is None:
+        if off.copy_stream is None and args.device.startswith("cuda"):
             off.copy_stream = torch.cuda.Stream(device=args.device)
+            
+    # ---- 生成一次以触发 KV 推/取 & 计算 ----
+    _ = llama.text_completion([args.prompt], max_gen_len=args.max_gen_len)
 
-    # ---------------- Wrap compute fwd ----------------
-    for idx, blk in enumerate(llama.model.layers):
-        blk.attention.forward    = make_compute_wrapper("MHA", idx, blk.attention.forward)
-        blk.feed_forward.forward = make_compute_wrapper("FFN", idx, blk.feed_forward.forward)
-
-    # ---------------- Run one generation ----------------
-    prompts = [args.prompt]
-    csv_path = "trace_summary.csv"
-    with open(csv_path, "w", newline="") as fcsv:
-        csv_writer = csv.writer(fcsv)
-        csv_writer.writerow(["event", "cat", "bytes", "dur_us"])
-        _ = llama.text_completion(prompts, max_gen_len=args.max_gen_len)
-
-    # ---------------- Dump trace ----------------
+    # ---- 输出 ----
     with open("trace.json", "w") as f:
-        json.dump(trace_events, f)
-    print("[TRACE] trace.json")
-    print(f"[CSV  ] {csv_path}")
+        json.dump(trace, f)
+    with open("trace_summary.csv", "w", newline="") as f:
+        csv.writer(f).writerows([["event","cat","bytes","dur_us"], *csv_rows])
+    print("=> trace.json & trace_summary.csv 已生成")
 
 if __name__ == "__main__":
     main()
