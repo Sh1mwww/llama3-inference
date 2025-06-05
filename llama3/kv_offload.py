@@ -8,7 +8,7 @@ from typing import Tuple, Dict, List
 from .config import ModelArgs
 import torch
 
-BLOCK = 64                   # token/块；与 vllm block table 一致
+BLOCK = 64                 
 
 class KVOffloader:
     def __init__(self, 
@@ -39,12 +39,11 @@ class KVOffloader:
                     for _ in range(layers)]
         self.v_cpu = [t.clone() for t in self.k_cpu]
         
-        # record which blocks are hot(GPU)；列表比位图快许多
+        # record which blocks are hot(GPU)
         self.hot: List[Dict[int, Tuple[torch.Tensor, torch.Tensor]]] = [
             {} for _ in range(layers)
         ]
 
-        # 单独的拷贝 stream
         # self.copy_stream = torch.cuda.Stream(device=device)
         
         if device.startswith("cuda"):
@@ -52,22 +51,24 @@ class KVOffloader:
         else:
             self.copy_stream = None
 
-    # ---------- 接口 ----------
+    # ---------- API ----------
     def push(self, 
              layer: int, 
              block_idx: int,
              k: torch.Tensor, 
              v: torch.Tensor):
-        """把新写入的 KV (B=1,H,D) 写入 GPU & CPU"""
+        """
+        把新写入的 KV (B=1,H,D) 写入 GPU & CPU
+        """
         self.k_cpu[layer][block_idx, :k.size(0)].copy_(k, non_blocking=True)
         self.v_cpu[layer][block_idx, :v.size(0)].copy_(v, non_blocking=True)
         self.hot[layer][block_idx] = (k.to(self.device, non_blocking=True),
                                     v.to(self.device, non_blocking=True))
 
-        # 冷却旧块
+        # Cold BLOCK 
         if len(self.hot[layer]) > self.hot_window:
             cold_block_idx = next(iter(self.hot[layer]))
-            self.hot[layer].pop(cold_block_idx)       # 释放 GPU
+            self.hot[layer].pop(cold_block_idx)      
 
     def fetch(self, layer: int, needed_blocks: torch.Tensor
               ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -89,8 +90,10 @@ class KVOffloader:
                     self.hot[layer][b] = (k, v)
         torch.cuda.current_stream().wait_stream(self.copy_stream)
 
-        # 拼接 (∑blocks, H, D) → 在调用方再 reshape
-        k_cat = torch.cat([self.hot[layer][b][0] for b in uniq], dim=1)  # cat on T
+        """
+        拼接 (∑blocks, H, D) → 在调用方再 reshape
+        """
+        k_cat = torch.cat([self.hot[layer][b][0] for b in uniq], dim=1) 
 
         v_cat = torch.cat([self.hot[layer][b][1] for b in uniq], dim=1)
         return k_cat, v_cat
