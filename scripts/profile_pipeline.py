@@ -53,7 +53,7 @@ def sizeof_fmt(num):
 def param_bytes(model):
     return sum(p.numel() * p.element_size() for p in model.parameters())
 
-# ---------- monkey-patch KVOffloader ----------
+# ---------- KVOffloader ----------
 import llama3.kv_offload as kvmod
 if not hasattr(kvmod, "_patched"):
     orig_push, orig_fetch = kvmod.KVOffloader.push, kvmod.KVOffloader.fetch
@@ -112,7 +112,7 @@ def main():
     llama.args.device = args.device 
     for layer in llama.model.layers:
         off = layer.attention.offloader
-        off.device = args.device              # 让 push()/fetch() 用 GPU
+        off.device = args.device              
         off.copy_stream = torch.cuda.Stream(device=args.device)
 
     # ----- run inference (prefill + decode) -----
