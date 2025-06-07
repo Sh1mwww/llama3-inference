@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# ---------------------------------------------
-# run_trace.sh  —  trace Llama-3 推理并产出 trace.json / trace_summary.csv
+# ------------------------------------------------
+# run_trace.sh v2
+# ⌁ 把 trace.json & trace_summary.csv 统一搬到 /home/roger/jsonfile
 #
 # 用法:
 #   ./run_trace.sh [prompt_or_file] [max_len] [model_dir] [cuda_id]
-#
-# 例:
-#   ./run_trace.sh "Why is the sky blue?" 128
-#   ./run_trace.sh prompts/chat.txt 64 /data/llama3/3B 0
-# ---------------------------------------------
+# ------------------------------------------------
 
 # ---------- 参数 ----------
 PROMPT_OR_FILE=${1:-"Hello, world!"}
@@ -26,11 +23,18 @@ fi
 # ---------- 环境 ----------
 export CUDA_VISIBLE_DEVICES=$CUDA_ID
 
-# ---------- 运行 ----------
+# ---------- 跑 trace ----------
 python scripts/trace_kv_weight.py \
   --model-path "$MODEL_DIR" \
   --device cuda \
   --prompt "$PROMPT" \
   --max-gen-len "$MAX_LEN"
 
-echo -e "\n✅ trace 完成：trace.json · trace_summary.csv 已在当前目录"
+# ---------- 归档到目标文件夹 ----------
+OUTDIR="/home/roger/jsonfile"
+mkdir -p "$OUTDIR"
+
+mv trace.json "$OUTDIR"/trace.json
+mv trace_summary.csv "$OUTDIR"/trace_summary.csv
+
+echo -e "✅ trace 完成，文件已移动到 $OUTDIR"
