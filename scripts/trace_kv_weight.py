@@ -18,7 +18,7 @@ from llama3.kv_offload import KVOffloader
 
 # ---------- trace buffers ----------
 trace, csv_rows = [], []
-kv_fetch_counter = 0               # ★ 新增计数器
+kv_fetch_counter = 0            
 
 def emit(name, cat, start_ns, dur_us, bytes_=0):
     trace.append({

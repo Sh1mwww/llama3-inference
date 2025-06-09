@@ -18,9 +18,13 @@ for tokens_per_block in tokens_per_block_list:
     src = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
     dst = torch.empty_like(src, device="cuda")
 
+    """
+    warm up
+    """
     for _ in range(2):
         dst.copy_(src, non_blocking=True)
     torch.cuda.synchronize()
+
 
     times_us = []
     for _ in range(repeat):

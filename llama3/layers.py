@@ -104,14 +104,13 @@ class SelfAttention(nn.Module):
         # CPU-offload 管理器（每层独立）
         self.block_sz = BLOCK
         self.offloader = KVOffloader(
-            layers=args.n_layers, 
-            heads=self.n_kv_heads, 
-            dim=self.head_dim,
-            max_seq=args.max_seq_len, 
-            max_batch=args.max_batch_size,
-            hot_window=32,  # 保留最近 32 块 ≈ 2048 token
-            device=args.device,
-            dtype_bytes=self.wq.weight.element_size()
+                layers=args.n_layers,
+                heads=self.n_kv_heads,
+                dim=self.head_dim,
+                max_seq=args.max_seq_len,
+                max_batch=args.max_batch_size,
+                device=args.device,
+                dtype_bytes=self.wq.weight.element_size(),
         )
         
         self.kv_elapsed_time = -1.0
