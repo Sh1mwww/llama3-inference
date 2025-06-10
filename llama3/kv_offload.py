@@ -81,8 +81,8 @@ class KVOffloader:
             if self.copy_stream:
                 with torch.cuda.stream(self.copy_stream):
                     for b in misses:
-                        k = self.k_cpu[layer, b, :1].to(self.device, non_blocking=True)
-                        v = self.v_cpu[layer, b, :1].to(self.device, non_blocking=True)
+                        k = self.k_cpu[layer][b][:1].to(self.device, non_blocking=True)
+                        v = self.v_cpu[layer][b][:1].to(self.device, non_blocking=True)
                         self.hot[(layer, b)] = (k, v)
             torch.cuda.current_stream().wait_stream(self.copy_stream)     
               
