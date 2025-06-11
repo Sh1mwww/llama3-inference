@@ -21,6 +21,7 @@ class ModelArgs:
     max_batch_size: int = 512
     max_seq_len: int = 2048
     device: str = "cuda"
+    window_blk: int = 8
 
     @staticmethod
     def from_json(params_path: str,

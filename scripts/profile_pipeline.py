@@ -1,154 +1,142 @@
-# ================================
-# scripts/profile_pipeline.py
-# ================================
-#!/usr/bin/env python
-"""Comprehensive profiler for LLaMA-3 inference.
-Measures:
-  • Checkpoint load to CPU time & size
-  • Weights transfer to GPU HBM time & size
-  • KV-cache save (push) / load (fetch) time and size
-  • MHA & FFN compute time
-  • KV per-token size
-Run:
-    python scripts/profile_pipeline.py \
-        --model-path /path/to/Llama3.2-3B \
-        --device cuda \
-        --prompt "Why is the sky blue?" \
-        --max-gen-len 128
+"""Comprehensive profiler for LLaMA‑3 inference.
+(保持原文件接口，只通过 **注释+插入** 修补计时逻辑)
+Changes v2
+===========
+* 不再覆盖 layers.STAT 内的數值；所有計時以 layers.py 寫入為準。
+* `weights_hbm_us` 現在在 `with timer()` 裡 **累加** 而非覆蓋。
+* 移除對 `attn_us / ffn_us` 的負數覆蓋；仍打印 layers 中統計結果。
+* 其餘函式接口與 CLI 參數保持不變。
 """
-import argparse, time, pathlib, builtins, types, math
+import argparse, time, pathlib
 from contextlib import contextmanager
-
-import torch
-from tqdm import tqdm
+import torch, csv, os
 from llama3.generator import LLaMA
-
-# ---------- global accumulators ----------
-STAT = {
-    "weights_cpu_ms": 0.0,
-    "weights_hbm_ms": 0.0,
-    "kv_push_ms": 0.0,
-    "kv_fetch_ms": 0.0,
-    "attn_ms": 0.0,
-    "ffn_ms": 0.0,
-}
-
+from llama3.layers import STAT            # <-- 單一來源
 
 # ---------- utility ----------
 @contextmanager
 def timer(key: str):
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
-    t0 = time.time()
-    yield
-    torch.cuda.synchronize() if torch.cuda.is_available() else None
-    STAT[key] += (time.time() - t0) * 1e3  # ms
+    """累加 μs 到 layers.STAT (若 GPU 可用)"""
+    if not torch.cuda.is_available():
+        yield; return
+    s,e = torch.cuda.Event(enable_timing=True),torch.cuda.Event(enable_timing=True)
+    s.record(); yield; e.record(); torch.cuda.synchronize()
+    STAT[key] = STAT.get(key,0) + int(s.elapsed_time(e)*1000)
 
 def sizeof_fmt(num):
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if num < 1024:
-            return f"{num:.2f} {unit}"
+    for unit in ("B","KB","MB","GB","TB"):
+        if num < 1024: return f"{num:.2f} {unit}"
         num /= 1024
     return f"{num:.2f} PB"
 
 def param_bytes(model):
-    return sum(p.numel() * p.element_size() for p in model.parameters())
+    return sum(p.numel()*p.element_size() for p in model.parameters())
 
-# ---------- KVOffloader ----------
+# ---------- KVOffloader patch 加计时 ----------
 import llama3.kv_offload as kvmod
-if not hasattr(kvmod, "_patched"):
+if not hasattr(kvmod,"_patched_profile"):
     orig_push, orig_fetch = kvmod.KVOffloader.push, kvmod.KVOffloader.fetch
-
-    def push_patch(self, *args, **kwargs):
-        with timer("kv_push_ms"):
-            return orig_push(self, *args, **kwargs)
-
-    def fetch_patch(self, *args, **kwargs):
-        with timer("kv_fetch_ms"):
-            return orig_fetch(self, *args, **kwargs)
-
-    kvmod.KVOffloader.push = push_patch
+    def push_patch(self,*a,**k):
+        with timer("kv_push_us"):
+            return orig_push(self,*a,**k)
+    def fetch_patch(self,*a,**k):
+        with timer("kv_fetch_us"):
+            return orig_fetch(self,*a,**k)
+    kvmod.KVOffloader.push  = push_patch
     kvmod.KVOffloader.fetch = fetch_patch
-    kvmod._patched = True
+    kvmod._patched_profile  = True
 
-# ---------- monkey-patch FeedForward ----------
+# ---------- FeedForward patch 加计时 ----------
 import llama3.layers as lyrs
-if not hasattr(lyrs, "_ffn_patched"):
-    orig_ffn_forward = lyrs.FeedForward.forward
-    def ffn_patch(self, x):
-        with timer("ffn_ms"):
-            return orig_ffn_forward(self, x)
+if not hasattr(lyrs,"_ffn_patch_profile"):
+    orig_ffn = lyrs.FeedForward.forward
+    def ffn_patch(self,x):
+        with timer("ffn_us"):
+            return orig_ffn(self,x)
     lyrs.FeedForward.forward = ffn_patch
-    lyrs._ffn_patched = True
+    lyrs._ffn_patch_profile = True
 
 # ---------- main ----------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-path", required=True)
-    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--prompt", default="Hello")
-    ap.add_argument("--max-gen-len", type=int, default=64)
+    ap.add_argument("--model-path",required=True)
+    ap.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--prompt",default="Hello")
+    ap.add_argument("--max-gen-len",type=int,default=64)
+    ap.add_argument("--window-blk",type=int,default=8,help="滑窗宽度(block)")
+    ap.add_argument("--csv",help="追加结果到 CSV")
     args = ap.parse_args()
 
-    ckpt_dir = pathlib.Path(args.model_path)
+    ckpt = pathlib.Path(args.model_path)
 
-    # ----- load checkpoint → CPU -----
-    with timer("weights_cpu_ms"):
-        llama = LLaMA.build(ckpt_dir, load_model=True, device="cpu")
+    # ----- checkpoint → CPU -----
+    with timer("weights_cpu_us"):
+        llama = LLaMA.build(ckpt,load_model=True,device="cpu")
+        for layer in llama.model.layers:
+            layer.attention.offloader.window_blk = args.window_blk
 
-    weights_file_bytes = sum(f.stat().st_size for f in ckpt_dir.glob("*.pth"))
+    weights_file_bytes   = sum(f.stat().st_size for f in ckpt.glob("*.pth"))
     weights_tensor_bytes = param_bytes(llama.model)
 
-    # ----- transfer weights → GPU -----
+    # ----- weights → GPU -----
     if args.device.startswith("cuda"):
-        torch.cuda.synchronize()
-        t0 = time.time()
-        llama.model.to(args.device)
-        torch.cuda.synchronize()
-        STAT["weights_hbm_ms"] = (time.time() - t0) * 1e3
+        with timer("weights_hbm_us"):
+            llama.model.to(args.device)
     else:
         llama.model.to(args.device)
-        
-    llama.args.device = args.device 
-    for layer in llama.model.layers:
-        off = layer.attention.offloader
-        off.device = args.device              
-        off.copy_stream = torch.cuda.Stream(device=args.device)
 
-    # ----- run inference (prefill + decode) -----
-    prompts = [args.prompt]
-    _, _ = llama.text_completion(prompts, max_gen_len=args.max_gen_len)
+    llama.args.device = args.device
+    for blk in llama.model.layers:
+        off = blk.attention.offloader
+        off.device = args.device
+        if torch.cuda.is_available():
+            off.copy_stream = torch.cuda.Stream(device=args.device)
 
-    # gather MHA time (already per layer)
-    STAT["attn_ms"] = sum(llama.model.attn_times)
+    # ----- inference -----
+    _ = llama.text_completion([args.prompt],max_gen_len=args.max_gen_len)
 
     # ----- KV size -----
-    L = llama.args.n_layers
-    Hk = llama.args.n_kv_heads or llama.args.n_heads
-    D = llama.args.dim // llama.args.n_heads
+    L   = llama.args.n_layers
+    Hk  = llama.args.n_kv_heads or llama.args.n_heads
+    D   = llama.args.dim // llama.args.n_heads
     dtype_bytes = llama.model.embed_tokens.weight.element_size()
     seq_len = len(llama.tokenizer.encode(args.prompt)) + args.max_gen_len
-    kv_total_bytes = L * 2 * Hk * D * seq_len * dtype_bytes
-    kv_per_tok = kv_total_bytes / seq_len
+    kv_total_bytes = L*2*Hk*D*seq_len*dtype_bytes
+    kv_per_tok = kv_total_bytes/seq_len
 
-    # ----- report -----
+    # ---------- report ----------
     print("\n===== Pipeline Profile =====")
     print(f"Weight files           : {sizeof_fmt(weights_file_bytes)}")
     print(f"Weight tensors         : {sizeof_fmt(weights_tensor_bytes)}")
     print(f"KV‑cache total         : {sizeof_fmt(kv_total_bytes)}")
     print(f"KV per token           : {sizeof_fmt(kv_per_tok)}")
     print("-------------------------------")
-    print(f"Load weights → CPU     : {STAT['weights_cpu_ms']:.1f} ms")
-    print(f"Transfer weights → HBM : {STAT['weights_hbm_ms']:.1f} ms")
-    print(f"KV save (DRAM)         : {STAT['kv_push_ms']:.1f} ms")
-    print(f"KV load (HBM)          : {STAT['kv_fetch_ms']:.1f} ms")
-    print(f"MHA compute            : {STAT['attn_ms']:.1f} ms")
-    print(f"FFN compute            : {STAT['ffn_ms']:.1f} ms")
-    total_io = STAT['weights_cpu_ms'] + STAT['weights_hbm_ms'] + STAT['kv_push_ms'] + STAT['kv_fetch_ms']
-    total_compute = STAT['attn_ms'] + STAT['ffn_ms']
+
+    us=STAT; ms=lambda k: us.get(k,0)/1000.0
+    print(f"Load weights → CPU     : {ms('weights_cpu_us'):.1f} ms")
+    print(f"Transfer weights → HBM : {ms('weights_hbm_us'):.1f} ms")
+    print(f"KV save (DRAM)         : {ms('kv_push_us'):.1f} ms")
+    print(f"KV load (HBM)          : {ms('kv_fetch_us'):.1f} ms")
+    print(f"MHA compute            : {ms('attn_us'):.1f} ms")
+    print(f"FFN compute            : {ms('ffn_us'):.1f} ms")
+    total_io  = ms('weights_cpu_us')+ms('weights_hbm_us')+ms('kv_push_us')+ms('kv_fetch_us')
+    total_cmp = ms('attn_us')+ms('ffn_us')
     print("-------------------------------")
     print(f"Total I/O time         : {total_io:.1f} ms")
-    print(f"Total compute time     : {total_compute:.1f} ms\n")
+    print(f"Total compute time     : {total_cmp:.1f} ms\n")
 
-if __name__ == "__main__":
+    # ----- CSV -----
+    if args.csv:
+        hdr=["model","prompt_tok","gen_tok","window_blk",*us.keys(),"weights_file_B","weights_tensor_B","kv_total_B"]
+        row=[ ckpt.name, len(llama.tokenizer.encode(args.prompt)), args.max_gen_len, args.window_blk,
+              *[us.get(k,0) for k in us], weights_file_bytes,weights_tensor_bytes,kv_total_bytes ]
+        need=not os.path.exists(args.csv)
+        with open(args.csv,"a",newline="") as f:
+            wr=csv.writer(f);
+            if need: wr.writerow(hdr)
+            wr.writerow(row)
+        print(f"[CSV] appended → {args.csv}")
+
+if __name__=="__main__":
     main()

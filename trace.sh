@@ -30,11 +30,11 @@ python scripts/trace_kv_weight.py \
   --prompt "$PROMPT" \
   --max-gen-len "$MAX_LEN"
 
-# ---------- 归档到目标文件夹 ----------
-OUTDIR="/home/roger/jsonfile"
-mkdir -p "$OUTDIR"
+# # ---------- 归档到目标文件夹 ----------
+# OUTDIR="/home/roger/jsonfile"
+# mkdir -p "$OUTDIR"
 
-mv trace.json "$OUTDIR"/trace.json
-mv trace_summary.csv "$OUTDIR"/trace_summary.csv
+# mv trace.json "$OUTDIR"/trace.json
+# mv trace_summary.csv "$OUTDIR"/trace_summary.csv
 
-echo -e "✅ trace 完成，文件已移动到 $OUTDIR"
+# echo -e "✅ trace 完成，文件已移动到 $OUTDIR"

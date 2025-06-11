@@ -60,7 +60,7 @@ def fetch_wrapper(self, layer, blocks):
     uniq=blocks.unique().tolist(); per=dur_us/len(uniq)
     kv_fetch_counter += len(uniq)       # ★ 累加 DRAM fetch 次数
     for b in uniq:
-        k,v=self.hot[layer][b]
+        k,v=self.hot[(layer, b)]
         emit(f"KV_FETCH_L{layer}_B{b}","kv",host_ns,per,(k.numel()+v.numel())*k.element_size())
     return out
 
@@ -120,8 +120,8 @@ def main():
     _=llama.text_completion([args.prompt],max_gen_len=args.max_gen_len)
 
     # ------- dump -------
-    with open("trace.json","w") as f: json.dump(trace,f)
-    with open("trace_summary.csv","w",newline="") as f:
+    with open("/home/roger/jsonfile/trace.json","w") as f: json.dump(trace,f)
+    with open("/home/roger/jsonfile/trace_summary.csv","w",newline="") as f:
         csv.writer(f).writerows([["event","cat","bytes","dur_us"],*csv_rows])
 
     print(f"KV DRAM fetch count: {kv_fetch_counter}")
