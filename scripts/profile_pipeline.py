@@ -7,11 +7,13 @@ Changes v2
 * 移除對 `attn_us / ffn_us` 的負數覆蓋；仍打印 layers 中統計結果。
 * 其餘函式接口與 CLI 參數保持不變。
 """
+import math
 import argparse, time, pathlib
 from contextlib import contextmanager
 import torch, csv, os
 from llama3.generator import LLaMA
-from llama3.layers import STAT            # <-- 單一來源
+from llama3.layers import STAT     
+from llama3.kv_offload import KVOffloader, BLOCK 
 
 # ---------- utility ----------
 @contextmanager
@@ -100,17 +102,32 @@ def main():
     L   = llama.args.n_layers
     Hk  = llama.args.n_kv_heads or llama.args.n_heads
     D   = llama.args.dim // llama.args.n_heads
-    dtype_bytes = llama.model.embed_tokens.weight.element_size()
-    seq_len = len(llama.tokenizer.encode(args.prompt)) + args.max_gen_len
-    kv_total_bytes = L*2*Hk*D*seq_len*dtype_bytes
-    kv_per_tok = kv_total_bytes/seq_len
+    block_sz = BLOCK
+    dtype_bytes = llama.model.layers[0].attention.wk.weight.element_size()
+    prompt_len = len(llama.tokenizer.encode(args.prompt))
+    seq_len    = prompt_len + args.max_gen_len
+    n_blocks   = (seq_len + block_sz - 1) // block_sz
+    window_blk = args.window_blk
+
+    print(f"L={L}, Hk={Hk}, D={D}, dtype_bytes={dtype_bytes}, block_sz={block_sz}, n_blocks={n_blocks}, window_blk={window_blk}, seq_len={seq_len}")
+
+    kv_dram_bytes = L * 1 * n_blocks * block_sz * 2 * Hk * D * dtype_bytes
+    kv_hbm_bytes  = L * 1 * window_blk * block_sz * 2 * Hk * D * dtype_bytes
+    kv_push_bytes = L * 1 * 2 * Hk * D * seq_len * dtype_bytes
+    total_tokens = 1 * seq_len
+    kv_bytes_per_token = kv_push_bytes / total_tokens
+    kv_bytes_per_layer_per_token = 2 * Hk * D * dtype_bytes
 
     # ---------- report ----------
     print("\n===== Pipeline Profile =====")
     print(f"Weight files           : {sizeof_fmt(weights_file_bytes)}")
     print(f"Weight tensors         : {sizeof_fmt(weights_tensor_bytes)}")
-    print(f"KV‑cache total         : {sizeof_fmt(kv_total_bytes)}")
-    print(f"KV per token           : {sizeof_fmt(kv_per_tok)}")
+    print(f"Dtype_bytes            : {sizeof_fmt(dtype_bytes)}")
+    print(f"KV-DRAM capacity       : {sizeof_fmt(kv_dram_bytes)}")              # 最大 DRAM 存储
+    print(f"KV-HBM peak            : {sizeof_fmt(kv_hbm_bytes)}")               # GPU HBM 峰值
+    print(f"KV pushed total        : {sizeof_fmt(kv_push_bytes)}")             # 累计 push 字节
+    print(f"KV per token (total)   : {sizeof_fmt(kv_bytes_per_token)}")        # 平均每 token
+    print(f"KV per layer per token : {sizeof_fmt(kv_bytes_per_layer_per_token)}")  # 单层单 token
     print("-------------------------------")
 
     us=STAT; ms=lambda k: us.get(k,0)/1000.0

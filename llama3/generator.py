@@ -23,9 +23,10 @@ class LLaMA:
     def __init__(self, tokenizer, checkpoint, args: ModelArgs):
         self.tokenizer = tokenizer
         self.args = args
-        self.model = Transformer(args).to(args.device)
+        self.model = Transformer(args).to(args.device).half()
         if checkpoint is not None:
             self.model.load_state_dict(checkpoint, strict=False)
+        
 
     # ---------- 构建 ----------
     @staticmethod
@@ -108,23 +109,6 @@ class LLaMA:
             if eos_mask.all():
                 break
 
-            # profiling
-            # kv_re_time = sum(self.model.kv_times)
-            # kv_bytes = sum(
-            #     (layer.attention.cache_k[:, :cur_pos].numel()
-            #      + layer.attention.cache_v[:, :cur_pos].numel())
-            #     * layer.attention.cache_k.element_size()
-            #     for layer in self.model.layers
-            # )
-            # kv_profile.append(
-            #     {
-            #         "token_idx": int(cur_pos),
-            #         "phase": "prefill" if cur_pos < max_prompt else "decode",
-            #         "kv_re_ms": float(kv_re_time),
-            #         "kv_kb": float(kv_bytes / 1024),
-            #         "per_layer_kv_ms": self.model.kv_times.copy(),
-            #     }
-            # )
             kv_re_time = sum(self.model.kv_times)
             bytes_per_token = (                
                 2 * self.model.args.n_kv_heads
