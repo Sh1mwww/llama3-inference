@@ -1,6 +1,4 @@
-# ============================================================
-# FILE: llama3/kv_offload.py — Top‑K (attention‑based) offloader
-# ============================================================
+
 from __future__ import annotations
 from typing import List
 import torch
@@ -8,12 +6,12 @@ import torch
 BLOCK = 64  # tokens / block
 
 class KVOffloader:
-    """Off‑GPU KV cache with attention‑based Top‑K fetch.
+    """Off-GPU KV cache with attention-based Top-K fetch.
 
     * push():  save K/V block to pinned CPU DRAM.
     * fetch(): load a *set* of blocks to GPU HBM.
     * update_importances(): 由 SelfAttention 将每个 block 的注意力得分写入。
-    * topk_blocks():  根据累计得分返回 Top‑K block idx（降序得分→升序 idx）。
+    * topk_blocks()
     """
 
     def __init__(self,
@@ -56,7 +54,7 @@ class KVOffloader:
         self.importance[layer][blk] = max(self.importance[layer][blk], 1e-6)
 
     def fetch(self, layer:int, blocks:torch.Tensor):
-        """Return concat‑K/V of given *unique* block indices (ascending)."""
+        """Return concat-K/V of given *unique* block indices (ascending)."""
         uniq = blocks.unique().tolist()
         k_parts, v_parts = [], []
         stream = self.copy_stream or torch.cuda.current_stream()
@@ -82,7 +80,7 @@ class KVOffloader:
             imp[idx] = momentum * imp[idx] + (1.0 - momentum) * score
 
     def topk_blocks(self, layer:int, k:int):
-        """Return **ascending** indices of Top‑k blocks by importance."""
+        """Return **ascending** indices of Top-k blocks by importance."""
         imp = self.importance[layer]
         ranked = sorted(range(self.n_blocks), key=lambda i: imp[i], reverse=True)
         chosen = [i for i in ranked if imp[i] > 0][:k]

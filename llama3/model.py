@@ -1,9 +1,9 @@
-from typing import List
+from typing import List, Dict, Any   
 
 import torch
 import torch.nn as nn
 
-from .config import ModelArgs
+from .config import ModelArgs,  LayerInfo
 from .layers import (
     RMSNorm,
     EncoderBlock,
@@ -22,9 +22,21 @@ class Transformer(nn.Module):
         self.vocab_size = args.vocab_size
 
         self.embed_tokens = nn.Embedding(args.vocab_size, args.dim)
-        self.layers = nn.ModuleList(
-            [EncoderBlock(args, i) for i in range(args.n_layers)]
-        )
+        # self.layers = nn.ModuleList(
+        #     [EncoderBlock(args, i) for i in range(args.n_layers)]
+        # )
+        
+        self.layers = nn.ModuleList()
+        self.layer_infos: List[Dict[str, Any]] = []
+        for i in range(args.n_layers):
+            blk = EncoderBlock(args, i)
+            self.layers.append(blk)
+            self.layer_infos.append({
+                "layer_id": i,
+                "block": blk,          # 方便从 info 直接拿模块
+                "extra": {}            # 留给后续任意字段
+            })     
+               
         self.norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.output = nn.Linear(args.dim, args.vocab_size, bias=False)
 
@@ -49,10 +61,11 @@ class Transformer(nn.Module):
         h = self.embed_tokens(tokens)            # (B,1,D)
         freqs = self.freqs_complex[start_pos : start_pos + 1].to(h.device)
 
-        for idx, layer in enumerate(self.layers):
-            h = layer(h, start_pos, freqs)
-            self.kv_times[idx] = layer.attention.kv_elapsed_time
-            self.attn_times[idx] = layer.attention.attn_time
+        for idx, info in enumerate(self.layer_infos):
+            blk = info["block"]                  # EncoderBlock
+            h = blk(h, start_pos, freqs)
+            self.kv_times[idx]  = blk.attention.kv_elapsed_time
+            self.attn_times[idx] = blk.attention.attn_time
 
         h = self.norm(h)
         return self.output(h).float()

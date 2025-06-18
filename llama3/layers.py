@@ -1,4 +1,3 @@
-# llama3/layers.py  — async-weights + KV window (保留原逻辑，以注释方式标记)
 # ============================================================
 # 在原版基础上：
 #   • 每层新增 weight_stream,权重按需异步拷贝 GPU
@@ -66,7 +65,7 @@ class SelfAttention(nn.Module):
         self.n_rep      = self.n_heads_q // self.n_kv_heads
         self.head_dim   = args.dim // args.n_heads
 
-        self.topk_blk   = args.window_blk          # 参数重用：含义改为 Top‑K 个 block
+        self.topk_blk   = args.topk_blk         
         self.device     = args.device
         self.is_cuda    = str(self.device).startswith("cuda") and torch.cuda.is_available()
 
@@ -101,6 +100,7 @@ class SelfAttention(nn.Module):
 
     # ---------- forward ----------
     def forward(self, x:torch.Tensor, start_pos:int, freqs_complex:torch.Tensor)->torch.Tensor:
+        # print(f"[INFO] Forwarding Layer ID: {self.layer_id}") 
         bsz, seqlen, _ = x.shape
         self._ensure_weights_cuda()
 
@@ -115,7 +115,7 @@ class SelfAttention(nn.Module):
         blk_idx = start_pos // self.block_sz
         self.offloader.push(self.layer_id, blk_idx, k.squeeze(1), v.squeeze(1))
 
-        # ---- Top‑K fetch ----
+        # ---- Top-K fetch ----
         blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk)
         if blk_idx not in blocks:
             blocks.append(blk_idx)
@@ -190,17 +190,16 @@ class EncoderBlock(nn.Module):
     def __init__(self, args: ModelArgs, layer_id: int):
         super().__init__()
         self.layer_id = layer_id
+        self.n_layer = args.n_layers
         self.attn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.attention = SelfAttention(args)
         self.feed_forward = FeedForward(args)
         self.attention.layer_id = layer_id
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
+        # print(f"[INFO] Forwarding Layer ID: {self.layer_id}") 
         h = x + self.attention(self.attn_norm(x), start_pos, freqs_complex)
-        return h + self.feed_forward(self.ffn_norm(h))
 
-# ============================================================
-# 以上为重写后版本，以下原版关键逻辑已被替换，保留注释便于 diff
-# ============================================================
-### OLD: 原来自 SelfAttention.forward 的 weight.to() 逐行调用等均已合并到 _ensure_weights_cuda
-### OLD: 原 KV cache 相关注释段落保留(见上原 file)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
