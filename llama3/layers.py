@@ -9,7 +9,7 @@ import math
 from typing import Optional, Tuple, List
 import torch, torch.nn as nn, torch.nn.functional as F
 
-from .config import ModelArgs
+from .config import ModelArgs, LayerInfo, KVCacheArgs
 from .kv_offload import KVOffloader, BLOCK
 
 from contextlib import contextmanager
@@ -144,7 +144,7 @@ class SelfAttention(nn.Module):
 
         out = out.transpose(1,2).reshape(bsz, seqlen, -1)
 
-        # ---- 更新 block importance (attention based) ----
+        # ---- Update block importance (attention based) ----
         with torch.no_grad():
             token_imp = scores.mean(dim=(0,1,2))  # (Tkv,)
             block_scores: List[float] = []
@@ -199,7 +199,6 @@ class EncoderBlock(nn.Module):
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
         # print(f"[INFO] Forwarding Layer ID: {self.layer_id}") 
         h = x + self.attention(self.attn_norm(x), start_pos, freqs_complex)
-
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 

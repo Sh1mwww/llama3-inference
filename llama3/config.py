@@ -3,11 +3,21 @@ import torch.nn as nn
 from dataclasses import dataclass, fields, field
 from typing import Optional, List, Dict, Any
 
+
+
 @dataclass
 class LayerInfo:
     layer_id:int
     block: Optional[nn.Module] = None   #encoderblock
     extra: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class KVCacheArgs:
+    
+    ssd_path: str = "/mnt/kv_cache/kv_cache.bin"
+    ssd_size_gb: int = 500
+    dram_limit_gb: float = 64 
 
 
 @dataclass

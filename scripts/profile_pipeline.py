@@ -45,6 +45,14 @@ if not hasattr(kvmod,"_patched_profile"):
     def fetch_patch(self,*a,**k):
         with timer("kv_fetch_us"):
             return orig_fetch(self,*a,**k)
+    orig_spill = kvmod.KVOffloader._spill_to_ssd
+    orig_load  = kvmod.KVOffloader._load_from_ssd
+    def spill_patch(self, *a, **k):
+        with timer("kv_spill_us"):
+            return orig_spill(self, *a, **k)
+    def load_patch(self, *a, **k):
+        with timer("kv_load_ssd_us"):      # DRAM ← SSD
+            return orig_load(self, *a, **k)
     def fetch_split(self, layer: int, blocks):
         """ 返回 (k, v)，并把 copy / wait 时间分别累加到 STAT """
         copy_evt0, copy_evt1 = Event(enable_timing=True), Event(enable_timing=True)
@@ -71,6 +79,8 @@ if not hasattr(kvmod,"_patched_profile"):
         return k, v
     kvmod.KVOffloader.push  = push_patch
     kvmod.KVOffloader.fetch = fetch_split
+    kvmod.KVOffloader._spill_to_ssd  = spill_patch
+    kvmod.KVOffloader._load_from_ssd = load_patch
     kvmod._fetch_splitted = True
     kvmod._patched_profile  = True
 
@@ -160,12 +170,18 @@ def main():
     print(f"Load weights → CPU     : {ms('weights_cpu_us'):.1f} ms")
     print(f"Transfer weights → HBM : {ms('weights_hbm_us'):.1f} ms")
     print(f"KV save (DRAM)         : {ms('kv_push_us'):.1f} ms")
+    print(f"KV spill (DRAM→SSD)    : {ms('kv_spill_us'):.1f} ms") # DRAM → SSD
     print(f"KV copy (HBM)          : {ms('kv_copy_us'):.1f} ms")
     print(f"KV wait                : {ms('kv_wait_us'):.1f} ms")
+    print(f"KV load (SSD→DRAM)     : {ms('kv_load_ssd_us'):.1f} ms")
     print(f"KV load (total)        : {ms('kv_fetch_us'):.1f} ms")
     print(f"MHA compute            : {ms('attn_us'):.1f} ms")
     print(f"FFN compute            : {ms('ffn_us'):.1f} ms")
-    total_io  = ms('weights_cpu_us')+ms('weights_hbm_us')+ms('kv_push_us')+ms('kv_fetch_us')
+    total_io = (
+        ms('weights_cpu_us') + ms('weights_hbm_us') +
+        ms('kv_push_us')     + ms('kv_spill_us') +
+        ms('kv_fetch_us')    + ms('kv_load_ssd_us')
+    )
     total_cmp = ms('attn_us')+ms('ffn_us')
     print("-------------------------------")
     print(f"Total I/O time         : {total_io:.1f} ms")
