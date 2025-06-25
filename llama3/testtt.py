@@ -14,7 +14,7 @@ from contextlib import contextmanager
 import time
 
 from .config import ModelArgs, LayerInfo, KVCacheArgs
-from .kv_offload import KVOffloader, BLOCK
+from .kv_offload import OptimizedKVOffloader, BLOCK
 
 # ---------- Enhanced timing util ----------
 class PerformanceTracker:
@@ -215,8 +215,6 @@ class SelfAttention(nn.Module):
         self.n_heads_q = args.n_heads
         self.n_rep = self.n_heads_q // self.n_kv_heads
         self.head_dim = args.dim // args.n_heads
-        self.kv_elapsed_time = 0.0
-        self.attn_time = 0.0
         
         self.topk_blk = args.topk_blk
         self.device = args.device
@@ -230,7 +228,7 @@ class SelfAttention(nn.Module):
         
         # 使用优化的KV offloader
         self.block_sz = BLOCK
-        self.offloader = KVOffloader(
+        self.offloader = OptimizedKVOffloader(
             layers=args.n_layers,
             heads=self.n_kv_heads,
             dim=self.head_dim,
@@ -247,7 +245,6 @@ class SelfAttention(nn.Module):
         # 预分配缓冲区减少内存分配
         self.qkv_buffer = None
         self.scores_buffer = None
-        
     
     def _get_modules_dict(self):
         """获取模块字典用于权重管理"""
@@ -285,10 +282,6 @@ class SelfAttention(nn.Module):
                 self.scores_buffer = torch.empty(scores_shape, dtype=torch.float16, device=self.device)
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
-        if not self.wq.weight.is_cuda:
-            for mod in (self.wq, self.wk, self.wv, self.wo):
-                mod.to(x.device, non_blocking=True)
-        
         start_time = time.time()
         bsz, seqlen, _ = x.shape
         
@@ -301,8 +294,6 @@ class SelfAttention(nn.Module):
         
         # QKV投影
         with cuda_timer("attn_us", self.layer_id):
-            # assert x.is_cuda, "x 不在 GPU？"
-            # print("wq.weight.device =", self.wq.weight.device)
             q = self.wq(x).view(bsz, seqlen, self.n_heads_q, self.head_dim)
             k = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
             v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
@@ -324,20 +315,8 @@ class SelfAttention(nn.Module):
         
         # 异步获取KV
         with cuda_timer("kv_fetch_us", self.layer_id):
-        #     k_full, v_full = self.offloader.fetch(self.layer_id, needed)
-        
-            fetch_evt_start = torch.cuda.Event(enable_timing=True)
-            fetch_evt_end = torch.cuda.Event(enable_timing=True)
-            fetch_evt_start.record()
             k_full, v_full = self.offloader.fetch(self.layer_id, needed)
-            fetch_evt_end.record()
-            torch.cuda.synchronize()  # 等待异步操作完成
-            self.kv_elapsed_time = fetch_evt_start.elapsed_time(fetch_evt_end) * 1000 # 转换为微秒
-            PERF_TRACKER.add_layer_stat(self.layer_id, "kv_fetch_us", self.kv_elapsed_time)
-            
-
         
-            
         # 形状调整
         if k_full.dim() == 3:
             k_full = k_full.permute(1, 0, 2).unsqueeze(0)
@@ -356,9 +335,6 @@ class SelfAttention(nn.Module):
         
         with cuda_timer("attn_us", self.layer_id):
             # 使用优化的注意力计算
-            attn_evt_start = torch.cuda.Event(enable_timing=True)
-            attn_evt_end = torch.cuda.Event(enable_timing=True)
-            attn_evt_start.record()  
             scores = torch.matmul(q, k_full.transpose(2, 3))
             scores = scores / math.sqrt(self.head_dim)
             
@@ -372,15 +348,8 @@ class SelfAttention(nn.Module):
             # Softmax和输出计算
             attn_weights = torch.softmax(scores, dim=-1)
             out = torch.matmul(attn_weights, v_full)
-            attn_evt_end.record()
-            torch.cuda.synchronize()
-            self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000  # 转换为微秒
-            PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
-        out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
         
-        stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
-        self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
-        self.attn_time       = stats.get("attn_us",     0)
+        out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
         
         # 更新block重要性
         with torch.no_grad():
