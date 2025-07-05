@@ -312,8 +312,9 @@ class SelfAttention(nn.Module):
             k = apply_rotary_embeddings(k, freqs_complex)
         
         # Push当前block到offloader
-        blk_idx = start_pos // self.block_sz
-        self.offloader.push(self.layer_id, blk_idx, k.squeeze(0), v.squeeze(0))
+        blk_idx = start_pos // self.block_sz # 计算出当前token属于哪个块的索引 
+        # squeeze(0)移除batch维度
+        self.offloader.push(self.layer_id, blk_idx, k.squeeze(0), v.squeeze(0)) 
         
         # 获取Top-K blocks
         blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk)
@@ -325,7 +326,6 @@ class SelfAttention(nn.Module):
         # 异步获取KV
         with cuda_timer("kv_fetch_us", self.layer_id):
         #     k_full, v_full = self.offloader.fetch(self.layer_id, needed)
-        
             fetch_evt_start = torch.cuda.Event(enable_timing=True)
             fetch_evt_end = torch.cuda.Event(enable_timing=True)
             fetch_evt_start.record()
@@ -336,8 +336,6 @@ class SelfAttention(nn.Module):
             PERF_TRACKER.add_layer_stat(self.layer_id, "kv_fetch_us", self.kv_elapsed_time)
             
 
-        
-            
         # 形状调整
         if k_full.dim() == 3:
             k_full = k_full.permute(1, 0, 2).unsqueeze(0)
@@ -362,7 +360,7 @@ class SelfAttention(nn.Module):
             scores = torch.matmul(q, k_full.transpose(2, 3))
             scores = scores / math.sqrt(self.head_dim)
             
-            # 应用causal mask（如果需要）
+            # 应用causal mask 
             if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
                 seq_len_q = q.size(2)
                 seq_len_k = k_full.size(2)
@@ -392,7 +390,7 @@ class SelfAttention(nn.Module):
                 score = float(token_imp[s:e].sum().item()) if s < token_imp.size(0) else 0.0
                 block_scores.append(score)
             
-            self.offloader.update_importances(self.layer_id, blocks, block_scores)
+            self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx= blk_idx)
         
         # 输出投影
         result = self.wo(out)

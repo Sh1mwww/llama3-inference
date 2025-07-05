@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Optional, Set, Dict, Tuple
+from typing import List, Optional, Set, Dict, Tuple, Union
 import torch
 import os, mmap, numpy as np, math
 import asyncio
@@ -11,300 +11,320 @@ from .config import KVCacheArgs
 BLOCK = 256  # tokens / block
 
 class KVOffloader:
-    """优化的Off-GPU KV cache，支持异步SSD I/O和智能预取"""
+    """Off-GPU KV cache with attention-based Top-K fetch.
+
+    * push():  save K/V block to pinned CPU DRAM.
+    * fetch(): load a *set* of blocks to GPU HBM.
+    * update_importances(): 由 SelfAttention 将每个 block 的注意力得分写入。
+    * topk_blocks()
+    """
 
     def __init__(self,
-                 layers: int,
-                 heads: int,
-                 dim: int,
-                 max_seq: int,
-                 max_batch: int,
-                 device: str,
-                 dtype_bytes: int):
-        
+                 layers:int,
+                 heads:int,
+                 dim:int,
+                 max_seq:int,
+                 max_batch:int,
+                 device:str,
+                 dtype_bytes:int):
         n_blocks = (max_seq + BLOCK - 1) // BLOCK
         self.k_cpu = [[None for _ in range(n_blocks)] for _ in range(layers)]
         self.v_cpu = [[None for _ in range(n_blocks)] for _ in range(layers)]
-        self.importance = [[0.0 for _ in range(n_blocks)] for _ in range(layers)]
         
-        # 访问统计，用于预取决策
-        self.access_count = [[0 for _ in range(n_blocks)] for _ in range(layers)]
-        self.last_access = [[0 for _ in range(n_blocks)] for _ in range(layers)]
-        self.global_time = 0
+        # 改为三维：[max_batch, layers, n_blocks]
+        self.importance = np.zeros((max_batch, layers, n_blocks), dtype=np.float32)
+        self.access_count = np.zeros((max_batch, layers, n_blocks), dtype=np.int32)
+        self.last_access = np.zeros((max_batch, layers, n_blocks), dtype=np.int32)
+        self.global_time = np.zeros(max_batch, dtype=np.int32)
         
-        self.layers = layers
+        # 全局重要性（用于跨batch分析和驱逐策略）
+        self.global_importance = np.zeros((layers, n_blocks), dtype=np.float32)
+        self.global_access_count = np.zeros((layers, n_blocks), dtype=np.int32)
+        self.global_time_counter = 0
+
         self.device = device
         self.dtype_bytes = dtype_bytes
+        self.copy_stream = (torch.cuda.Stream(device=device)
+                            if device.startswith("cuda") else None)
         self.heads = heads
         self.dim = dim
         self.max_batch = max_batch
+        self.layers = layers
         self.n_blocks = n_blocks
         self.block_nbytes = (max_batch * heads * dim) * dtype_bytes * 2  # K+V
         
-        # CUDA streams for async operations
-        if device.startswith("cuda"):
-            self.copy_stream = torch.cuda.Stream(device=device)
-            self.prefetch_stream = torch.cuda.Stream(device=device)
-        else:
-            self.copy_stream = None
-            self.prefetch_stream = None
-        
-        # SSD backend with optimizations
-        self.ssd = OptimizedSSDBackedKV(
+        self.ssd = SSDBackedKV(
             path=KVCacheArgs.ssd_path,
-            n_layers=layers,
-            blk_bytes=self.block_nbytes,
-            blk_per_layer=n_blocks,
-            max_concurrent_io=getattr(KVCacheArgs, 'max_concurrent_io', 4)
-        )
-        
+            n_layers=layers, blk_bytes=self.block_nbytes,
+            blk_per_layer=n_blocks)
         self.on_ssd = [[False]*n_blocks for _ in range(layers)]
-        self.loading_from_ssd = [[False]*n_blocks for _ in range(layers)]  # 防止重复加载
         self.dram_limit_blk = int(KVCacheArgs.dram_limit_gb * (1024**3) // self.block_nbytes)
-        
-        # LRU cache for DRAM management
-        self.dram_lru = {}  # (layer, block) -> timestamp
-        
-        # Prefetch management
-        self.prefetch_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="kv_prefetch")
-        self.prefetch_queue = Queue(maxsize=16)
-        self.prefetching = set()  # Track blocks being prefetched
-        
-        # Start prefetch worker
-        self._start_prefetch_worker()
 
-    def _start_prefetch_worker(self):
-        """启动预取工作线程"""
-        def prefetch_worker():
-            while True:
-                try:
-                    layer, block = self.prefetch_queue.get(timeout=1.0)
-                    if (layer, block) == (-1, -1):  # shutdown signal
-                        break
-                    self._prefetch_block(layer, block)
-                    self.prefetching.discard((layer, block))
-                except Empty:
-                    continue
-                except Exception as e:
-                    print(f"Prefetch error: {e}")
-        
-        self.prefetch_thread = threading.Thread(target=prefetch_worker, daemon=True)
-        self.prefetch_thread.start()
-
-    def _prefetch_block(self, layer: int, block: int):
-        """预取单个block"""
-        if not self.on_ssd[layer][block] or self.k_cpu[layer][block] is not None:
-            return
-        
-        try:
-            self._load_from_ssd_sync(layer, block)
-        except Exception as e:
-            print(f"Prefetch failed for layer {layer}, block {block}: {e}")
-
-    def _should_prefetch(self, layer: int, block: int) -> bool:
-        """基于访问模式决定是否预取"""
-        if (layer, block) in self.prefetching:
-            return False
-        
-        access_freq = self.access_count[layer][block]
-        recency = self.global_time - self.last_access[layer][block]
-        
-        # 高频访问且最近访问过的block优先预取
-        return access_freq > 2 and recency < 100
-
-    def _trigger_prefetch(self, layer: int, blocks: List[int]):
-        """触发相邻block的预取"""
-        for block in blocks:
-            # 预取前后相邻的blocks
-            candidates = [block - 1, block + 1]
-            for candidate in candidates:
-                if (0 <= candidate < self.n_blocks and 
-                    self.on_ssd[layer][candidate] and
-                    self._should_prefetch(layer, candidate)):
-                    
-                    try:
-                        self.prefetch_queue.put_nowait((layer, candidate))
-                        self.prefetching.add((layer, candidate))
-                    except:
-                        pass  # Queue full, skip
-
-    def _alloc_block(self, layer: int, blk: int, batch_sz: int):
-        """分配block内存，使用内存池避免频繁分配"""
+    # ---------------- internal -----------------
+    def _alloc_block(self, layer:int, blk:int, batch_sz:int):
         if self.k_cpu[layer][blk] is None:
             shape = (batch_sz, self.heads, self.dim)
-            # 使用pin_memory提高传输效率
-            self.k_cpu[layer][blk] = torch.empty(*shape, dtype=torch.float16, pin_memory=True)
+            self.k_cpu[layer][blk] = torch.empty(*shape, dtype=torch.float16,
+                                                 pin_memory=True)
             self.v_cpu[layer][blk] = torch.empty_like(self.k_cpu[layer][blk])
-            
-            # 更新LRU
-            self.dram_lru[(layer, blk)] = self.global_time
 
-    def push(self, layer: int, blk: int, k: torch.Tensor, v: torch.Tensor):
-        """保存K/V block到DRAM，支持批量操作"""
+    # ---------------- public API --------------
+    def push(self, layer:int, blk:int, k:torch.Tensor, v:torch.Tensor, batch_idx:int = 0):
+        """Save K/V of *one* block from HBM → DRAM."""
         self._alloc_block(layer, blk, k.size(0))
+        self.k_cpu[layer][blk][:k.size(0)].copy_(k, non_blocking=True)
+        self.v_cpu[layer][blk][:v.size(0)].copy_(v, non_blocking=True)
         
-        # 异步复制到CPU
-        if self.copy_stream:
-            with torch.cuda.stream(self.copy_stream):
-                self.k_cpu[layer][blk][:k.size(0)].copy_(k, non_blocking=True)
-                self.v_cpu[layer][blk][:v.size(0)].copy_(v, non_blocking=True)
-            # 同步等待完成
-            torch.cuda.current_stream().wait_stream(self.copy_stream)
-        else:
-            self.k_cpu[layer][blk][:k.size(0)].copy_(k)
-            self.v_cpu[layer][blk][:v.size(0)].copy_(v)
+        # 新 block 给一个极小初始权重，防止意外被忽略
+        if batch_idx < self.max_batch:
+            self.importance[batch_idx, layer, blk] = max(self.importance[batch_idx, layer, blk], 1e-6)
+        # 同时更新全局重要性
+        self.global_importance[layer, blk] = max(self.global_importance[layer, blk], 1e-6)
         
-        # 更新重要性和访问统计
-        self.importance[layer][blk] = max(self.importance[layer][blk], 1e-6)
-        self.access_count[layer][blk] += 1
-        self.last_access[layer][blk] = self.global_time
-        self.global_time += 1
-        
-        # 检查是否需要驱逐
         self._maybe_evict()
 
-    def fetch(self, layer: int, blocks: torch.Tensor):
-        """批量获取blocks，支持异步加载和预取"""
-        uniq = blocks.unique().tolist()
-        
-        # 更新访问统计
-        for block in uniq:
-            self.access_count[layer][block] += 1
-            self.last_access[layer][block] = self.global_time
-        self.global_time += 1
-        
-        # 分离需要从SSD加载的blocks
-        need_load = [b for b in uniq if self.on_ssd[layer][b] and not self.loading_from_ssd[layer][b]]
-        
-        # 批量从SSD加载
-        if need_load:
-            self._batch_load_from_ssd(layer, need_load)
-        
-        # 触发预取
-        self._trigger_prefetch(layer, uniq)
-        
-        # 收集K/V tensors
+    def fetch(self, layer:int, blocks:torch.Tensor):
+        """Return concat-K/V of given *unique* block indices (ascending)."""
+
+        uniq = blocks.unique().tolist() 
+        need_load = [b for b in uniq if self.on_ssd[layer][b]]
+        for b in need_load:               # 先把 SSD → DRAM
+            self._load_from_ssd(layer, b)
+            
         k_parts, v_parts = [], []
         stream = self.copy_stream or torch.cuda.current_stream()
-        
         with torch.cuda.stream(stream):
             for blk in uniq:
                 if self.k_cpu[layer][blk] is None:
-                    raise RuntimeError(f"Block {blk} not available (layer {layer})")
-                
-                k_gpu = self.k_cpu[layer][blk].to(self.device, non_blocking=True)
-                v_gpu = self.v_cpu[layer][blk].to(self.device, non_blocking=True)
-                k_parts.append(k_gpu)
-                v_parts.append(v_gpu)
-        
-        if stream != torch.cuda.current_stream():
+                    raise RuntimeError(f"[KVOffloader] block {blk} not pushed (layer {layer})")
+                k_parts.append(self.k_cpu[layer][blk].to(self.device, non_blocking=True))
+                v_parts.append(self.v_cpu[layer][blk].to(self.device, non_blocking=True))
+        if stream is not torch.cuda.current_stream():
             torch.cuda.current_stream().wait_stream(stream)
-        
         return torch.cat(k_parts, dim=0), torch.cat(v_parts, dim=0)
 
-    def _batch_load_from_ssd(self, layer: int, blocks: List[int]):
-        """批量从SSD加载blocks"""
-        if not blocks:
-            return
+    # ------------- attention importance -------------
+    def update_importances(self,
+                           layer:int,
+                           block_indices:List[int],
+                           block_scores:List[float],
+                           batch_idx:Union[int, List[int]] = None,
+                           momentum:float = 0.9):
+        """EMA 累积注意力得分 (momentum 越大越偏向历史)。
         
-        # 标记正在加载，防止重复
-        for block in blocks:
-            self.loading_from_ssd[layer][block] = True
+        Args:
+            layer: 层索引
+            block_indices: block索引列表
+            block_scores: block分数列表
+            batch_idx: batch索引，可以是单个int或int列表，None表示所有batch
+            momentum: 动量系数
+        """
+        if batch_idx is None:
+            # 更新所有batch
+            batch_indices = list(range(self.max_batch))
+        elif isinstance(batch_idx, int):
+            # 单个batch
+            batch_indices = [batch_idx]
+        else:
+            # 多个batch
+            batch_indices = batch_idx
         
-        try:
-            # 使用SSD的批量读取
-            self.ssd.batch_read(layer, blocks, self._on_batch_loaded, layer)
-        except Exception as e:
-            # 失败时清除标记
-            for block in blocks:
-                self.loading_from_ssd[layer][block] = False
-            raise e
-
-    def _on_batch_loaded(self, layer: int, loaded_data: Dict[int, torch.Tensor]):
-        """批量加载完成的回调"""
-        for block, data in loaded_data.items():
-            try:
-                k_gpu, v_gpu = data.split(self.dim, dim=-1)
-                self._alloc_block(layer, block, self.max_batch)
-                self.k_cpu[layer][block].copy_(k_gpu.cpu(), non_blocking=True)
-                self.v_cpu[layer][block].copy_(v_gpu.cpu(), non_blocking=True)
-                self.on_ssd[layer][block] = False
-            finally:
-                self.loading_from_ssd[layer][block] = False
-
-    def _load_from_ssd_sync(self, layer: int, block: int):
-        """同步从SSD加载单个block"""
-        if self.loading_from_ssd[layer][block]:
-            return  # 已在加载中
-        
-        self.loading_from_ssd[layer][block] = True
-        try:
-            shape = (self.max_batch, self.heads, self.dim * 2)
-            buf_gpu = torch.empty(shape, dtype=torch.float16, device=self.device)
-            self.ssd.read(layer, block, buf_gpu)
+        for b_idx in batch_indices:
+            if b_idx >= self.max_batch:
+                continue
+                
+            # 更新batch特定的重要性
+            for idx, score in zip(block_indices, block_scores):
+                if idx < self.n_blocks:
+                    self.importance[b_idx, layer, idx] = (
+                        momentum * self.importance[b_idx, layer, idx] + 
+                        (1.0 - momentum) * score
+                    )
+                    self.access_count[b_idx, layer, idx] += 1
+                    self.last_access[b_idx, layer, idx] = self.global_time[b_idx]
             
-            k_gpu, v_gpu = buf_gpu.split(self.dim, dim=-1)
-            self._alloc_block(layer, block, self.max_batch)
-            self.k_cpu[layer][block].copy_(k_gpu.cpu())
-            self.v_cpu[layer][block].copy_(v_gpu.cpu())
-            self.on_ssd[layer][block] = False
-        finally:
-            self.loading_from_ssd[layer][block] = False
-
-    def update_importances(self, layer: int, block_indices: List[int], 
-                          block_scores: List[float], momentum: float = 0.9):
-        """更新重要性分数"""
-        imp = self.importance[layer]
+            self.global_time[b_idx] += 1
+        
+        # 同时更新全局重要性（用于驱逐策略）
         for idx, score in zip(block_indices, block_scores):
-            imp[idx] = momentum * imp[idx] + (1.0 - momentum) * score
-            # 更新访问统计
-            self.access_count[layer][idx] += 1
-            self.last_access[layer][idx] = self.global_time
-        self.global_time += 1
+            if idx < self.n_blocks:
+                self.global_importance[layer, idx] = (
+                    momentum * self.global_importance[layer, idx] + 
+                    (1.0 - momentum) * score
+                )
+                self.global_access_count[layer, idx] += 1
+        self.global_time_counter += 1
 
-    def topk_blocks(self, layer: int, k: int):
-        """返回Top-k重要blocks"""
-        imp = self.importance[layer]
-        # 结合重要性和访问频率
-        scores = [(imp[i] * (1 + 0.1 * self.access_count[layer][i]), i) 
-                 for i in range(self.n_blocks) if imp[i] > 0]
-        scores.sort(reverse=True)
-        chosen = [i for _, i in scores[:k]]
+    def topk_blocks(self, 
+                    layer:int, 
+                    k:int, 
+                    batch_idx:Union[int, List[int]] = None,
+                    strategy:str = 'batch_specific',
+                    access_weight:float = 0.1):
+        """Return **ascending** indices of Top-k blocks by importance.
+        
+        Args:
+            layer: 层索引
+            k: 选择的block数量
+            batch_idx: batch索引
+            strategy: 选择策略
+                - 'batch_specific': 使用batch特定的重要性
+                - 'global': 使用全局重要性
+                - 'hybrid': 结合batch和全局重要性
+            access_weight: 访问频率权重
+        """
+        if batch_idx is None:
+            # 使用全局重要性
+            imp = self.global_importance[layer]
+            access = self.global_access_count[layer]
+            ranked = sorted(range(self.n_blocks), 
+                          key=lambda i: imp[i] * (1 + access_weight * access[i]), 
+                          reverse=True)
+            chosen = [i for i in ranked if imp[i] > 0][:k]
+            return sorted(chosen)
+        
+        elif isinstance(batch_idx, int):
+            # 单个batch
+            if strategy == 'batch_specific':
+                imp = self.importance[batch_idx, layer]
+                access = self.access_count[batch_idx, layer]
+                ranked = sorted(range(self.n_blocks), 
+                              key=lambda i: imp[i] * (1 + access_weight * access[i]), 
+                              reverse=True)
+                chosen = [i for i in ranked if imp[i] > 0][:k]
+                return sorted(chosen)
+            
+            elif strategy == 'global':
+                imp = self.global_importance[layer]
+                access = self.global_access_count[layer]
+                ranked = sorted(range(self.n_blocks), 
+                              key=lambda i: imp[i] * (1 + access_weight * access[i]), 
+                              reverse=True)
+                chosen = [i for i in ranked if imp[i] > 0][:k]
+                return sorted(chosen)
+            
+            elif strategy == 'hybrid':
+                batch_imp = self.importance[batch_idx, layer]
+                global_imp = self.global_importance[layer]
+                batch_access = self.access_count[batch_idx, layer]
+                global_access = self.global_access_count[layer]
+                
+                def hybrid_score(i):
+                    combined_imp = 0.7 * batch_imp[i] + 0.3 * global_imp[i]
+                    combined_access = batch_access[i] + global_access[i]
+                    return combined_imp * (1 + access_weight * combined_access)
+                
+                ranked = sorted(range(self.n_blocks), key=hybrid_score, reverse=True)
+                chosen = [i for i in ranked if hybrid_score(i) > 0][:k]
+                return sorted(chosen)
+        
+        else:
+            # 多个batch，返回字典
+            result = {}
+            for b_idx in batch_idx:
+                if b_idx < self.max_batch:
+                    result[b_idx] = self.topk_blocks(layer, k, b_idx, strategy, access_weight)
+            return result
+
+    def topk_blocks_aggregated(self, 
+                              layer:int, 
+                              k:int, 
+                              batch_indices:List[int] = None,
+                              aggregation:str = 'mean'):
+        """跨batch聚合后选择top-k blocks
+        
+        Args:
+            layer: 层索引
+            k: 选择的block数量
+            batch_indices: batch索引列表，None表示所有batch
+            aggregation: 聚合方式 ('mean', 'max', 'min', 'sum')
+        """
+        if batch_indices is None:
+            batch_indices = list(range(self.max_batch))
+        
+        # 聚合重要性分数
+        if aggregation == 'mean':
+            agg_imp = np.mean(self.importance[batch_indices, layer], axis=0)
+            agg_access = np.mean(self.access_count[batch_indices, layer], axis=0)
+        elif aggregation == 'max':
+            agg_imp = np.max(self.importance[batch_indices, layer], axis=0)
+            agg_access = np.max(self.access_count[batch_indices, layer], axis=0)
+        elif aggregation == 'min':
+            agg_imp = np.min(self.importance[batch_indices, layer], axis=0)
+            agg_access = np.min(self.access_count[batch_indices, layer], axis=0)
+        elif aggregation == 'sum':
+            agg_imp = np.sum(self.importance[batch_indices, layer], axis=0)
+            agg_access = np.sum(self.access_count[batch_indices, layer], axis=0)
+        
+        ranked = sorted(range(self.n_blocks), 
+                       key=lambda i: agg_imp[i] * (1 + 0.1 * agg_access[i]), 
+                       reverse=True)
+        chosen = [i for i in ranked if agg_imp[i] > 0][:k]
         return sorted(chosen)
 
+    def get_batch_statistics(self, batch_idx:int):
+        """获取特定batch的统计信息"""
+        if batch_idx >= self.max_batch:
+            return None
+            
+        stats = {
+            'batch_idx': batch_idx,
+            'batch_time': int(self.global_time[batch_idx]),
+            'total_importance': float(np.sum(self.importance[batch_idx])),
+            'total_accesses': int(np.sum(self.access_count[batch_idx])),
+            'layer_stats': []
+        }
+        
+        for layer in range(self.layers):
+            layer_stat = {
+                'layer': layer,
+                'active_blocks': int(np.sum(self.importance[batch_idx, layer] > 0)),
+                'total_importance': float(np.sum(self.importance[batch_idx, layer])),
+                'total_accesses': int(np.sum(self.access_count[batch_idx, layer])),
+                'avg_importance': float(np.mean(self.importance[batch_idx, layer])),
+                'max_importance': float(np.max(self.importance[batch_idx, layer]))
+            }
+            stats['layer_stats'].append(layer_stat)
+        
+        return stats
+
+    def reset_batch(self, batch_idx:int):
+        """重置特定batch的数据"""
+        if batch_idx < self.max_batch:
+            self.importance[batch_idx] = 0
+            self.access_count[batch_idx] = 0
+            self.last_access[batch_idx] = 0
+            self.global_time[batch_idx] = 0
+
+    # ---------------- SSD spill / load --------------
+    def _spill_to_ssd(self, L:int, B:int):
+        self.ssd.write(L, B,
+            torch.cat([self.k_cpu[L][B], self.v_cpu[L][B]], dim=-1))
+        self.k_cpu[L][B] = self.v_cpu[L][B] = None
+        self.on_ssd[L][B] = True
+
     def _maybe_evict(self):
-        """基于LRU策略驱逐blocks到SSD"""
         hot_cnt = sum(x is not None for lay in self.k_cpu for x in lay)
-        if hot_cnt <= self.dram_limit_blk:
+        if hot_cnt < self.dram_limit_blk:
             return
-        
-        # 找到最久未访问的block
-        candidates = [(self.dram_lru.get((L, B), 0), L, B)
-                     for L in range(self.layers)
-                     for B in range(self.n_blocks)
-                     if self.k_cpu[L][B] is not None]
-        
-        if not candidates:
-            return
-        
-        # 驱逐最久未访问的block
-        _, L, B = min(candidates)
+        # 使用全局重要性找到最小 importance 的块
+        cand = [(self.global_importance[L, B], L, B)
+                for L in range(self.layers)
+                for B in range(self.n_blocks)
+                if self.k_cpu[L][B] is not None]
+        _, L, B = min(cand)
         self._spill_to_ssd(L, B)
 
-    def _spill_to_ssd(self, layer: int, block: int):
-        """异步写入到SSD"""
-        kv_data = torch.cat([self.k_cpu[layer][block], self.v_cpu[layer][block]], dim=-1)
-        
-        # 异步写入
-        self.ssd.write_async(layer, block, kv_data)
-        
-        # 清理内存
-        self.k_cpu[layer][block] = None
-        self.v_cpu[layer][block] = None
-        self.on_ssd[layer][block] = True
-        
-        # 从LRU中移除
-        self.dram_lru.pop((layer, block), None)
+    def _load_from_ssd(self, L:int, B:int):
+        shape = (self.max_batch, self.heads, self.dim*2)
+        buf_gpu = torch.empty(shape, dtype=torch.float16,
+                              device=self.device, non_blocking=True)
+        self.ssd.read(L, B, buf_gpu)
+        k_gpu, v_gpu = buf_gpu.split(self.dim, dim=-1)
+        self._alloc_block(L, B, self.max_batch)
+        self.k_cpu[L][B].copy_(k_gpu.cpu())
+        self.v_cpu[L][B].copy_(v_gpu.cpu())
+        self.on_ssd[L][B] = False
 
     def __del__(self):
         """清理资源"""
@@ -315,8 +335,6 @@ class KVOffloader:
 
 
 class OptimizedSSDBackedKV:
-    """优化的SSD存储后端，支持批量I/O和异步操作"""
-
     def __init__(self, path: str, n_layers: int, blk_bytes: int, 
                  blk_per_layer: int, max_concurrent_io: int = 4):
         self.path = os.path.abspath(path)

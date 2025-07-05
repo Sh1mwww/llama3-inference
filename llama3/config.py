@@ -17,7 +17,8 @@ class KVCacheArgs:
     
     ssd_path: str = "/mnt/kv_cache/kv_cache.bin"
     ssd_size_gb: int = 500
-    dram_limit_gb: float = 0
+    dram_limit_gb: float = 0.1
+    
 
 
 @dataclass

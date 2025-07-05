@@ -60,6 +60,7 @@ class LLaMA:
         temperature: float = 0.6,
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
+        profile_output_dir: Optional[str] = None,
     ):
         self.args.max_batch_size = max(self.args.max_batch_size, len(prompts))
 
@@ -136,15 +137,12 @@ class LLaMA:
             out_text.append(self.tokenizer.decode(row))
 
         # 保存 profiling
-        # save_name = (
-        #     f"{Path(self.args.checkpoints_dir).name}_kv_profile.json"
-        # )
-        save_dir = "/home/roger/jsonfile"
-        os.makedirs(save_dir, exist_ok=True)
-        save_name = os.path.join(save_dir, f"{Path(self.args.checkpoints_dir).name}_kv_profile.json")
-        with open(save_name, "w", encoding="utf-8") as f:
-            json.dump(kv_profile, f, indent=2)
-        print(f"[INFO] KV profile saved → {save_name}")
+        if profile_output_dir:
+            os.makedirs(profile_output_dir, exist_ok=True)
+            save_name = os.path.join(profile_output_dir, f"{Path(self.args.checkpoints_dir).name}_kv_profile.json")
+            with open(save_name, "w", encoding="utf-8") as f:
+                json.dump(kv_profile, f, indent=2)
+            print(f"[INFO] KV profile saved → {save_name}")
 
         return out_tokens, out_text
 
