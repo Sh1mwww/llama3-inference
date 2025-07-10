@@ -1,91 +1,72 @@
-import os
-import mmap
-import threading
+# raw_block_kv.py
+import os, numpy as np, torch, threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import List 
-import torch
-import numpy as np  
 
+ALIGN = 4096           
+def aligned_array(shape, dtype, align=ALIGN):
+    """返回对齐的 numpy 数组视图(O_DIRECT 需要"""
+    nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    buf = np.empty(nbytes + align, dtype=np.uint8)        # over-allocate
+    offset = (-buf.ctypes.data) % align
+    arr = buf[offset:offset+nbytes].view(dtype)
+    return arr.reshape(shape)
 
-class SSDBackedKV:
-    def __init__(self, path: str, n_layers: int, blk_bytes: int, 
-                 blk_per_layer: int, max_concurrent_io: int = 4):
-        self.path = os.path.abspath(path)
+class RawBlockKVBackend:
+    def __init__(self, dev_path: str, n_layers: int,
+                 blk_bytes: int, blk_per_layer: int,
+                 max_concurrent_io: int = 4):
+        self.fd = None
+        try:
+            self.fd = os.open(dev_path, os.O_RDONLY | os.O_DIRECT)
+        except FileNotFoundError:
+            print(f"[ERROR] Device not found: {dev_path}")
+            raise
+
         self.blk_bytes = blk_bytes
-        self.blk_pl = blk_per_layer
+        self.blk_pl   = blk_per_layer
         self.n_layers = n_layers
-        total_bytes = n_layers * blk_per_layer * blk_bytes
-        
-        # 创建文件
-        if not os.path.exists(self.path):
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            # 使用fallocate预分配空间
-            os.system(f"fallocate -l {total_bytes} {self.path}")
-        
-        # 使用O_DIRECT提高性能
-        self.fd = os.open(self.path, os.O_RDWR | os.O_DIRECT)
-        self.mm = mmap.mmap(self.fd, total_bytes, mmap.MAP_SHARED,
-                           mmap.PROT_READ | mmap.PROT_WRITE)
-        
-        # I/O线程池
-        self.io_executor = ThreadPoolExecutor(max_workers=max_concurrent_io, 
-                                            thread_name_prefix="ssd_io")
-        
-        # 写入缓冲区管理
-        self.write_buffer = {}
-        self.write_lock = threading.Lock()
+        self.pool = ThreadPoolExecutor(max_workers=max_concurrent_io,
+                                       thread_name_prefix="rbd_io")
 
-    def _offset(self, layer: int, blk: int) -> int:
+    # ---------- helpers ----------
+    def _offset(self, layer, blk):
         return (layer * self.blk_pl + blk) * self.blk_bytes
 
-    def write_async(self, layer: int, blk: int, t_cpu: torch.Tensor):
-        """异步写入"""
-        def _write():
-            off = self._offset(layer, blk)
-            data = t_cpu.cpu().numpy()
-            view = np.ndarray(data.size, dtype=np.float16,
-                            buffer=self.mm, offset=off).reshape(data.shape)
-            np.copyto(view, data, casting='no')
-            # 强制刷新到磁盘
-            self.mm.flush(off, self.blk_bytes)
-        
-        return self.io_executor.submit(_write)
+    # ---------- write ----------
+    def write_async(self, layer:int, blk:int, t_cpu:torch.Tensor):
+        """异步写单个 block"""
+        def _task():
+            data = t_cpu.cpu().numpy().flatten().view(np.uint8)
+            assert data.nbytes == self.blk_bytes
+            buf = aligned_array(data.shape, np.uint8)      # page-aligned copy
+            np.copyto(buf, data)
+            os.pwrite(self.fd, buf, self._offset(layer, blk))
+        return self.pool.submit(_task)
 
-    def batch_read(self, layer: int, blocks: List[int], 
-                   callback, callback_arg):
-        """批量异步读取"""
-        def _batch_read():
-            loaded_data = {}
-            for block in blocks:
-                try:
-                    off = self._offset(layer, block)
-                    shape = (self.blk_bytes // 2,)  # float16
-                    view = np.ndarray(shape[0], dtype=np.float16,
-                                    buffer=self.mm, offset=off)
-                    # 复制数据避免内存映射问题
-                    data_copy = torch.from_numpy(view.copy())
-                    loaded_data[block] = data_copy.reshape(-1)  # 需要根据实际shape调整
-                except Exception as e:
-                    print(f"Failed to read block {block}: {e}")
-            
-            if loaded_data:
-                callback(callback_arg, loaded_data)
-        
-        return self.io_executor.submit(_batch_read)
+    # ---------- batch read ----------
+    def batch_read(self, layer:int, blocks:list[int],
+                   callback, cb_arg):
+        def _task():
+            out = {}
+            for blk in blocks:
+                buf = aligned_array((self.blk_bytes,), np.uint8)
+                os.pread(self.fd, buf, self._offset(layer, blk))
+                # 复制到 torch，避免 buffer 被复用
+                t = torch.from_numpy(buf.copy()).view(torch.float16)
+                out[blk] = t
+            if out:
+                callback(cb_arg, out)
+        return self.pool.submit(_task)
 
-    def read(self, layer: int, blk: int, t_gpu: torch.Tensor):
-        """同步读取"""
-        off = self._offset(layer, blk)
-        view = np.ndarray(t_gpu.numel(), dtype=np.float16,
-                         buffer=self.mm, offset=off).reshape(t_gpu.shape)
-        h_tmp = torch.from_numpy(view.copy()).clone()
-        t_gpu.copy_(h_tmp, non_blocking=True)
+    # ---------- sync read to GPU tensor ----------
+    def read(self, layer:int, blk:int, t_gpu:torch.Tensor):
+        buf = aligned_array((self.blk_bytes,), np.uint8)
+        os.pread(self.fd, buf, self._offset(layer, blk))
+        h_tmp = torch.from_numpy(buf.copy()).view(torch.float16)
+        t_gpu.copy_(h_tmp.reshape(t_gpu.shape), non_blocking=True)
 
     def __del__(self):
-        """清理资源"""
-        if hasattr(self, 'io_executor'):
-            self.io_executor.shutdown(wait=True)
-        if hasattr(self, 'mm'):
-            self.mm.close()
-        if hasattr(self, 'fd'):
+        try:
+            self.pool.shutdown(wait=False)
+        finally:
             os.close(self.fd)

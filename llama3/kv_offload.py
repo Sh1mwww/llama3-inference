@@ -5,7 +5,7 @@ import os, mmap, numpy as np, math
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from .config import KVCacheArgs  
-from .SSDBacked import SSDBackedKV
+from .SSDBacked import RawBlockKVBackend
 
 BLOCK = 256  # tokens / block
 
@@ -52,10 +52,13 @@ class KVOffloader:
         self.n_blocks = n_blocks
         self.block_nbytes = (max_batch * heads * dim) * dtype_bytes * 2  # K+V
         
-        self.ssd = SSDBackedKV(
-            path=KVCacheArgs.ssd_path,
-            n_layers=layers, blk_bytes=self.block_nbytes,
-            blk_per_layer=n_blocks)
+        self.ssd = RawBlockKVBackend(
+            dev_path="/dev/nvme0n1p3",     # 你的裸分区
+            n_layers=layers,
+            blk_bytes=self.block_nbytes,
+            blk_per_layer=n_blocks,
+            max_concurrent_io=getattr(KVCacheArgs, 'max_concurrent_io', 4)
+        )
         self.on_ssd = [[False]*n_blocks for _ in range(layers)]
         self.dram_limit_blk = int(KVCacheArgs.dram_limit_gb * (1024**3) // self.block_nbytes)
 

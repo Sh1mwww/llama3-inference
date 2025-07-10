@@ -35,7 +35,6 @@ class ModelArgs:
     use_scaled_rope: bool
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-5
-    gqa: Optional[int] = None
     max_batch_size: int = 512
     max_seq_len: int = 2048
     device: str = "cuda"
