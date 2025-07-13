@@ -64,11 +64,10 @@ class KVOffloader:
 
     # ---------------- internal -----------------
     def _alloc_block(self, layer:int, blk:int, batch_sz:int):
-        if self.k_cpu[layer][blk] is None:
-            shape = (batch_sz, self.heads, self.dim)
-            self.k_cpu[layer][blk] = torch.empty(*shape, dtype=torch.float16,
-                                                 pin_memory=True)
-            self.v_cpu[layer][blk] = torch.empty_like(self.k_cpu[layer][blk])
+        shape = (batch_sz, self.heads, self.dim)        # 而不是 max_batch
+        self.k_cpu[layer][blk] = torch.empty(*shape, dtype=torch.float16,
+                                            pin_memory=True)
+        self.v_cpu[layer][blk] = torch.empty_like(self.k_cpu[layer][blk])
 
     # ---------------- public API --------------
     def push(self, layer:int, blk:int, k:torch.Tensor, v:torch.Tensor, batch_idx:int = 0):
@@ -101,9 +100,29 @@ class KVOffloader:
                     raise RuntimeError(f"[KVOffloader] block {blk} not pushed (layer {layer})")
                 k_parts.append(self.k_cpu[layer][blk].to(self.device, non_blocking=True))
                 v_parts.append(self.v_cpu[layer][blk].to(self.device, non_blocking=True))
+        # 安全的流等待，避免死锁
         if stream is not torch.cuda.current_stream():
-            torch.cuda.current_stream().wait_stream(stream)
-        return torch.cat(k_parts, dim=0), torch.cat(v_parts, dim=0)
+            try:
+                current_stream = torch.cuda.current_stream()
+                current_stream.wait_stream(stream)
+                
+                # 验证流状态
+                if hasattr(stream, 'query') and not stream.query():
+                    # 流还在运行，等待一小段时间
+                    import time
+                    time.sleep(0.001)  # 1ms
+                    
+            except RuntimeError as e:
+                logger.warning(f"Stream wait failed in KV offloader: {e}")
+                # 降级到同步
+                torch.cuda.synchronize()
+        # 检查k_parts的维度以决定concatenation策略
+        if k_parts and k_parts[0].dim() == 3:
+            # 单batch情况: 沿seq_len维度concat
+            return torch.cat(k_parts, dim=0), torch.cat(v_parts, dim=0)
+        else:
+            # 多batch情况: 沿seq_len维度concat (dim=1)
+            return torch.cat(k_parts, dim=1), torch.cat(v_parts, dim=1)
 
     # ------------- attention importance -------------
     def update_importances(self,
@@ -319,8 +338,20 @@ class KVOffloader:
 
     def _load_from_ssd(self, L:int, B:int):
         shape = (self.max_batch, self.heads, self.dim*2)
-        buf_gpu = torch.empty(shape, dtype=torch.float16,
-                              device=self.device, non_blocking=True)
+        
+        # 复用GPU缓冲区避免内存泄漏
+        if not hasattr(self, '_ssd_buffer') or self._ssd_buffer is None:
+            self._ssd_buffer = torch.empty(shape, dtype=torch.float16,
+                                         device=self.device, non_blocking=True)
+        elif self._ssd_buffer.shape != shape:
+            # 形状不匹配时重新分配
+            del self._ssd_buffer
+            torch.cuda.empty_cache()
+            self._ssd_buffer = torch.empty(shape, dtype=torch.float16,
+                                         device=self.device, non_blocking=True)
+        
+        # 复用缓冲区
+        buf_gpu = self._ssd_buffer
         self.ssd.read(L, B, buf_gpu)
         k_gpu, v_gpu = buf_gpu.split(self.dim, dim=-1)
         self._alloc_block(L, B, self.max_batch)

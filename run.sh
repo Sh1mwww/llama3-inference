@@ -1,47 +1,40 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ------------------------------------------------------------
+# run.sh  --  multi-batch wrapper for scripts/run_inference.py
+#
+# 用法：
+#   ./run.sh [PROMPT_FILE] [MODEL_PATH] [BATCH_SIZE] [MAX_LEN] [DEVICE]
+#
+#   PROMPT_FILE : (必填) 纯文本，每行一条 prompt。
+#   MODEL_PATH  : (可选) 模型目录，默认为 $HOME/.llama/checkpoints/Llama3.2-3B
+#   BATCH_SIZE  : (可选) 每批条数，默认 32
+#   MAX_LEN     : (可选) 生成长度，默认 64
+#   DEVICE      : (可选) cuda / cpu，默认 cuda（若可用）
+# ------------------------------------------------------------
 
-# ---------- 参数设定 ----------
-MODEL_PATH=${1:-"/home/roger/.llama/checkpoints/Llama3.2-3B"}
-DEVICE=${2:-"cuda"}
-PROMPT_DIR="./prompts"
-MAX_GEN_LEN=${3:-64}
+set -e
 
-# ---------- 检查 prompts 目录 ----------
-if [ ! -d "$PROMPT_DIR" ]; then
-  echo "[ERROR] Prompt directory not found: $PROMPT_DIR"
+PROMPT_FILE=${1:? "❌ 必须提供 prompt 文件路径"}
+MODEL_PATH=${2:-"$HOME/.llama/checkpoints/Llama3.2-3B"}
+BATCH_SIZE=${3:-32}
+MAX_LEN=${4:-64}
+DEVICE=${5:-"cuda"}
+
+if [ ! -f "$PROMPT_FILE" ]; then
+  echo "[ERROR] prompt file not found: $PROMPT_FILE"
   exit 1
 fi
 
-# ---------- 显示选单 ----------
-echo "请选择要使用的 prompt 文件："
-PS3="请输入对应数字编号："
+echo "▶ MODEL       = $MODEL_PATH"
+echo "▶ DEVICE      = $DEVICE"
+echo "▶ PROMPT_FILE = $PROMPT_FILE"
+echo "▶ BATCH_SIZE  = $BATCH_SIZE"
+echo "▶ MAX_LEN     = $MAX_LEN"
+echo "------------------------------------------------------------"
 
-# 建立文件列表数组
-prompt_files=($(ls "$PROMPT_DIR"/*.txt))
-select file in "${prompt_files[@]}"; do
-  if [ -n "$file" ]; then
-    PROMPT_FILE="$file"
-    echo "select: $PROMPT_FILE"
-    break
-  else
-    echo "无效的选择，请重试。"
-  fi
-done
-
-# ---------- 读取 prompt 文件内容 ----------
-PROMPTS=()
-while IFS= read -r line || [ -n "$line" ]; do
-  PROMPTS+=("$line")
-done < "$PROMPT_FILE"
-
-PROMPT_ARGS=""
-for p in "${PROMPTS[@]}"; do
-  PROMPT_ARGS+="\"$p\" "
-done
-
-# ---------- 执行推理 ----------
-eval python scripts/run_inference.py \
+python scripts/run_inference.py \
   --model-path "$MODEL_PATH" \
   --device "$DEVICE" \
-  --prompt $PROMPT_ARGS \
-  --max-gen-len "$MAX_GEN_LEN"
+  --prompt-file "$PROMPT_FILE" \
+  --batch-size "$BATCH_SIZE" \
+  --max-gen-len "$MAX_LEN"

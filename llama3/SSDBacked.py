@@ -51,7 +51,6 @@ class RawBlockKVBackend:
             for blk in blocks:
                 buf = aligned_array((self.blk_bytes,), np.uint8)
                 os.pread(self.fd, buf, self._offset(layer, blk))
-                # 复制到 torch，避免 buffer 被复用
                 t = torch.from_numpy(buf.copy()).view(torch.float16)
                 out[blk] = t
             if out:

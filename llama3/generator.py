@@ -39,8 +39,9 @@ class LLaMA:
         tokenizer = LlamaTokenizerFast.from_pretrained(ckpt_dir, legacy=True)
         params_path = ckpt_dir / "params.json"
         args = ModelArgs.from_json(
-            str(params_path), max_seq_len=2048, max_batch_size=32, device=device
+            str(params_path), max_seq_len=2048, max_batch_size=512, device=device
         )
+        
         args.checkpoints_dir = str(ckpt_dir)
 
         checkpoint = None

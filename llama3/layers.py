@@ -7,13 +7,17 @@
 # ============================================================
 
 import math
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, List, Dict
 import torch, torch.nn as nn, torch.nn.functional as F
 import threading
+import logging
 from contextlib import contextmanager
 import time
 
-from .config import ModelArgs, LayerInfo, KVCacheArgs
+# 配置日志
+logger = logging.getLogger(__name__)
+
+from .config import ModelArgs
 from .kv_offload import KVOffloader, BLOCK
 
 # ---------- Enhanced timing util ----------
@@ -58,30 +62,69 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
     if not torch.cuda.is_available():
         yield; return
     
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    start_event = None
+    end_event = None
     
-    start_event.record()
     try:
-        yield
-    finally:
-        end_event.record()
-        torch.cuda.synchronize()
-        elapsed_us = int(start_event.elapsed_time(end_event) * 1000)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
         
-        with PERF_TRACKER.lock:
-            PERF_TRACKER.stats[key] += elapsed_us
-            if layer_id is not None:
-                PERF_TRACKER.add_layer_stat(layer_id, key, elapsed_us)
+        start_event.record()
+        yield
+        
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error(f"CUDA OOM in timer for {key}: {e}")
+        torch.cuda.empty_cache()
+        raise
+    except RuntimeError as e:
+        if "CUDA" in str(e):
+            logger.error(f"CUDA error in timer for {key}: {e}")
+            raise
+        else:
+            logger.error(f"Runtime error in timer for {key}: {e}")
+            raise
+    finally:
+        try:
+            if end_event is not None:
+                end_event.record()
+                torch.cuda.synchronize()
+                
+                if start_event is not None:
+                    elapsed_us = int(start_event.elapsed_time(end_event) * 1000)
+                    
+                    with PERF_TRACKER.lock:
+                        PERF_TRACKER.stats[key] += elapsed_us
+                        if layer_id is not None:
+                            PERF_TRACKER.add_layer_stat(layer_id, key, elapsed_us)
+        except Exception as e:
+            logger.warning(f"Error in cuda_timer cleanup for {key}: {e}")
 
 # ---------- Optimized weight management ----------
 class WeightManager:
     """管理权重的异步加载和缓存"""
     
     def __init__(self, device: str, max_cached_layers: int = 4):
-        self.device = device
-        self.is_cuda = device.startswith("cuda") and torch.cuda.is_available()
-        self.weight_stream = torch.cuda.Stream(device=device) if self.is_cuda else None
+        # 导入GPU工具
+        from .gpu_utils import SafeGPUManager, gpu_memory_guard, gpu_safe_operation
+        from .memory_manager import GlobalMemoryManager
+        
+        self.gpu_manager = SafeGPUManager(device, auto_fallback=True)
+        self.device = self.gpu_manager.current_device
+        self.is_cuda = self.device.startswith("cuda") and torch.cuda.is_available()
+        
+        # 获取内存管理器
+        self.memory_manager = GlobalMemoryManager.get_instance()
+        
+        # 安全创建CUDA流
+        self.weight_stream = None
+        if self.is_cuda:
+            try:
+                device_id = int(self.device.split(":")[1]) if ":" in self.device else 0
+                with self.gpu_manager.safe_cuda_context(device_id):
+                    self.weight_stream = torch.cuda.Stream(device=self.device)
+            except Exception as e:
+                logger.warning(f"Failed to create CUDA stream: {e}")
+                self.weight_stream = None
         
         # 权重缓存管理
         self.cached_weights = {}  # layer_id -> {module_name: weight_dict}
@@ -89,6 +132,7 @@ class WeightManager:
         self.max_cached = max_cached_layers
         self.loading_weights = set()  # track which layers are being loaded
         self.lock = threading.Lock()
+        self.memory_threshold_gb = 0.5  # GPU内存保护阈值
     
     def ensure_weights_cuda(self, layer_id: int, modules: Dict[str, nn.Module], 
                            priority: bool = False):
@@ -108,6 +152,16 @@ class WeightManager:
         
         try:
             self._load_weights_to_gpu(layer_id, modules, priority)
+            
+            # 更新缓存
+            with self.lock:
+                self.cached_weights[layer_id] = {
+                    name: {p_name: param for p_name, param in module.named_parameters()}
+                    for name, module in modules.items()
+                }
+                self.access_order.append(layer_id)
+                self._maybe_evict_weights()
+                
         finally:
             with self.lock:
                 self.loading_weights.discard(layer_id)
@@ -115,29 +169,102 @@ class WeightManager:
     def _load_weights_to_gpu(self, layer_id: int, modules: Dict[str, nn.Module], 
                             priority: bool):
         """实际加载权重到GPU"""
-        with cuda_timer("weights_hbm_us", layer_id):
-            if self.weight_stream and not priority:
-                with torch.cuda.stream(self.weight_stream):
-                    for name, module in modules.items():
-                        for param in module.parameters():
-                            if not param.is_cuda:
-                                param.data = param.data.to(self.device, non_blocking=True)
-                torch.cuda.current_stream().wait_stream(self.weight_stream)
-            else:
-                # 同步加载，用于高优先级请求
-                for name, module in modules.items():
-                    for param in module.parameters():
-                        if not param.is_cuda:
-                            param.data = param.data.to(self.device)
+        from .gpu_utils import gpu_memory_guard, gpu_safe_operation
         
-        # 更新缓存
+        @gpu_safe_operation(retry_count=2, cleanup_on_error=True)
+        def _safe_load():
+            return self._do_load_weights(layer_id, modules, priority)
+        
+        return _safe_load()
+    
+    def _do_load_weights(self, layer_id: int, modules: Dict[str, nn.Module], 
+                        priority: bool):
+        """执行实际的权重加载"""
+        from .gpu_utils import gpu_memory_guard
+        
+        device_id = int(self.device.split(":")[1]) if ":" in self.device else 0
+        
+        # 检查内存是否足够
+        if self.memory_manager and self.is_cuda:
+            total_weight_size = 0
+            for module in modules.values():
+                for param in module.parameters():
+                    if not param.is_cuda:
+                        total_weight_size += param.numel() * param.element_size()
+            
+            if not self.memory_manager.can_allocate(total_weight_size):
+                logger.warning(f"Insufficient memory for layer {layer_id} weights ({total_weight_size/(1024**3):.2f}GB)")
+                # 尝试清理缓存
+                self._emergency_weight_cleanup()
+                
+                if not self.memory_manager.can_allocate(total_weight_size):
+                    raise RuntimeError(f"Cannot load layer {layer_id}: insufficient GPU memory")
+        
+        with gpu_memory_guard(self.device, self.memory_threshold_gb):
+            with cuda_timer("weights_hbm_us", layer_id):
+                if self.weight_stream and not priority and self.is_cuda:
+                    try:
+                        with self.gpu_manager.safe_cuda_context(device_id):
+                            with torch.cuda.stream(self.weight_stream):
+                                for module_name, module in modules.items():
+                                    for param in module.parameters():
+                                        if not param.is_cuda:
+                                            param.data = param.data.to(self.device, non_blocking=True)
+                            
+                            # 安全的流等待，避免死锁
+                            try:
+                                # 添加超时检查，避免无限等待
+                                current_stream = torch.cuda.current_stream(self.device)
+                                if current_stream != self.weight_stream:
+                                    current_stream.wait_stream(self.weight_stream)
+                                    # 验证操作完成
+                                    if not self.weight_stream.query():
+                                        logger.warning(f"Weight stream not completed for layer {layer_id}")
+                            except RuntimeError as e:
+                                logger.error(f"Stream wait failed for layer {layer_id}: {e}")
+                                # 降级到同步操作
+                                torch.cuda.synchronize(self.device)
+                                raise
+                    except Exception as e:
+                        logger.warning(f"Async weight loading failed for layer {layer_id}: {e}")
+                        # 回退到同步加载
+                        self._sync_load_weights(modules)
+                else:
+                    # 同步加载，用于高优先级请求或CPU设备
+                    self._sync_load_weights(modules)
+    
+    def _emergency_weight_cleanup(self):
+        """紧急权重清理"""
         with self.lock:
-            self.cached_weights[layer_id] = {
-                name: {p_name: param for p_name, param in module.named_parameters()}
-                for name, module in modules.items()
-            }
-            self.access_order.append(layer_id)
-            self._maybe_evict_weights()
+            # 清理一半的缓存权重
+            cleanup_count = len(self.cached_weights) // 2
+            for _ in range(cleanup_count):
+                if self.access_order:
+                    evict_layer = self.access_order.pop(0)
+                    if evict_layer in self.cached_weights:
+                        del self.cached_weights[evict_layer]
+                        logger.info(f"Emergency cleanup: evicted layer {evict_layer}")
+        
+        # 清理GPU缓存
+        if self.is_cuda:
+            torch.cuda.empty_cache()
+    
+    def _sync_load_weights(self, modules: Dict[str, nn.Module]):
+        """同步加载权重"""
+        try:
+            for module_name, module in modules.items():
+                for param in module.parameters():
+                    if not param.is_cuda and self.is_cuda:
+                        param.data = param.data.to(self.device)
+        except torch.cuda.OutOfMemoryError as e:
+            logger.error(f"GPU OOM during weight loading: {e}")
+            torch.cuda.empty_cache()
+            raise
+        except Exception as e:
+            logger.error(f"Weight loading failed: {e}")
+            raise
+        
+        # 更新缓存（移到主函数中处理）
     
     def _maybe_evict_weights(self):
         """LRU驱逐权重缓存"""
@@ -264,25 +391,70 @@ class SelfAttention(nn.Module):
         self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
     
     def _allocate_buffers(self, batch_size: int, seq_len: int, max_kv_len: int):
-        """预分配计算缓冲区"""
+        """安全预分配计算缓冲区，防止OOM"""
         if (self.qkv_buffer is None or 
             self.qkv_buffer[0].size(0) < batch_size or 
             self.qkv_buffer[0].size(1) < seq_len):
             
             with cuda_timer("memory_alloc_us", self.layer_id):
-                # QKV缓冲区
-                q_shape = (batch_size, seq_len, self.n_heads_q, self.head_dim)
-                kv_shape = (batch_size, seq_len, self.n_kv_heads, self.head_dim)
+                # 限制缓冲区大小防止OOM
+                MAX_BUFFER_ELEMENTS = 50_000_000  # 约100MB for float16
                 
-                self.qkv_buffer = (
-                    torch.empty(q_shape, dtype=torch.float16, device=self.device),
-                    torch.empty(kv_shape, dtype=torch.float16, device=self.device),
-                    torch.empty(kv_shape, dtype=torch.float16, device=self.device)
-                )
+                # 计算所需内存
+                q_elements = batch_size * seq_len * self.n_heads_q * self.head_dim
+                kv_elements = batch_size * seq_len * self.n_kv_heads * self.head_dim
+                scores_elements = batch_size * self.n_heads_q * seq_len * max_kv_len
                 
-                # 注意力分数缓冲区
-                scores_shape = (batch_size, self.n_heads_q, seq_len, max_kv_len)
-                self.scores_buffer = torch.empty(scores_shape, dtype=torch.float16, device=self.device)
+                # 如果scores缓冲区过大，限制max_kv_len
+                if scores_elements > MAX_BUFFER_ELEMENTS:
+                    logger.warning(f"Large attention buffer requested ({scores_elements} elements), limiting to prevent OOM")
+                    # 计算安全的max_kv_len
+                    safe_kv_len = MAX_BUFFER_ELEMENTS // (batch_size * self.n_heads_q * seq_len)
+                    max_kv_len = min(max_kv_len, max(safe_kv_len, 1024))  # 至少保留1024
+                    scores_elements = batch_size * self.n_heads_q * seq_len * max_kv_len
+                    self.use_chunked_attention = True
+                else:
+                    self.use_chunked_attention = False
+                
+                # 检查内存管理器
+                try:
+                    from .memory_manager import GlobalMemoryManager
+                    memory_manager = GlobalMemoryManager.get_instance()
+                    if memory_manager:
+                        total_bytes = (q_elements + 2 * kv_elements + scores_elements) * 2  # float16
+                        if not memory_manager.can_allocate(total_bytes):
+                            # 尝试清理内存
+                            if hasattr(self, 'qkv_buffer') and self.qkv_buffer:
+                                del self.qkv_buffer
+                            if hasattr(self, 'scores_buffer') and self.scores_buffer:
+                                del self.scores_buffer
+                            torch.cuda.empty_cache()
+                            
+                            if not memory_manager.can_allocate(total_bytes):
+                                raise RuntimeError(f"Insufficient GPU memory: need {total_bytes/(1024**3):.2f}GB")
+                except ImportError:
+                    pass  # memory_manager not available
+                
+                try:
+                    # QKV缓冲区
+                    q_shape = (batch_size, seq_len, self.n_heads_q, self.head_dim)
+                    kv_shape = (batch_size, seq_len, self.n_kv_heads, self.head_dim)
+                    
+                    self.qkv_buffer = (
+                        torch.empty(q_shape, dtype=torch.float16, device=self.device),
+                        torch.empty(kv_shape, dtype=torch.float16, device=self.device),
+                        torch.empty(kv_shape, dtype=torch.float16, device=self.device)
+                    )
+                    
+                    # 注意力分数缓冲区 - 使用限制后的大小
+                    scores_shape = (batch_size, self.n_heads_q, seq_len, max_kv_len)
+                    self.scores_buffer = torch.empty(scores_shape, dtype=torch.float16, device=self.device)
+                    
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.error(f"GPU OOM during buffer allocation: batch={batch_size}, seq={seq_len}, kv_len={max_kv_len}")
+                    # 清理并抛出有用的错误
+                    torch.cuda.empty_cache()
+                    raise RuntimeError(f"GPU OOM: Cannot allocate attention buffers. Try reducing batch_size (current: {batch_size}) or max sequence length.") from e
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
         if not self.wq.weight.is_cuda:
@@ -311,10 +483,26 @@ class SelfAttention(nn.Module):
             q = apply_rotary_embeddings(q, freqs_complex)
             k = apply_rotary_embeddings(k, freqs_complex)
         
-        # Push当前block到offloader
-        blk_idx = start_pos // self.block_sz # 计算出当前token属于哪个块的索引 
-        # squeeze(0)移除batch维度
-        self.offloader.push(self.layer_id, blk_idx, k.squeeze(0), v.squeeze(0)) 
+        # Push当前block到offloader  
+        # 支持多token和多batch处理
+        bsz, seqlen, n_heads, head_dim = k.shape
+        
+        # 对于每个token位置，计算对应的block并push
+        for seq_idx in range(seqlen):
+            blk_idx = (start_pos + seq_idx) // self.block_sz
+            # 提取当前位置的k,v: (bsz, n_heads, head_dim)
+            k_curr = k[:, seq_idx, :, :]  # (bsz, n_heads, head_dim)
+            v_curr = v[:, seq_idx, :, :]  # (bsz, n_heads, head_dim)
+            
+            # 如果batch_size=1，保持原有行为移除batch维度
+            if bsz == 1:
+                k_curr = k_curr.squeeze(0)  # (n_heads, head_dim)
+                v_curr = v_curr.squeeze(0)  # (n_heads, head_dim)
+            
+            self.offloader.push(self.layer_id, blk_idx, k_curr, v_curr)
+        
+        # 使用第一个token的位置来计算需要的blocks（简化处理）
+        blk_idx = start_pos // self.block_sz 
         
         # 获取Top-K blocks
         blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk)
@@ -331,15 +519,32 @@ class SelfAttention(nn.Module):
             fetch_evt_start.record()
             k_full, v_full = self.offloader.fetch(self.layer_id, needed)
             fetch_evt_end.record()
-            torch.cuda.synchronize()  # 等待异步操作完成
-            self.kv_elapsed_time = fetch_evt_start.elapsed_time(fetch_evt_end) * 1000 # 转换为微秒
-            PERF_TRACKER.add_layer_stat(self.layer_id, "kv_fetch_us", self.kv_elapsed_time)
+            
+            # 避免不必要的同步，仅在profiling时同步
+            if getattr(self, 'enable_profiling', False):
+                torch.cuda.synchronize()  # 仅在profiling模式下同步
+                self.kv_elapsed_time = fetch_evt_start.elapsed_time(fetch_evt_end) * 1000
+                PERF_TRACKER.add_layer_stat(self.layer_id, "kv_fetch_us", self.kv_elapsed_time)
+            else:
+                # 非profiling模式：不阻塞GPU管道
+                self.kv_elapsed_time = 0
             
 
-        # 形状调整
+        # 形状调整以支持多batch
         if k_full.dim() == 3:
+            # 原始单batch情况: (seq_len, n_heads, head_dim) -> (1, n_heads, seq_len, head_dim)
             k_full = k_full.permute(1, 0, 2).unsqueeze(0)
             v_full = v_full.permute(1, 0, 2).unsqueeze(0)
+        elif k_full.dim() == 4:
+            # 多batch情况: (bsz, seq_len, n_heads, head_dim) -> (bsz, n_heads, seq_len, head_dim)
+            k_full = k_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
+            v_full = v_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
+        
+        # 确保k_full和v_full与q的batch维度一致
+        if k_full.size(0) == 1 and bsz > 1:
+            # 单batch的KV需要扩展到多batch
+            k_full = k_full.expand(bsz, -1, -1, -1)
+            v_full = v_full.expand(bsz, -1, -1, -1)
         
         k_full = k_full.to(q.dtype)
         v_full = v_full.to(q.dtype)
@@ -371,9 +576,15 @@ class SelfAttention(nn.Module):
             attn_weights = torch.softmax(scores, dim=-1)
             out = torch.matmul(attn_weights, v_full)
             attn_evt_end.record()
-            torch.cuda.synchronize()
-            self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000  # 转换为微秒
-            PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
+            
+            # 避免不必要的同步，仅在profiling时同步
+            if getattr(self, 'enable_profiling', False):
+                torch.cuda.synchronize()
+                self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
+                PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
+            else:
+                # 非profiling模式：不阻塞GPU管道
+                self.attn_time = 0
         out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
         
         stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
@@ -384,7 +595,7 @@ class SelfAttention(nn.Module):
         with torch.no_grad():
             token_imp = attn_weights.mean(dim=(0, 1, 2))  # (Tkv,)
             block_scores = []
-            for i, block_id in enumerate(blocks):
+            for i, _ in enumerate(blocks):
                 s = i * self.block_sz
                 e = min(s + self.block_sz, token_imp.size(0))
                 score = float(token_imp[s:e].sum().item()) if s < token_imp.size(0) else 0.0

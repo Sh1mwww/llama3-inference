@@ -53,13 +53,15 @@ class Transformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, start_pos: int) -> torch.Tensor:
         """
-        tokens: (B,1)  - 每次只喂一个 token，保持与原实现一致
+        tokens: (B, seqlen)  - 支持多batch和多token处理
+        在生成阶段通常 seqlen=1，但支持更大的值用于预填充
         """
         bsz, seqlen = tokens.shape
-        assert seqlen == 1, "一次只能处理一个 token"
+        # 移除硬编码限制，支持seqlen > 1
+        # assert seqlen == 1, "一次只能处理一个 token"
 
-        h = self.embed_tokens(tokens)            # (B,1,D)
-        freqs = self.freqs_complex[start_pos : start_pos + 1].to(h.device)
+        h = self.embed_tokens(tokens)            # (B, seqlen, D)
+        freqs = self.freqs_complex[start_pos : start_pos + seqlen].to(h.device)
 
         for idx, info in enumerate(self.layer_infos):
             blk = info["block"]                  # EncoderBlock
