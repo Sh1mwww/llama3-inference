@@ -16,7 +16,7 @@ set -e
 
 PROMPT_FILE=${1:? "❌ 必须提供 prompt 文件路径"}
 MODEL_PATH=${2:-"$HOME/.llama/checkpoints/Llama3.2-3B"}
-BATCH_SIZE=${3:-32}
+BATCH_SIZE=${3:-4}  # 降低預設批次大小
 MAX_LEN=${4:-64}
 DEVICE=${5:-"cuda"}
 

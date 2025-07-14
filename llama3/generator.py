@@ -23,9 +23,24 @@ class LLaMA:
     def __init__(self, tokenizer, checkpoint, args: ModelArgs):
         self.tokenizer = tokenizer
         self.args = args
-        self.model = Transformer(args).to(args.device).half()
+        
+        print(f"[INFO] Initializing model on device: {args.device}")
+        self.model = Transformer(args)
+        
+        print(f"[INFO] Moving model to {args.device}...")
+        self.model = self.model.to(args.device)
+        
+        print(f"[INFO] Converting to half precision...")
+        self.model = self.model.half()
+        
         if checkpoint is not None:
-            self.model.load_state_dict(checkpoint, strict=False)
+            print(f"[INFO] Loading state dict...")
+            missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint, strict=False)
+            if missing_keys:
+                print(f"[WARNING] Missing keys: {len(missing_keys)} keys")
+            if unexpected_keys:
+                print(f"[WARNING] Unexpected keys: {len(unexpected_keys)} keys")
+            print(f"[INFO] Model weights loaded successfully")
         
 
     # ---------- 构建 ----------

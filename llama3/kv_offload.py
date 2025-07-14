@@ -52,13 +52,20 @@ class KVOffloader:
         self.n_blocks = n_blocks
         self.block_nbytes = (max_batch * heads * dim) * dtype_bytes * 2  # K+V
         
-        self.ssd = RawBlockKVBackend(
-            dev_path="/dev/nvme0n1p3",     # 你的裸分区
-            n_layers=layers,
-            blk_bytes=self.block_nbytes,
-            blk_per_layer=n_blocks,
-            max_concurrent_io=getattr(KVCacheArgs, 'max_concurrent_io', 4)
-        )
+        # 尝试初始化SSD后端，如果失败则禁用
+        try:
+            self.ssd = RawBlockKVBackend(
+                dev_path="/dev/nvme0n1p3",     # 你的裸分区
+                n_layers=layers,
+                blk_bytes=self.block_nbytes,
+                blk_per_layer=n_blocks,
+                max_concurrent_io=getattr(KVCacheArgs, 'max_concurrent_io', 4)
+            )
+            print("[INFO] SSD backend initialized successfully")
+        except (PermissionError, FileNotFoundError, OSError) as e:
+            print(f"[WARNING] Failed to initialize SSD backend: {e}")
+            print("[INFO] Falling back to DRAM-only mode")
+            self.ssd = None
         self.on_ssd = [[False]*n_blocks for _ in range(layers)]
         self.dram_limit_blk = int(KVCacheArgs.dram_limit_gb * (1024**3) // self.block_nbytes)
 
@@ -319,6 +326,11 @@ class KVOffloader:
 
     # ---------------- SSD spill / load --------------
     def _spill_to_ssd(self, L:int, B:int):
+        if self.ssd is None:
+            # DRAM-only mode: just free the memory
+            self.k_cpu[L][B] = self.v_cpu[L][B] = None
+            return
+        
         self.ssd.write(L, B,
             torch.cat([self.k_cpu[L][B], self.v_cpu[L][B]], dim=-1))
         self.k_cpu[L][B] = self.v_cpu[L][B] = None
@@ -349,6 +361,11 @@ class KVOffloader:
             torch.cuda.empty_cache()
             self._ssd_buffer = torch.empty(shape, dtype=torch.float16,
                                          device=self.device, non_blocking=True)
+        
+        if self.ssd is None:
+            # DRAM-only mode: data is lost, allocate empty
+            self._alloc_block(L, B, self.max_batch)
+            return
         
         # 复用缓冲区
         buf_gpu = self._ssd_buffer
