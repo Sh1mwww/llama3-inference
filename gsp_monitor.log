@@ -1,0 +1,38 @@
+2025-07-13 16:53:08,926 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 16:53:08,961 - INFO - Optimized GSP monitoring started (base interval: 60.0s, smart mode: True)
+2025-07-13 16:53:08,962 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 16:54:08,995 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 16:55:09,034 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 16:59:25,999 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 16:59:26,032 - INFO - Optimized GSP monitoring started (base interval: 60.0s, smart mode: True)
+2025-07-13 16:59:26,032 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 17:00:26,068 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 17:01:26,109 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 17:02:26,148 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 17:02:43,279 - INFO - GSP monitoring stopped and resources cleaned
+2025-07-13 17:06:29,052 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 17:06:29,081 - INFO - Optimized GSP monitoring started (base interval: 60.0s, smart mode: True)
+2025-07-13 17:06:29,082 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 17:07:29,118 - INFO - Minimal keepalive tensor created (400 bytes)
+2025-07-13 17:08:29,145 - ERROR - Failed to create keepalive tensor: CUDA error: unspecified launch failure
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2025-07-13 17:09:29,172 - ERROR - Failed to create keepalive tensor: CUDA error: unspecified launch failure
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2025-07-13 17:10:29,200 - ERROR - Failed to create keepalive tensor: CUDA error: unspecified launch failure
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2025-07-13 17:11:29,224 - ERROR - Failed to create keepalive tensor: CUDA error: unspecified launch failure
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+2025-07-13 17:15:46,226 - INFO - GSP monitoring stopped and resources cleaned
+2025-07-13 17:16:08,237 - INFO - GSP monitoring stopped and resources cleaned
