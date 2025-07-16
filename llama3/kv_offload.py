@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from .config import KVCacheArgs  
 from .SSDBacked import RawBlockKVBackend
+from .global_state_tracker import GlobalStateTracker, StorageType, get_global_tracker, init_global_tracker
 
 BLOCK = 256  # tokens / block
 
@@ -61,13 +62,29 @@ class KVOffloader:
                 blk_per_layer=n_blocks,
                 max_concurrent_io=getattr(KVCacheArgs, 'max_concurrent_io', 4)
             )
-            print("[INFO] SSD backend initialized successfully")
+            # print("[INFO] SSD backend initialized successfully")
         except (PermissionError, FileNotFoundError, OSError) as e:
             print(f"[WARNING] Failed to initialize SSD backend: {e}")
             print("[INFO] Falling back to DRAM-only mode")
             self.ssd = None
         self.on_ssd = [[False]*n_blocks for _ in range(layers)]
         self.dram_limit_blk = int(KVCacheArgs.dram_limit_gb * (1024**3) // self.block_nbytes)
+        
+        # 初始化或获取全局状态跟踪器
+        self.global_tracker = get_global_tracker()
+        if self.global_tracker is None:
+            self.global_tracker = init_global_tracker(max_batch, layers, n_blocks)
+        
+        # 设置存储容量限制
+        if self.global_tracker:
+            self.global_tracker.storage_stats[StorageType.DRAM]['capacity_limit'] = self.dram_limit_blk
+            if self.ssd:
+                # 估算SSD容量（基于裸分区大小）
+                try:
+                    ssd_capacity_blk = int(getattr(KVCacheArgs, 'ssd_capacity_gb', 100) * (1024**3) // self.block_nbytes)
+                    self.global_tracker.storage_stats[StorageType.SSD]['capacity_limit'] = ssd_capacity_blk
+                except:
+                    pass
 
     # ---------------- internal -----------------
     def _alloc_block(self, layer:int, blk:int, batch_sz:int):
@@ -89,15 +106,33 @@ class KVOffloader:
         # 同时更新全局重要性
         self.global_importance[layer, blk] = max(self.global_importance[layer, blk], 1e-6)
         
+        # 更新全局跟踪器: HBM → DRAM
+        if self.global_tracker:
+            # 从HBM移除
+            self.global_tracker.update_hbm_storage(batch_idx, layer, [blk], 'remove')
+            # 添加到DRAM
+            importance_score = float(self.importance[batch_idx, layer, blk]) if batch_idx < self.max_batch else 1e-6
+            self.global_tracker.update_dram_storage(batch_idx, layer, [blk], 'add', [importance_score])
+        
         self._maybe_evict()
 
-    def fetch(self, layer:int, blocks:torch.Tensor):
+    def fetch(self, layer:int, blocks:torch.Tensor, batch_idx:int = 0):
         """Return concat-K/V of given *unique* block indices (ascending)."""
 
         uniq = blocks.unique().tolist() 
         need_load = [b for b in uniq if self.on_ssd[layer][b]]
         for b in need_load:               # 先把 SSD → DRAM
             self._load_from_ssd(layer, b)
+        
+        # 更新全局跟踪器: DRAM → HBM
+        if self.global_tracker:
+            for blk in uniq:
+                if not self.on_ssd[layer][blk]:  # 如果不在SSD上，说明在DRAM中
+                    # 从DRAM移除
+                    self.global_tracker.update_dram_storage(batch_idx, layer, [blk], 'remove')
+                    # 添加到HBM
+                    importance_score = float(self.importance[batch_idx, layer, blk]) if batch_idx < self.max_batch else 1e-6
+                    self.global_tracker.update_hbm_storage(batch_idx, layer, [blk], 'add', [importance_score])
             
         k_parts, v_parts = [], []
         stream = self.copy_stream or torch.cuda.current_stream()
@@ -328,8 +363,22 @@ class KVOffloader:
     def _spill_to_ssd(self, L:int, B:int):
         if self.ssd is None:
             # DRAM-only mode: just free the memory
+            # 更新全局跟踪器: 从DRAM移除（数据丢失）
+            if self.global_tracker:
+                # 查找所有使用此block的batch
+                for batch_idx in range(self.max_batch):
+                    self.global_tracker.update_dram_storage(batch_idx, L, [B], 'remove')
             self.k_cpu[L][B] = self.v_cpu[L][B] = None
             return
+        
+        # 更新全局跟踪器: DRAM → SSD
+        if self.global_tracker:
+            # 查找所有使用此block的batch并移动到SSD
+            for batch_idx in range(self.max_batch):
+                if (batch_idx, L) in self.global_tracker.dram_storage and B in self.global_tracker.dram_storage[(batch_idx, L)]:
+                    importance_score = float(self.importance[batch_idx, L, B]) if batch_idx < self.max_batch else 1e-6
+                    self.global_tracker.update_dram_storage(batch_idx, L, [B], 'remove')
+                    self.global_tracker.update_ssd_storage(batch_idx, L, [B], 'add', [importance_score])
         
         self.ssd.write(L, B,
             torch.cat([self.k_cpu[L][B], self.v_cpu[L][B]], dim=-1))
@@ -367,6 +416,15 @@ class KVOffloader:
             self._alloc_block(L, B, self.max_batch)
             return
         
+        # 更新全局跟踪器: SSD → DRAM
+        if self.global_tracker:
+            # 查找所有使用此block的batch并移动到DRAM
+            for batch_idx in range(self.max_batch):
+                if (batch_idx, L) in self.global_tracker.ssd_storage and B in self.global_tracker.ssd_storage[(batch_idx, L)]:
+                    importance_score = float(self.importance[batch_idx, L, B]) if batch_idx < self.max_batch else 1e-6
+                    self.global_tracker.update_ssd_storage(batch_idx, L, [B], 'remove')
+                    self.global_tracker.update_dram_storage(batch_idx, L, [B], 'add', [importance_score])
+        
         # 复用缓冲区
         buf_gpu = self._ssd_buffer
         self.ssd.read(L, B, buf_gpu)
@@ -375,6 +433,25 @@ class KVOffloader:
         self.k_cpu[L][B].copy_(k_gpu.cpu())
         self.v_cpu[L][B].copy_(v_gpu.cpu())
         self.on_ssd[L][B] = False
+
+    def set_current_execution(self, batch_idx: int, layer_idx: int):
+        """设置当前正在执行的batch和layer"""
+        if self.global_tracker:
+            self.global_tracker.set_current_execution(batch_idx, layer_idx)
+    
+    def get_global_state(self):
+        """获取全局状态"""
+        if self.global_tracker:
+            return self.global_tracker.get_current_state()
+        return None
+    
+    def print_global_state(self):
+        """打印全局状态"""
+        if self.global_tracker:
+            self.global_tracker.print_current_state()
+            self.global_tracker.print_storage_utilization()
+        else:
+            print("Global tracker not available")
 
     def __del__(self):
         """清理资源"""
