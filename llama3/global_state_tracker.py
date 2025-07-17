@@ -57,6 +57,9 @@ class GlobalStateTracker:
         # 历史记录
         self.operation_history = []
         self.max_history_size = 1000
+        
+        # 未来批次列表
+        self.future_batches: List[int] = [] 
     
     def set_current_execution(self, batch_idx: int, layer_idx: int):
         """设置当前正在执行的batch和layer"""
@@ -328,6 +331,22 @@ class GlobalStateTracker:
             print(f"  {storage_type.upper()}: {info['used']}/{info['capacity']} "
                   f"({info['utilization_rate']:.1%}) - 剩余: {info['free']}")
 
+    def register_future_batch(self, batch_idx: List[int]):
+        """
+        一次性注册接下来要跑的 batch 顺序
+        """
+        with self._lock:
+           self.future_batches = batch_idx.copy()
+           self._log_operation('register_future_batches', f"batches={batch_idx}")
+    
+    def get_future_batches(self, offset: int = 1) -> List[int]:
+        """
+        向前看第 offset 个 batch; offset=1 ==> “下一个 batch”
+        """
+        with self._lock:
+            idx = offset - 1
+            return self.future_batches[idx:] if 0 <= idx < len(self.future_batches) else None
+    
 # 全局实例
 _global_tracker = None
 
@@ -346,3 +365,13 @@ def reset_global_tracker():
     """重置全局跟踪器"""
     global _global_tracker
     _global_tracker = None
+    
+def get_current_batch():
+    """获取当前执行的batch索引"""
+    tracker = get_global_tracker()
+    return tracker.current_batch if tracker else None
+
+def get_future_batches(offset: int = 1) -> List[int]:
+    """获取未来的batch列表"""
+    tracker = get_global_tracker()
+    return tracker.get_future_batches(offset) if tracker else None

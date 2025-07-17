@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 from .config import ModelArgs
 from .kv_offload import KVOffloader, BLOCK
+from .global_state_tracker import GlobalStateTracker
 
 # ---------- Enhanced timing util ----------
 class PerformanceTracker:
