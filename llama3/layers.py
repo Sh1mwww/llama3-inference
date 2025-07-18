@@ -19,8 +19,7 @@ logger = logging.getLogger(__name__)
 
 from .config import ModelArgs
 from .kv_offload import KVOffloader, BLOCK
-from .global_state_tracker import GlobalStateTracker
-
+from .global_state_tracker import GlobalStateTracker, get_global_tracker, init_global_tracker
 # ---------- Enhanced timing util ----------
 class PerformanceTracker:
     def __init__(self):
@@ -65,8 +64,17 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
     
     start_event = None
     end_event = None
+    cuda_error_occurred = False
     
     try:
+        # Check CUDA context health before creating events
+        try:
+            torch.cuda.current_device()
+        except RuntimeError:
+            logger.warning(f"CUDA context unhealthy for {key}, skipping timing")
+            yield
+            return
+            
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         
@@ -75,30 +83,36 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
         
     except torch.cuda.OutOfMemoryError as e:
         logger.error(f"CUDA OOM in timer for {key}: {e}")
+        cuda_error_occurred = True
         torch.cuda.empty_cache()
         raise
     except RuntimeError as e:
         if "CUDA" in str(e):
             logger.error(f"CUDA error in timer for {key}: {e}")
+            cuda_error_occurred = True
             raise
         else:
             logger.error(f"Runtime error in timer for {key}: {e}")
             raise
     finally:
-        try:
-            if end_event is not None:
+        # Only attempt cleanup if no CUDA error occurred and events were created
+        if not cuda_error_occurred and start_event is not None and end_event is not None:
+            try:
+                # Check if CUDA context is still valid
+                torch.cuda.current_device()
+                
                 end_event.record()
                 torch.cuda.synchronize()
                 
-                if start_event is not None:
-                    elapsed_us = int(start_event.elapsed_time(end_event) * 1000)
-                    
-                    with PERF_TRACKER.lock:
-                        PERF_TRACKER.stats[key] += elapsed_us
-                        if layer_id is not None:
-                            PERF_TRACKER.add_layer_stat(layer_id, key, elapsed_us)
-        except Exception as e:
-            logger.warning(f"Error in cuda_timer cleanup for {key}: {e}")
+                elapsed_us = int(start_event.elapsed_time(end_event) * 1000)
+                
+                with PERF_TRACKER.lock:
+                    PERF_TRACKER.stats[key] += elapsed_us
+                    if layer_id is not None:
+                        PERF_TRACKER.add_layer_stat(layer_id, key, elapsed_us)
+            except Exception as e:
+                logger.warning(f"Error in cuda_timer cleanup for {key}: {e}")
+                # Don't re-raise exceptions in cleanup
 
 # ---------- Optimized weight management ----------
 class WeightManager:
@@ -207,7 +221,7 @@ class WeightManager:
                     try:
                         with self.gpu_manager.safe_cuda_context(device_id):
                             with torch.cuda.stream(self.weight_stream):
-                                for module_name, module in modules.items():
+                                for module in modules.values():
                                     for param in module.parameters():
                                         if not param.is_cuda:
                                             param.data = param.data.to(self.device, non_blocking=True)
@@ -253,7 +267,7 @@ class WeightManager:
     def _sync_load_weights(self, modules: Dict[str, nn.Module]):
         """同步加载权重"""
         try:
-            for module_name, module in modules.items():
+            for module in modules.values():
                 for param in module.parameters():
                     if not param.is_cuda and self.is_cuda:
                         param.data = param.data.to(self.device)
@@ -458,6 +472,14 @@ class SelfAttention(nn.Module):
                     raise RuntimeError(f"GPU OOM: Cannot allocate attention buffers. Try reducing batch_size (current: {batch_size}) or max sequence length.") from e
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
+        # Check CUDA context health
+        if x.is_cuda:
+            try:
+                torch.cuda.current_device()
+            except RuntimeError as e:
+                logger.error(f"CUDA context error in attention forward: {e}")
+                raise RuntimeError("CUDA context is corrupted") from e
+        
         if not self.wq.weight.is_cuda:
             for mod in (self.wq, self.wk, self.wv, self.wo):
                 mod.to(x.device, non_blocking=True)
@@ -467,6 +489,13 @@ class SelfAttention(nn.Module):
         
         # 确保权重在GPU上
         self._ensure_weights_cuda()
+        
+        # 更新全局状态跟踪器
+        tracker = get_global_tracker()
+        if tracker:
+            # 使用start_pos推断batch_idx，这是一个简化的方法
+            batch_idx = start_pos // 1000  # 假设每个batch最多1000个token
+            tracker.set_current_execution(batch_idx, self.layer_id)
         
         # 预取下一层权重
         if hasattr(self, '_next_layer_modules'):
@@ -610,7 +639,23 @@ class SelfAttention(nn.Module):
         # 记录性能统计
         total_time = (time.time() - start_time) * 1000000  # 转换为微秒
         PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
-        
+        tracker = get_global_tracker()
+        if tracker:
+            print("当前 batch:", tracker.current_batch)
+            print("下一个 batch:", tracker.get_future_batches())        # offset=1
+            print("第三个批次:", tracker.get_future_batches(3))        # offset=3
+        else:
+            # 尝试在这里初始化 tracker（作为后备方案）
+            try:
+                # 使用默认参数初始化
+                tracker = init_global_tracker(max_batch=8, layers=32, n_blocks=100)
+                # 设置默认的future batches
+                tracker.register_future_batch([0, 1, 2, 3, 4, 5, 6, 7])
+                print("✅ Global tracker initialized with default parameters")
+                print("当前 batch:", tracker.current_batch)
+                print("下一个 batch:", tracker.get_future_batches())
+            except Exception as e:
+                print(f"⚠️  Global tracker not initialized and failed to initialize: {e}")
         return result
 
 # ---------- Optimized FeedForward ----------
@@ -646,6 +691,14 @@ class FeedForward(nn.Module):
         self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Check CUDA context health
+        if x.is_cuda:
+            try:
+                torch.cuda.current_device()
+            except RuntimeError as e:
+                logger.error(f"CUDA context error in feedforward: {e}")
+                raise RuntimeError("CUDA context is corrupted") from e
+        
         self._ensure_weights_cuda()
         
         with cuda_timer("ffn_us", self.layer_id):
