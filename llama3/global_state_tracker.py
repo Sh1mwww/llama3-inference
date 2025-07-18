@@ -371,6 +371,11 @@ def get_current_batch():
     tracker = get_global_tracker()
     return tracker.current_batch if tracker else None
 
+def get_next_batch(self, offset: int = 1) -> Optional[int]:
+    """返回 offset 之后**单个** batch 索引；默认就是“下一个 batch”"""
+    idx = offset - 1
+    return self.future_batches[idx] if 0 <= idx < len(self.future_batches) else None
+
 def get_future_batches(offset: int = 1) -> List[int]:
     """获取未来的batch列表"""
     tracker = get_global_tracker()

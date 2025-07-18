@@ -91,12 +91,12 @@ class LLaMA:
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
         profile_output_dir: Optional[str] = None,
-        batch_size: int = 4,  # 每个batch的prompt数量
+        batch_size: int = 4,  
     ):
-        # 根据prompts数量和batch_size计算需要的batch数量
+        
         num_batches = (len(prompts) + batch_size - 1) // batch_size
         
-        # 注册实际需要的batch indices
+        # register future batches in the global state tracker
         from .global_state_tracker import get_global_tracker
         tracker = get_global_tracker()
         if tracker:
@@ -113,7 +113,11 @@ class LLaMA:
             self.tokenizer.encode(p, add_special_tokens=False) for p in prompts
         ]
         
-        # 按batch_size分组处理prompts
+        '''
+        all_out_tokens: 最终每个 prompt 生成的 token ID 序列
+        all_out_text: 对上面 token 的 decode 结果
+        kv_profile: 每个 token 的 KV 访问 profile 记录（带时间和内存）
+        '''
         all_out_tokens, all_out_text = [], []
         kv_profile = []
         
@@ -130,7 +134,11 @@ class LLaMA:
                 
                 print(f"[INFO] Processing batch {batch_idx + 1}/{num_batches} with {len(batch_prompts)} prompts")
                 
-                # 处理当前批次
+                '''
+                bsz: 当前 batch 的样本数
+                max_prompt: 当前 batch 中最长的 prompt token 数
+                total_len: 当前 batch 需要分配的最大序列长度 (最长 prompt + 可生成的 token)
+                '''
                 bsz = len(batch_prompts)
                 max_prompt = max(len(x) for x in batch_prompts)
                 total_len = min(self.args.max_seq_len, max_gen_len + max_prompt)
@@ -140,17 +148,27 @@ class LLaMA:
                 continue
 
             try:
+                '''
+                获取 tokenizer 里用于 padding 的 token ID;
+                如果 tokenizer 没定义 pad_token_id(例如原生 LLaMA 就没有），则 fallback 使用 eos_token_id 来填充；
+                这个 pad_id 将用于填满每条 prompt 后面的空白位置。
+                '''
                 pad_id = (
                     self.tokenizer.pad_token_id
                     if self.tokenizer.pad_token_id is not None
                     else self.tokenizer.eos_token_id
                 )
+                '''
+                tokens 是输入模型的 token ID 二维张量,shape 为 (bsz, total_len);
+                初始化时全部填充为 pad_id,即“空”的标记;
+                '''
                 tokens = torch.full(
                     (bsz, total_len),
                     pad_id,
                     dtype=torch.long,
                     device=self.args.device,
                 )
+
                 for i, tok in enumerate(batch_prompts):
                     tokens[i, : len(tok)] = torch.tensor(tok, device=self.args.device)
 
@@ -168,7 +186,14 @@ class LLaMA:
                     continue
                 else:
                     raise
-
+            '''
+            每个 step(cur_pos)做：
+            1.调用模型进行一次 forward输入当前序列的最后一个 token;
+            2.得到 logits → 根据温度采样或 argmax,得到下一个 token;
+            3.写入 tokens;
+            4.如果所有样本都生成了 <eos>，提前退出；
+            5.同时收集 KV cache profiling 信息（时间、空间）；
+            '''
             for cur_pos in tqdm(range(1, total_len), desc=f"Generating tokens for batch {batch_idx + 1}"):
                 try:
                     # ---- forward ----

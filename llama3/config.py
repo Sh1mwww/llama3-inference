@@ -45,7 +45,7 @@ class ModelArgs:
     use_scaled_rope: bool
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-5
-    max_batch_size: int = 32  # 降低批次大小減少記憶體使用
+    max_batch_size: int = 512  
     max_seq_len: int = 2048
     device: str = "cuda"
     topk_blk: int = 8

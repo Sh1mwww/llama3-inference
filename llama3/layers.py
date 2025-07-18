@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 from .config import ModelArgs
 from .kv_offload import KVOffloader, BLOCK
-from .global_state_tracker import GlobalStateTracker, get_global_tracker, init_global_tracker
+from .global_state_tracker import GlobalStateTracker, get_global_tracker, init_global_tracker, get_next_batch
 # ---------- Enhanced timing util ----------
 class PerformanceTracker:
     def __init__(self):
@@ -496,6 +496,9 @@ class SelfAttention(nn.Module):
             # 使用start_pos推断batch_idx，这是一个简化的方法
             batch_idx = start_pos // 1000  # 假设每个batch最多1000个token
             tracker.set_current_execution(batch_idx, self.layer_id)
+            if self.layer_id == 0 and start_pos == 0:
+                print(f"当前 batch: {batch_idx}")
+                print(f"下一个 batch: {tracker.get_next_batch()}")
         
         # 预取下一层权重
         if hasattr(self, '_next_layer_modules'):
@@ -535,7 +538,7 @@ class SelfAttention(nn.Module):
         blk_idx = start_pos // self.block_sz 
         
         # 获取Top-K blocks
-        blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk)
+        blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk, batch_idx=batch_idx)
         if blk_idx not in blocks:
             blocks.append(blk_idx)
         blocks = sorted(blocks)
@@ -641,9 +644,12 @@ class SelfAttention(nn.Module):
         PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
         tracker = get_global_tracker()
         if tracker:
-            print("当前 batch:", tracker.current_batch)
-            print("下一个 batch:", tracker.get_future_batches())        # offset=1
-            print("第三个批次:", tracker.get_future_batches(3))        # offset=3
+            cur = tracker.current_batch
+            nxt = tracker.get_next_batch()          # 只取一个数字
+            third = tracker.get_next_batch(3)       # 第三个批次
+            print(f"当前 batch: {cur}")
+            print(f"下一个 batch: {nxt}")
+            print(f"第三个批次: {third}")
         else:
             # 尝试在这里初始化 tracker（作为后备方案）
             try:
