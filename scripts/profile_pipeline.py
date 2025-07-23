@@ -852,9 +852,31 @@ def main():
         try:
             all_outs = []
             batch_count = 0
+            
+            # 預先計算總batch數並設置future_batches
+            total_batches = (len(prompts) + args.batch_size - 1) // args.batch_size
+            try:
+                from llama3.global_state_tracker import get_global_tracker
+                tracker = get_global_tracker()
+                if tracker:
+                    all_batch_indices = list(range(total_batches))
+                    tracker.register_future_batch(all_batch_indices)
+                    print(f"[INFO] Pre-registered {total_batches} batches: {all_batch_indices}")
+            except Exception as e:
+                print(f"[WARNING] Failed to pre-register batches: {e}")
+            
             for prompt_batch in safe_batch_processing(prompts, args.batch_size, max_seq_len=args.max_seq_len, logger=logger):
                 batch_count += 1
                 logger.debug(f"Processing batch {batch_count} with {len(prompt_batch)} prompts")
+                
+                # 更新current_batch
+                current_batch_idx = batch_count - 1  # batch_count-1因為從0開始索引
+                try:
+                    tracker = get_global_tracker()
+                    if tracker:
+                        tracker.set_current_execution(current_batch_idx, 0)
+                except Exception as e:
+                    print(f"[WARNING] Failed to set current batch: {e}")
                 
                 _, outs = llama.text_completion(
                     prompt_batch,

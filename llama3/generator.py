@@ -101,8 +101,12 @@ class LLaMA:
         tracker = get_global_tracker()
         if tracker:
             actual_batches = list(range(num_batches))
-            tracker.register_future_batch(actual_batches)
-            print(f"[INFO] Registered {num_batches} batches for {len(prompts)} prompts (batch_size={batch_size}): {actual_batches}")
+            # 只在future_batches為空時註冊，避免覆蓋已存在的batch序列
+            if not tracker.future_batches:
+                tracker.register_future_batch(actual_batches)
+                print(f"[INFO] Registered {num_batches} batches for {len(prompts)} prompts (batch_size={batch_size}): {actual_batches}")
+        else:
+            print("[WARNING] Global tracker not found during batch registration")
         
         self.args.max_batch_size = max(self.args.max_batch_size, len(prompts))
 
@@ -128,11 +132,16 @@ class LLaMA:
                 end_idx = min(start_idx + batch_size, len(prompts_tok))
                 batch_prompts = prompts_tok[start_idx:end_idx]
                 
-                # 更新tracker的当前批次
-                if tracker:
-                    tracker.set_current_execution(batch_idx, 0)
-                
-                print(f"[INFO] Processing batch {batch_idx + 1}/{num_batches} with {len(batch_prompts)} prompts")
+                # 顯示全局batch進度（如果可用）
+                try:
+                    if tracker and tracker.future_batches:
+                        global_batch_idx = tracker.current_batch
+                        total_global_batches = len(tracker.future_batches)
+                        print(f"[INFO] Processing batch {global_batch_idx + 1}/{total_global_batches} with {len(batch_prompts)} prompts")
+                    else:
+                        print(f"[INFO] Processing batch {batch_idx + 1}/{num_batches} with {len(batch_prompts)} prompts")
+                except:
+                    print(f"[INFO] Processing batch {batch_idx + 1}/{num_batches} with {len(batch_prompts)} prompts")
                 
                 '''
                 bsz: 当前 batch 的样本数

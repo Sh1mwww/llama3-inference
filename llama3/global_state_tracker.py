@@ -341,11 +341,26 @@ class GlobalStateTracker:
     
     def get_future_batches(self, offset: int = 1) -> List[int]:
         """
-        向前看第 offset 个 batch; offset=1 ==> “下一个 batch”
+        向前看第 offset 个 batch; offset=1 ==> "下一个 batch"
         """
         with self._lock:
             idx = offset - 1
             return self.future_batches[idx:] if 0 <= idx < len(self.future_batches) else None
+    
+    def get_next_batch(self, offset: int = 1) -> Optional[int]:
+        """返回 offset 之后**单个** batch 索引；默认就是"下一个 batch"""
+        with self._lock:
+            if not self.future_batches:
+                return None
+            
+            # 找到当前batch在future_batches中的位置
+            try:
+                current_pos = self.future_batches.index(self.current_batch)
+                next_pos = current_pos + offset
+                return self.future_batches[next_pos] if next_pos < len(self.future_batches) else None
+            except (ValueError, IndexError):
+                # 如果当前batch不在future_batches中，或索引越界
+                return None
     
 # 全局实例
 _global_tracker = None
@@ -371,10 +386,6 @@ def get_current_batch():
     tracker = get_global_tracker()
     return tracker.current_batch if tracker else None
 
-def get_next_batch(self, offset: int = 1) -> Optional[int]:
-    """返回 offset 之后**单个** batch 索引；默认就是“下一个 batch”"""
-    idx = offset - 1
-    return self.future_batches[idx] if 0 <= idx < len(self.future_batches) else None
 
 def get_future_batches(offset: int = 1) -> List[int]:
     """获取未来的batch列表"""
