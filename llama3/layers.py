@@ -1,10 +1,4 @@
-# ============================================================
-# 优化版本：
-#   • 改进权重管理和异步加载
-#   • 集成优化的KV offloader
-#   • 增强的性能统计和监控
-#   • 智能的内存管理
-# ============================================================
+
 
 import math
 from typing import Optional, List, Dict
@@ -640,30 +634,30 @@ class SelfAttention(nn.Module):
         # 记录性能统计
         total_time = (time.time() - start_time) * 1000000  # 转换为微秒
         PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
-        # 批次跟踪（可選的調試信息）
-        if False:  # 設置為 True 來啟用調試打印
-            tracker = get_global_tracker()
-            if tracker and self.layer_id == 0:  # 只在第一層打印，避免重複
-                cur = tracker.current_batch
-                nxt = tracker.get_next_batch()          # 只取一个数字
-                third = tracker.get_next_batch(3)       # 第三个批次
-                print(f"DEBUG - Layer 0: future_batches={tracker.future_batches}, current_batch={cur}")
-                print(f"当前 batch: {cur}")
-                print(f"下一个 batch: {nxt}")
-                print(f"第三个批次: {third}")
-        elif not tracker and self.layer_id == 0:  # 只在第一層且tracker不存在時初始化
-            # 尝试在这里初始化 tracker（作为后备方案）
-            try:
-                # 使用默认参数初始化
-                tracker = init_global_tracker(max_batch=8, layers=32, n_blocks=100)
-                # 设置默认的future batches
-                tracker.register_future_batch([0, 1, 2, 3, 4, 5, 6, 7])
-                print("✅ Global tracker initialized with default parameters in layer.py")
-                print("当前 batch:", tracker.current_batch)
-                print("下一个 batch:", tracker.get_next_batch())
-                print("第三个批次:", tracker.get_next_batch(3))
-            except Exception as e:
-                print(f"⚠️  Global tracker not initialized and failed to initialize: {e}")
+        # # 批次跟踪（可選的調試信息）
+        # if False:  # 設置為 True 來啟用調試打印
+        #     tracker = get_global_tracker()
+        #     if tracker and self.layer_id == 0:  # 只在第一層打印，避免重複
+        #         cur = tracker.current_batch
+        #         nxt = tracker.get_next_batch()          # 只取一个数字
+        #         third = tracker.get_next_batch(3)       # 第三个批次
+        #         print(f"DEBUG - Layer 0: future_batches={tracker.future_batches}, current_batch={cur}")
+        #         print(f"当前 batch: {cur}")
+        #         print(f"下一个 batch: {nxt}")
+        #         print(f"第三个批次: {third}")
+        # elif not tracker and self.layer_id == 0:  # 只在第一層且tracker不存在時初始化
+        #     # 尝试在这里初始化 tracker（作为后备方案）
+        #     try:
+        #         # 使用默认参数初始化
+        #         tracker = init_global_tracker(max_batch=8, layers=32, n_blocks=100)
+        #         # 设置默认的future batches
+        #         tracker.register_future_batch([0, 1, 2, 3, 4, 5, 6, 7])
+        #         print("✅ Global tracker initialized with default parameters in layer.py")
+        #         print("当前 batch:", tracker.current_batch)
+        #         print("下一个 batch:", tracker.get_next_batch())
+        #         print("第三个批次:", tracker.get_next_batch(3))
+        #     except Exception as e:
+        #         print(f"⚠️  Global tracker not initialized and failed to initialize: {e}")
         return result
 
 # ---------- Optimized FeedForward ----------

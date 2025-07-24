@@ -59,7 +59,13 @@ class GlobalStateTracker:
         self.max_history_size = 1000
         
         # 未来批次列表
-        self.future_batches: List[int] = [] 
+        self.future_batches: List[int] = []
+        
+        # ZigZag调度相关
+        self.zigzag_enabled = False
+        self.zigzag_schedule: List[Tuple[int, int]] = []  # [(batch_idx, layer_idx), ...]
+        self.zigzag_current_index = 0  # 当前执行的调度索引
+        self.zigzag_completed_executions: List[Tuple[int, int]] = []  # 已完成的执行 
     
     def set_current_execution(self, batch_idx: int, layer_idx: int):
         """设置当前正在执行的batch和layer"""
