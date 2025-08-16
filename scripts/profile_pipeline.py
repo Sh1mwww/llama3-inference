@@ -411,7 +411,7 @@ def patch_kv_offloader_detailed():
                getattr(self, "blk_bytes", 0))
 
     # ---------- GPU → DRAM ----------
-    def wrapped_push(self, layer, blk, k, v):
+    def wrapped_push(self, layer, blk, k, v, *args, **kwargs):
         if not orig_push:
             return None
         
@@ -424,12 +424,12 @@ def patch_kv_offloader_detailed():
                                     'gpu_to_dram_bytes',
                                     'gpu_to_dram_count',
                                     bytes_tx):
-                result = orig_push(self, layer, blk, k, v)
+                result = orig_push(self, layer, blk, k, v, *args, **kwargs)
                 update_memory_stats()  # 更新内存统计
                 return result
         except Exception as e:
             logging.getLogger(__name__).warning(f"Error in wrapped_push: {e}")
-            return orig_push(self, layer, blk, k, v)
+            return orig_push(self, layer, blk, k, v, *args, **kwargs)
 
     # ---------- DRAM (+SSD) → GPU ----------
     def wrapped_fetch(self, layer, blocks):
@@ -797,6 +797,12 @@ def main():
     print("\n📦 Loading model...")
     try:
         llama = LLaMA.build(ckpt, load_model=True, device="cpu")
+        # 验证模型是否正确加载
+        if not hasattr(llama, 'model') or llama.model is None:
+            raise RuntimeError("Model failed to load properly - llama.model is None")
+        if not hasattr(llama.model, 'named_children'):
+            raise RuntimeError(f"Model is not a PyTorch module - got {type(llama.model)}")
+        print(f"✅ Model loaded successfully: {type(llama.model)}")
     except Exception as e:
         print(f"❌ Error loading model: {e}")
         sys.exit(1)
@@ -810,32 +816,81 @@ def main():
         print(f"⚠️  Error configuring KV cache: {e}")
     
     # 转移到 GPU
+    # if args.device.startswith("cuda"):
+    #     if not torch.cuda.is_available():
+    #         print("❌ CUDA not available but cuda device specified")
+    #         sys.exit(1)
+        
+    #     print("🔄 Transferring to GPU...")
+    #     # try:
+    #     #     llama.model.to(args.device)
+    #     #     torch.cuda.synchronize()
+    #     # except Exception as e:
+    #     #     print(f"❌ Error transferring to GPU: {e}")
+    #     #     sys.exit(1)
     if args.device.startswith("cuda"):
         if not torch.cuda.is_available():
             print("❌ CUDA not available but cuda device specified")
             sys.exit(1)
-        
-        print("🔄 Transferring to GPU...")
+
+        print("🔄 Moving model components to GPU (simplified approach)...")
         try:
-            llama.model.to(args.device)
-            torch.cuda.synchronize()
+            # 暂时禁用复杂的权重流式传输，直接移动整个模型
+            print(f"   Moving entire model to {args.device}...")
+            llama.model = llama.model.to(args.device)
+            print("✅ Model moved to GPU")
+            
+            # 验证组件设备
+            print("🔍 Verifying component devices:")
+            print(f"   embed_tokens: {llama.model.embed_tokens.weight.device}")
+            print(f"   norm: {llama.model.norm.weight.device}")
+            print(f"   output: {llama.model.output.weight.device}")
+            if hasattr(llama.model, 'freqs_complex'):
+                print(f"   freqs_complex: {llama.model.freqs_complex.device}")
+            print(f"   Layer 0 attention: {next(llama.model.layers[0].attention.parameters()).device}")
+            print(f"   Layer 0 ffn: {next(llama.model.layers[0].feed_forward.parameters()).device}")
+            
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"❌ CUDA OOM when moving model: {e}")
+            print("🔄 Falling back to CPU...")
+            args.device = "cpu"
+            llama.args.device = "cpu"
         except Exception as e:
-            print(f"❌ Error transferring to GPU: {e}")
-            sys.exit(1)
-    
+            print(f"⚠️  Error moving model: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("⚙️  Running on CPU")
     llama.args.device = args.device
     
     # 配置 offloader streams
+    # try:
+    #     for blk in llama.model.layers:
+    #         if hasattr(blk, 'attention') and hasattr(blk.attention, 'offloader'):
+    #             off = blk.attention.offloader
+    #             off.device = args.device
+    #             if torch.cuda.is_available():
+    #                 off.copy_stream = torch.cuda.Stream(device=args.device)
+    # except Exception as e:
+    #     print(f"⚠️  Error configuring offloader streams: {e}")
+    
+    from llama3.stream_mnt import get_streams
+    streams = get_streams(args.device) if args.device.startswith("cuda") else None
     try:
-        for blk in llama.model.layers:
-            if hasattr(blk, 'attention') and hasattr(blk.attention, 'offloader'):
-                off = blk.attention.offloader
-                off.device = args.device
-                if torch.cuda.is_available():
-                    off.copy_stream = torch.cuda.Stream(device=args.device)
+        if streams:
+            for blk in llama.model.layers:
+                if hasattr(blk, 'attention') and hasattr(blk.attention, 'offloader'):
+                    off = blk.attention.offloader
+                    off.device = args.device
+                    off.h2d_stream = streams.kv_h2d
+                    off.d2h_stream = streams.kv_d2h
+                    off.copy_stream = streams.kv_h2d  # 兼容fetch里使用copy_stream的旧代码
     except Exception as e:
         print(f"⚠️  Error configuring offloader streams: {e}")
-    
+
+    # 预热已被简化处理替代
+    # 所有权重已在GPU上，无需额外预热
+
     print("✅ Model ready for inference")
     
     # 执行多次推理

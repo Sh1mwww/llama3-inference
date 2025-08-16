@@ -44,13 +44,22 @@ class KVOffloader:
 
         self.device = device
         self.dtype_bytes = dtype_bytes
-        self.copy_stream = (torch.cuda.Stream(device=device)
-                            if device.startswith("cuda") else None)
+
+        self.h2d_stream = (torch.cuda.Stream(device=device, priority=0)
+                           if device.startswith("cuda") else None)
+        self.d2h_stream = (torch.cuda.Stream(device=device, priority=+1)
+                           if device.startswith("cuda") else None)
+        self.copy_stream = self.h2d_stream
+
         self.heads = heads
         self.dim = dim
         self.max_batch = max_batch
         self.layers = layers
         self.n_blocks = n_blocks
+
+        # 逐 token 的字节数（K+V）
+        self.token_nbytes = (max_batch * heads * dim) * dtype_bytes * 2
+
         self.block_nbytes = (max_batch * heads * dim) * dtype_bytes * 2  # K+V
         
         # 尝试初始化SSD后端，如果失败则禁用
@@ -67,6 +76,7 @@ class KVOffloader:
             print(f"[WARNING] Failed to initialize SSD backend: {e}")
             print("[INFO] Falling back to DRAM-only mode")
             self.ssd = None
+
         self.on_ssd = [[False]*n_blocks for _ in range(layers)]
         self.dram_limit_blk = int(KVCacheArgs.dram_limit_gb * (1024**3) // self.block_nbytes)
         
@@ -94,11 +104,15 @@ class KVOffloader:
         self.v_cpu[layer][blk] = torch.empty_like(self.k_cpu[layer][blk])
 
     # ---------------- public API --------------
-    def push(self, layer:int, blk:int, k:torch.Tensor, v:torch.Tensor, batch_idx:int = 0):
+    def push(self, layer:int, blk:int, k:torch.Tensor, v:torch.Tensor, token_idx:int=None, batch_idx:int = 0,  **kwargs):
         """Save K/V of *one* block from HBM → DRAM."""
         self._alloc_block(layer, blk, k.size(0))
-        self.k_cpu[layer][blk][:k.size(0)].copy_(k, non_blocking=True)
-        self.v_cpu[layer][blk][:v.size(0)].copy_(v, non_blocking=True)
+        # self.k_cpu[layer][blk][:k.size(0)].copy_(k, non_blocking=True)
+        # self.v_cpu[layer][blk][:v.size(0)].copy_(v, non_blocking=True)
+        stream = self.d2h_stream or torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            self.k_cpu[layer][blk][:k.size(0)].copy_(k, non_blocking=True)
+            self.v_cpu[layer][blk][:v.size(0)].copy_(v, non_blocking=True)
         
         # 新 block 给一个极小初始权重，防止意外被忽略
         if batch_idx < self.max_batch:
@@ -115,6 +129,28 @@ class KVOffloader:
             self.global_tracker.update_dram_storage(batch_idx, layer, [blk], 'add', [importance_score])
         
         self._maybe_evict()
+
+        if token_idx is not None and self.ssd is not None:
+            # k: (bsz, heads, dim) 或 (heads, dim)
+            if k.dim() == 2:
+                k = k.unsqueeze(0)
+                v = v.unsqueeze(0)
+            bsz = k.size(0)
+
+            # 目标封包形状：(max_batch, heads, 2*dim)，fp16
+            # 放前 bsz 条，其余清零（不影响对齐）
+            kv_pack = torch.zeros(
+                (self.max_batch, self.heads, self.dim * 2),
+                dtype=torch.float16, device=k.device
+            )
+            kv_pack[:bsz, :, :self.dim].copy_(k)
+            kv_pack[:bsz, :, self.dim:].copy_(v)
+
+            # 异步写入，不改变 on_ssd 语义（仍表示“被驱逐”）
+            try:
+                self.ssd.write_async(layer, token_idx, kv_pack)
+            except Exception as e:
+                print(f"[WARN] SSD mirror write failed @L{layer} T{token_idx}: {e}")
 
     def fetch(self, layer:int, blocks:torch.Tensor, batch_idx:int = 0):
         """Return concat-K/V of given *unique* block indices (ascending)."""
@@ -135,7 +171,8 @@ class KVOffloader:
                     self.global_tracker.update_hbm_storage(batch_idx, layer, [blk], 'add', [importance_score])
             
         k_parts, v_parts = [], []
-        stream = self.copy_stream or torch.cuda.current_stream()
+        # stream = self.copy_stream or torch.cuda.current_stream()
+        stream = self.h2d_stream or torch.cuda.current_stream()
         with torch.cuda.stream(stream):
             for blk in uniq:
                 if self.k_cpu[layer][blk] is None:

@@ -109,7 +109,7 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
                 # Don't re-raise exceptions in cleanup
 
 # ---------- Optimized weight management ----------
-class WeightManager:
+# class WeightManager:
     """管理权重的异步加载和缓存"""
     
     def __init__(self, device: str, max_cached_layers: int = 4):
@@ -126,14 +126,18 @@ class WeightManager:
         
         # 安全创建CUDA流
         self.weight_stream = None
+        self.weight_h2d_stream = None 
+        self.cpu_stash = {}                 # param_id -> pinned CPU tensor
         if self.is_cuda:
             try:
                 device_id = int(self.device.split(":")[1]) if ":" in self.device else 0
                 with self.gpu_manager.safe_cuda_context(device_id):
-                    self.weight_stream = torch.cuda.Stream(device=self.device)
+                    # self.weight_stream = torch.cuda.Stream(device=self.device)
+                    self.weight_h2d_stream = torch.cuda.Stream(device=self.device, priority=-1)
             except Exception as e:
                 logger.warning(f"Failed to create CUDA stream: {e}")
-                self.weight_stream = None
+                # self.weight_stream = None
+                self.weight_h2d_stream = None
         
         # 权重缓存管理
         self.cached_weights = {}  # layer_id -> {module_name: weight_dict}
@@ -211,23 +215,32 @@ class WeightManager:
         
         with gpu_memory_guard(self.device, self.memory_threshold_gb):
             with cuda_timer("weights_hbm_us", layer_id):
-                if self.weight_stream and not priority and self.is_cuda:
+                stream = self.weight_h2d_stream
+                if stream is not None and not priority and self.is_cuda:
                     try:
                         with self.gpu_manager.safe_cuda_context(device_id):
-                            with torch.cuda.stream(self.weight_stream):
+                            with torch.cuda.stream(stream):
                                 for module in modules.values():
                                     for param in module.parameters():
                                         if not param.is_cuda:
-                                            param.data = param.data.to(self.device, non_blocking=True)
+                                            # param.data = param.data.to(self.device, non_blocking=True)
+                                            pid = id(param)
+                                            # first build pin cpu copy
+                                            if pid not in self.cpu_stash:
+                                                cpu_copy = param.data.detach().cpu().contiguous()
+                                                try: cpu_copy = cpu_copy.pin_memory()
+                                                except: pass
+                                                self.cpu_stash[pid] = cpu_copy
+                                            param.data = self.cpu_stash[pid].to(self.device, non_blocking=True)
                             
                             # 安全的流等待，避免死锁
                             try:
                                 # 添加超时检查，避免无限等待
                                 current_stream = torch.cuda.current_stream(self.device)
-                                if current_stream != self.weight_stream:
-                                    current_stream.wait_stream(self.weight_stream)
+                                if current_stream != stream:
+                                    current_stream.wait_stream(stream)
                                     # 验证操作完成
-                                    if not self.weight_stream.query():
+                                    if not stream.query():
                                         logger.warning(f"Weight stream not completed for layer {layer_id}")
                             except RuntimeError as e:
                                 logger.error(f"Stream wait failed for layer {layer_id}: {e}")
@@ -240,7 +253,18 @@ class WeightManager:
                         self._sync_load_weights(modules)
                 else:
                     # 同步加载，用于高优先级请求或CPU设备
-                    self._sync_load_weights(modules)
+                    # self._sync_load_weights(modules)
+                    for module in modules.values():
+                        for param in module.parameters():
+                            if not param.is_cuda and self.is_cuda:
+                                pid = id(param)
+                                if pid not in self.cpu_stash:
+                                    cpu_copy = param.data.detach().cpu().contiguous()
+                                    try: cpu_copy = cpu_copy.pin_memory()
+                                    except: pass
+                                    self.cpu_stash[pid] = cpu_copy
+                                param.data = self.cpu_stash[pid].to(self.device)
+                                
     
     def _emergency_weight_cleanup(self):
         """紧急权重清理"""
@@ -286,8 +310,11 @@ class WeightManager:
                 # 将权重移回CPU
                 for module_weights in self.cached_weights[evict_layer].values():
                     for param in module_weights.values():
-                        if param.is_cuda:
-                            param.data = param.data.cpu()
+                        # if param.is_cuda:
+                        #     param.data = param.data.cpu()
+                        pid = id(param)
+                        if pid in self.cpu_stash:
+                            param.data = self.cpu_stash[pid]
                 
                 del self.cached_weights[evict_layer]
     
@@ -304,10 +331,17 @@ class WeightManager:
 # 全局权重管理器
 WEIGHT_MANAGER = None
 
-def get_weight_manager(device: str) -> WeightManager:
+def set_weight_manager(manager):
+    """设置全局权重管理器"""
     global WEIGHT_MANAGER
-    if WEIGHT_MANAGER is None:
-        WEIGHT_MANAGER = WeightManager(device)
+    WEIGHT_MANAGER = manager
+
+def get_weight_manager(device: str):
+    """
+    获取权重管理器。如果尚未设置，返回None。
+    实际的权重流式管理在profile_pipeline.py中手动创建并设置。
+    """
+    global WEIGHT_MANAGER
     return WEIGHT_MANAGER
 
 # ---------- helpers (保持不变但优化) ----------
@@ -337,11 +371,11 @@ def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor) -> tor
     out = torch.view_as_real(x_complex * freqs_complex)
     return out.reshape(b, l, h, d).type_as(x)
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    if n_rep == 1: 
-        return x
-    b, t, h, d = x.shape
-    return x[:, :, :, None, :].expand(b, t, h, n_rep, d).contiguous().view(b, t, h * n_rep, d)
+# def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+#     if n_rep == 1: 
+#         return x
+#     b, t, h, d = x.shape
+#     return x[:, :, :, None, :].expand(b, t, h, n_rep, d).contiguous().view(b, t, h * n_rep, d)
 
 # ---------- Optimized SelfAttention ----------
 class SelfAttention(nn.Module):
@@ -397,7 +431,8 @@ class SelfAttention(nn.Module):
     def _ensure_weights_cuda(self):
         """确保权重在GPU上"""
         modules = self._get_modules_dict()
-        self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
+        if self.weight_manager:
+            self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
     
     def _allocate_buffers(self, batch_size: int, seq_len: int, max_kv_len: int):
         """安全预分配计算缓冲区，防止OOM"""
@@ -494,7 +529,8 @@ class SelfAttention(nn.Module):
         
         # 预取下一层权重
         if hasattr(self, '_next_layer_modules'):
-            self.weight_manager.prefetch_weights([self.layer_id + 1], {self.layer_id + 1: self._next_layer_modules})
+            if self.weight_manager:
+                self.weight_manager.prefetch_weights([self.layer_id + 1], {self.layer_id + 1: self._next_layer_modules})
         
         # QKV投影
         with cuda_timer("attn_us", self.layer_id):
@@ -514,18 +550,16 @@ class SelfAttention(nn.Module):
         
         # 对于每个token位置，计算对应的block并push
         for seq_idx in range(seqlen):
-            blk_idx = (start_pos + seq_idx) // self.block_sz
-            # 提取当前位置的k,v: (bsz, n_heads, head_dim)
-            k_curr = k[:, seq_idx, :, :]  # (bsz, n_heads, head_dim)
-            v_curr = v[:, seq_idx, :, :]  # (bsz, n_heads, head_dim)
-            
-            # 如果batch_size=1，保持原有行为移除batch维度
+            blk_idx   = (start_pos + seq_idx) // self.block_sz
+            token_idx =  start_pos + seq_idx
+
+            k_curr = k[:, seq_idx, :, :]
+            v_curr = v[:, seq_idx, :, :]
             if bsz == 1:
-                k_curr = k_curr.squeeze(0)  # (n_heads, head_dim)
-                v_curr = v_curr.squeeze(0)  # (n_heads, head_dim)
-            
-            self.offloader.push(self.layer_id, blk_idx, k_curr, v_curr)
-        
+                k_curr = k_curr.squeeze(0)  # (heads, dim)
+                v_curr = v_curr.squeeze(0)
+            self.offloader.push(self.layer_id, blk_idx, k_curr, v_curr,
+                        token_idx=token_idx, batch_idx=batch_idx)
         # 使用第一个token的位置来计算需要的blocks（简化处理）
         blk_idx = start_pos // self.block_sz 
         
@@ -690,7 +724,8 @@ class FeedForward(nn.Module):
     
     def _ensure_weights_cuda(self):
         modules = self._get_modules_dict()
-        self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
+        if self.weight_manager:
+            self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Check CUDA context health

@@ -4,6 +4,7 @@ import numpy as np
 import threading
 from dataclasses import dataclass
 from enum import Enum
+import time
 
 class StorageType(Enum):
     """存储类型枚举"""
@@ -21,6 +22,20 @@ class BlockInfo:
     timestamp: float
     importance_score: float = 0.0
     access_count: int = 0
+
+@dataclass
+class CopyOpToken:
+    kind: str
+    bytes: int
+    t0: float
+
+@dataclass
+class CopyCounters:
+    in_flight: int = 0
+    total_bytes: int = 0
+    total_ops: int = 0
+    last_bw_MBps: float = 0.0
+    last_t: float = 0.0
 
 class GlobalStateTracker:
     """全局状态跟踪器，记录当前执行状态和各存储层级的数据分布"""
@@ -52,6 +67,12 @@ class GlobalStateTracker:
             StorageType.HBM: {'total_blocks': 0, 'used_blocks': 0, 'capacity_limit': 1000},
             StorageType.DRAM: {'total_blocks': 0, 'used_blocks': 0, 'capacity_limit': 10000},
             StorageType.SSD: {'total_blocks': 0, 'used_blocks': 0, 'capacity_limit': 100000}
+        }
+
+        self.copy_stats: Dict[str, CopyCounters] = {
+            "weight_h2d": CopyCounters(),
+            "kv_h2d":     CopyCounters(),
+            "kv_d2h":     CopyCounters(),
         }
         
         # 历史记录
@@ -367,6 +388,37 @@ class GlobalStateTracker:
             except (ValueError, IndexError):
                 # 如果当前batch不在future_batches中，或索引越界
                 return None
+            
+    def start_copy(self, kind: str, bytes_cnt: int) -> CopyOpToken:
+        cs = self.copy_stats.get(kind)
+        if cs is None:
+            self.copy_stats[kind] = cs = CopyCounters()
+        cs.in_flight += 1
+        return CopyOpToken(kind=kind, bytes=bytes_cnt, t0=time.time())
+
+    def end_copy(self, token: CopyOpToken):
+        cs = self.copy_stats.get(token.kind)
+        if cs is None:
+            return
+        cs.in_flight = max(0, cs.in_flight - 1)
+        dt = max(1e-6, time.time() - token.t0)
+        cs.total_ops += 1
+        cs.total_bytes += token.bytes
+        cs.last_bw_MBps = (token.bytes / 1e6) / dt
+        cs.last_t = time.time()
+
+    def inflight(self, kind: str) -> int:
+        cs = self.copy_stats.get(kind)
+        return cs.in_flight if cs else 0
+
+    def last_bw(self, kind: str) -> float:
+        cs = self.copy_stats.get(kind)
+        return cs.last_bw_MBps if cs else 0.0
+
+    def prefer_launch_kv_d2h_now(self) -> bool:
+        """简单决策信号：当权重H2D不在跑时，更适合发起KV的D2H"""
+        return self.inflight("weight_h2d") == 0
+
     
 # 全局实例
 _global_tracker = None
