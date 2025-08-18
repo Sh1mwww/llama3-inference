@@ -202,3 +202,30 @@ class WeightStreamingManager:
             self._evict_module_to_cpu(mod)
         if self.verbose:
             print(f"[WSM]   evict layer={idx}")
+    
+    # ============ 兼容 layers.py 的接口 ============
+    
+    def ensure_weights_cuda(self, layer_id: int, modules: Dict[str, nn.Module], priority: bool = False):
+        """
+        兼容 layers.py 中 _ensure_weights_cuda 的调用
+        将指定层的模块权重确保在 GPU 上
+        """
+        if layer_id >= len(self.blocks):
+            return  # 超出范围，忽略
+        
+        # 使用现有的 ensure_on_gpu 逻辑
+        self.ensure_on_gpu(layer_id, wait=priority)
+        
+        # 额外确保提供的模块在 GPU 上（如果与我们管理的不同）
+        for name, module in modules.items():
+            try:
+                self._ensure_module_on_gpu(module)
+            except Exception as e:
+                if self.verbose:
+                    print(f"[WSM] Warning: Failed to ensure {name} on GPU for layer {layer_id}: {e}")
+    
+    def prefetch_weights(self, layer_ids: List[int], modules_dict: Dict[int, Dict[str, nn.Module]] = None):
+        """
+        兼容 layers.py 中预取权重的调用
+        """
+        self.prefetch(layer_ids)
