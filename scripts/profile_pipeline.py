@@ -460,235 +460,33 @@ def main():
 
     print("\n📦 Loading model...")
     try:
-        llama = LLaMA.build(ckpt, load_model=True, device="cpu")
+        # 配置权重流式传输参数
+        enable_streaming = args.device.startswith("cuda")
+        streaming_config = {
+            'prefetch_distance': 1,
+            'max_cached_layers': 4,
+            'warmup_layers': 1,
+            'verbose': args.verbose
+        } if enable_streaming else None
+        
+        # 使用新的 LLaMA.build() API 进行统一构建
+        llama = LLaMA.build(
+            ckpt, 
+            load_model=True, 
+            device=args.device,
+            enable_weight_streaming=enable_streaming,
+            streaming_config=streaming_config,
+            topk_blk=args.topk_blk,
+            max_seq_len=args.max_seq_len,
+            max_batch_size=args.batch_size
+        )
+        
         if not hasattr(llama, 'model') or llama.model is None:
             raise RuntimeError("Model failed to load properly - llama.model is None")
-        if not hasattr(llama.model, 'named_children'):
-            raise RuntimeError(f"Model is not a PyTorch module - got {type(llama.model)}")
         print(f"✅ Model loaded successfully: {type(llama.model)}")
+        
     except Exception as e:
         print(f"❌ Error loading model: {e}"); sys.exit(1)
-
-    USE_STREAMING = True
-
-    def _enable_weight_streaming(llama, device, verbose=False):
-        llama.args.device = device
-        m = llama.model
-
-        # >>> 关键补丁 1：确保 WSM 看到“真正参与前向的层” <<<
-        blocks = None
-        if hasattr(m, "layer_infos"):
-            try:
-                blocks = [info["block"] for info in m.layer_infos]
-            except Exception:
-                blocks = None
-        if blocks and not hasattr(m, "layers"):
-            m.layers = blocks  # 供 WSM/其它逻辑统一访问
-
-        # 小模块常驻 HBM
-        m.embed_tokens = m.embed_tokens.to(device)
-        m.norm         = m.norm.to(device)
-        m.output       = m.output.to(device)
-        
-        # 关键修复：确保 freqs_complex 正确移动到 GPU
-        if hasattr(m, "freqs_complex"):
-            try:
-                if verbose:
-                    print(f"[DEBUG] freqs_complex current device: {m.freqs_complex.device}")
-                old_device = m.freqs_complex.device
-                m.freqs_complex = m.freqs_complex.to(device)
-                if verbose:
-                    print(f"[DEBUG] freqs_complex moved: {old_device} -> {m.freqs_complex.device}")
-            except Exception as e:
-                print(f"⚠️ Warning: Failed to move freqs_complex to {device}: {e}")
-                print(f"   This may cause device mismatch errors during inference")
-                # 尝试重新创建 freqs_complex 在目标设备上
-                try:
-                    from llama3.layers import precompute_theta_pos_frequencies
-                    print(f"   Attempting to recreate freqs_complex on {device}...")
-                    m.freqs_complex = precompute_theta_pos_frequencies(
-                        llama.args.dim // llama.args.n_heads,
-                        llama.args.max_seq_len * 2,
-                        device=device,
-                        theta=llama.args.rope_theta,
-                    )
-                    print(f"   Successfully recreated freqs_complex on {device}")
-                except Exception as e2:
-                    print(f"   Failed to recreate freqs_complex: {e2}")
-                    raise RuntimeError(f"Cannot ensure freqs_complex is on {device}") from e2
-
-        # 权重流式（安装 forward_pre_hook 在 m.layers[*] 上）
-        wsm = WeightStreamingManager(
-            m, device=device, prefetch_distance=1, max_cached_layers=4, warmup_layers=1, verbose=verbose
-        )
-
-        # >>> 关键补丁 2：把 WSM 注册到每个 Block 的 attention / feed_forward <<<
-        try:
-            from llama3.layers import set_weight_manager
-            set_weight_manager(wsm)  # 设置全局引用（新创建层可见）
-            # 既有层手动注入
-            blk_list = blocks if blocks else (list(getattr(m, "layers", [])) if hasattr(m, "layers") else [])
-            for i, blk in enumerate(blk_list):
-                if hasattr(blk, "attention"):
-                    blk.attention.weight_manager = wsm
-                    blk.attention.layer_id = getattr(blk, "layer_id", i)
-                if hasattr(blk, "feed_forward"):
-                    blk.feed_forward.weight_manager = wsm
-                    blk.feed_forward.layer_id = getattr(blk, "layer_id", i)
-        except Exception as e:
-            print(f"[WARN] failed to set_weight_manager on blocks: {e}")
-
-        # KV H2D/D2H 流
-        streams = _stream_mnt.get_streams(device)
-        for blk in (blocks or m.layers):
-            off = getattr(blk.attention, "offloader", None) if hasattr(blk, "attention") else None
-            if off is not None:
-                off.h2d_stream = streams.kv_h2d
-                off.d2h_stream = streams.kv_d2h
-        return wsm
-
-    if USE_STREAMING:
-        if args.device.startswith("cuda"):
-            _wsm = _enable_weight_streaming(llama, args.device, verbose=args.verbose)
-            print("✅ Weight streaming enabled (activations on GPU, weights streamed per-layer).")
-
-            # 关闭 llama3.layers 的 CUDA 计时器（no-op）
-            import llama3.layers as _layers
-            @contextmanager
-            def _noop_timer(*_a, **_k): yield
-            _layers.cuda_timer = _noop_timer
-
-            print("⚙️  Running on GPU")
-        else:
-            print("⚠️  Streaming requested but device=cpu; running purely on CPU (no streaming).")
-            USE_STREAMING = False
-    elif args.device.startswith("cuda"):
-        if not torch.cuda.is_available():
-            print("❌ CUDA not available but cuda device specified"); sys.exit(1)
-        print("🔄 Moving model components to GPU (simplified approach)...")
-        try:
-            print(f"   Moving entire model to {args.device}..."); llama.model = llama.model.to(args.device)
-            print("✅ Model moved to GPU")
-        except torch.cuda.OutOfMemoryError:
-            print(f"❌ CUDA OOM when moving model. Falling back to CPU...")
-            args.device = "cpu"; llama.args.device = "cpu"
-        except Exception as e:
-            print(f"⚠️  Error moving model: {e}")
-
-    llama.args.device = args.device
-    
-    # 调试信息：检查最终的设备配置
-    if args.verbose:
-        print(f"[DEBUG] Final llama.args.device: {llama.args.device}")
-        print(f"[DEBUG] Final args.device: {args.device}")
-        print(f"[DEBUG] llama.args.device type: {type(llama.args.device)}")
-        print(f"[DEBUG] args.device type: {type(args.device)}")
-
-    # 统一 offloader streams（幂等）
-    streams = _stream_mnt.get_streams(args.device) if args.device.startswith("cuda") else None
-    try:
-        if streams:
-            # 通过 m.layers 统一遍历（上面已把 layer_infos 映射过来）
-            for blk in getattr(llama.model, "layers", []):
-                if hasattr(blk, 'attention') and hasattr(blk.attention, 'offloader'):
-                    off = blk.attention.offloader
-                    off.device = args.device
-                    off.h2d_stream = streams.kv_h2d
-                    off.d2h_stream = streams.kv_d2h
-                    off.copy_stream = streams.kv_h2d
-    except Exception as e:
-        print(f"⚠️  Error configuring offloader streams: {e}")
-
-    # 配置 KV cache
-    try:
-        for layer in getattr(llama.model, "layers", []):
-            if hasattr(layer, 'attention') and hasattr(layer.attention, 'topk_blk'):
-                layer.attention.topk_blk = args.topk_blk
-    except Exception as e:
-        print(f"⚠️  Error configuring KV cache: {e}")
-
-    # （可选）检查第一层参数设备（预期此刻仍是 CPU；进入 forward 时由 pre-hook 搬到 CUDA）
-    try:
-        first_blk = getattr(llama.model, "layers", [None])[0]
-        if first_blk is not None:
-            print("[CHECK] first block param device:", next(first_blk.parameters()).device)
-    except Exception:
-        pass
-
-    # 推理前设备验证（关键修复）
-    if args.device.startswith("cuda"):
-        print("🔍 Verifying device placement before inference...")
-        try:
-            # 验证关键组件的设备
-            embed_device = llama.model.embed_tokens.weight.device
-            norm_device = llama.model.norm.weight.device
-            output_device = llama.model.output.weight.device
-            freqs_device = llama.model.freqs_complex.device if hasattr(llama.model, 'freqs_complex') else None
-            
-            print(f"   embed_tokens: {embed_device}")
-            print(f"   norm: {norm_device}")  
-            print(f"   output: {output_device}")
-            if freqs_device:
-                print(f"   freqs_complex: {freqs_device}")
-            
-            # 检查是否有设备不匹配（修复设备比较逻辑）
-            expected_device = torch.device(args.device)
-            device_issues = []
-            
-            # 使用字符串比较来处理 cuda vs cuda:0 的问题
-            def devices_match(dev1, dev2):
-                """检查两个设备是否匹配，处理 cuda vs cuda:0 的情况"""
-                if dev1.type != dev2.type:
-                    return False
-                if dev1.type == 'cuda':
-                    # cuda 和 cuda:0 被认为是相同的
-                    return dev1.index == dev2.index or (dev1.index is None and dev2.index == 0) or (dev1.index == 0 and dev2.index is None)
-                return dev1 == dev2
-            
-            if not devices_match(embed_device, expected_device):
-                device_issues.append(f"embed_tokens on {embed_device}, expected {expected_device}")
-            if not devices_match(norm_device, expected_device):
-                device_issues.append(f"norm on {norm_device}, expected {expected_device}")
-            if not devices_match(output_device, expected_device):
-                device_issues.append(f"output on {output_device}, expected {expected_device}")
-            if freqs_device and not devices_match(freqs_device, expected_device):
-                device_issues.append(f"freqs_complex on {freqs_device}, expected {expected_device}")
-            
-            if device_issues:
-                print("❌ Device placement issues found:")
-                for issue in device_issues:
-                    print(f"   - {issue}")
-                print("Attempting to fix device placement...")
-                
-                # 强制修复设备放置
-                llama.model.embed_tokens = llama.model.embed_tokens.to(args.device)
-                llama.model.norm = llama.model.norm.to(args.device)
-                llama.model.output = llama.model.output.to(args.device)
-                if hasattr(llama.model, 'freqs_complex'):
-                    llama.model.freqs_complex = llama.model.freqs_complex.to(args.device)
-                
-                print("✅ Device placement fixed")
-            
-            # 关键修复：同步所有层的 norm 权重到 GPU（WSM 的关键问题）
-            print("🔧 Synchronizing layer norms to GPU...")
-            for i, layer in enumerate(llama.model.layers):
-                if hasattr(layer, 'attn_norm'):
-                    layer.attn_norm = layer.attn_norm.to(args.device)
-                if hasattr(layer, 'ffn_norm'):
-                    layer.ffn_norm = layer.ffn_norm.to(args.device)
-                if args.verbose and i < 3:  # 只打印前3层的详情
-                    attn_norm_device = layer.attn_norm.weight.device if hasattr(layer, 'attn_norm') else "N/A"
-                    ffn_norm_device = layer.ffn_norm.weight.device if hasattr(layer, 'ffn_norm') else "N/A"
-                    print(f"   Layer {i} attn_norm: {attn_norm_device}, ffn_norm: {ffn_norm_device}")
-            
-            # GPU 同步确保所有操作完成
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            
-            print("✅ All layer components synchronized to target device")
-                
-        except Exception as e:
-            print(f"⚠️ Error during device verification: {e}")
     
     print("✅ Model ready for inference")
 
@@ -713,6 +511,7 @@ def main():
 
             for prompt_batch in safe_batch_processing(prompts, args.batch_size, max_seq_len=args.max_seq_len, logger=logger):
                 batch_count += 1
+                print(f"[INFO] Processing batch {batch_count}/{total_batches} with {len(prompt_batch)} prompts")
                 logger.debug(f"Processing batch {batch_count} with {len(prompt_batch)} prompts")
                 try:
                     tracker = get_global_tracker()

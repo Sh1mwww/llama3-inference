@@ -400,6 +400,15 @@ class SelfAttention(nn.Module):
         
         # 使用优化的KV offloader
         self.block_sz = BLOCK
+        
+        # 获取统一的流管理
+        streams = None
+        try:
+            import llama3.stream_mnt as stream_mnt
+            streams = stream_mnt.get_streams(args.device)
+        except Exception:
+            pass  # 回退到内部流创建
+        
         self.offloader = KVOffloader(
             layers=args.n_layers,
             heads=self.n_kv_heads,
@@ -407,7 +416,8 @@ class SelfAttention(nn.Module):
             max_seq=args.max_seq_len,
             max_batch=args.max_batch_size,
             device=args.device,
-            dtype_bytes=2  # float16
+            dtype_bytes=2,  # float16
+            streams=streams
         )
         
         self.layer_id = -1

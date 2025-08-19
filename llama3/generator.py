@@ -55,7 +55,187 @@ class LLaMA:
             if unexpected_keys:
                 print(f"[WARNING] Unexpected keys: {len(unexpected_keys)} keys")
             print(f"[INFO] Model weights loaded successfully")
+    
+    def _configure_weight_streaming(self, streaming_config: dict):
+        """配置权重流式传输"""
+        print("🔧 Configuring Weight Streaming...")
         
+        # 导入必要的模块
+        from .weight_streaming_manager import WeightStreamingManager
+        from . import layers
+        from . import stream_mnt
+        
+        # 设置默认配置
+        config = {
+            'prefetch_distance': 1,
+            'max_cached_layers': 4,
+            'warmup_layers': 1,
+            'verbose': False
+        }
+        config.update(streaming_config)
+        
+        # 确保模型的 layers 属性可访问（供 WSM 使用）
+        if hasattr(self.model, "layer_infos"):
+            try:
+                blocks = [info.block for info in self.model.layer_infos if info.block is not None]
+                if blocks and not hasattr(self.model, "layers"):
+                    self.model.layers = blocks
+            except Exception:
+                pass
+        
+        # 配置核心组件到目标设备（小模块常驻 HBM）
+        self._configure_core_components()
+        
+        # 创建和配置 WSM
+        wsm = WeightStreamingManager(
+            self.model, 
+            device=self.args.device,
+            prefetch_distance=config['prefetch_distance'],
+            max_cached_layers=config['max_cached_layers'],
+            warmup_layers=config['warmup_layers'],
+            verbose=True  # 强制启用详细日志以便验证
+        )
+        
+        # 集成 WSM 到模型层
+        self._integrate_wsm_to_layers(wsm)
+        
+        # 配置 KV streams
+        self._configure_kv_streams()
+        
+        # 验证并修复设备放置
+        self._verify_and_fix_device_placement()
+        
+        # 输出关键的诊断信息
+        try:
+            first_blk = getattr(self.model, "layers", [None])[0]
+            if first_blk is not None:
+                print("[CHECK] first block param device:", next(first_blk.parameters()).device)
+        except Exception:
+            pass
+        
+        print("✅ Weight streaming enabled (activations on GPU, weights streamed per-layer).")
+        print("⚙️  Running on GPU")
+        
+        return wsm
+    
+    def _configure_core_components(self):
+        """配置核心组件到目标设备"""
+        device = self.args.device
+        model = self.model
+        
+        # 小模块常驻 HBM
+        model.embed_tokens = model.embed_tokens.to(device)
+        model.norm = model.norm.to(device)
+        model.output = model.output.to(device)
+        
+        # 处理 freqs_complex
+        self._handle_freqs_complex(device)
+    
+    def _handle_freqs_complex(self, device: str):
+        """处理 freqs_complex 的设备放置与重建"""
+        model = self.model
+        
+        if hasattr(model, "freqs_complex"):
+            try:
+                model.freqs_complex = model.freqs_complex.to(device)
+            except Exception as e:
+                print(f"⚠️ Warning: Failed to move freqs_complex to {device}: {e}")
+                # 重新创建 freqs_complex 在目标设备上
+                self._recreate_freqs_complex(device)
+    
+    def _recreate_freqs_complex(self, device: str):
+        """重新创建 freqs_complex 在目标设备上"""
+        try:
+            from .layers import precompute_theta_pos_frequencies
+            print(f"   Attempting to recreate freqs_complex on {device}...")
+            
+            # 使用 ModelArgs 中的配置
+            dim = self.args.dim
+            n_heads = self.args.n_heads
+            max_seq_len = self.args.max_seq_len
+            rope_theta = self.args.rope_theta
+            
+            self.model.freqs_complex = precompute_theta_pos_frequencies(
+                dim // n_heads,
+                max_seq_len * 2,
+                device=device,
+                theta=rope_theta,
+            )
+            print(f"   Successfully recreated freqs_complex on {device}")
+        except Exception as e:
+            print(f"   Failed to recreate freqs_complex: {e}")
+            raise RuntimeError(f"Cannot ensure freqs_complex is on {device}") from e
+    
+    def _integrate_wsm_to_layers(self, wsm):
+        """将 WSM 集成到模型层"""
+        try:
+            from . import layers
+            layers.set_weight_manager(wsm)  # 设置全局引用
+            
+            # 为现有层手动注入
+            if hasattr(self.model, "layers"):
+                for i, layer in enumerate(self.model.layers):
+                    if hasattr(layer, "attention"):
+                        layer.attention.weight_manager = wsm
+                        layer.attention.layer_id = getattr(layer, "layer_id", i)
+                    if hasattr(layer, "feed_forward"):
+                        layer.feed_forward.weight_manager = wsm
+                        layer.feed_forward.layer_id = getattr(layer, "layer_id", i)
+        except Exception as e:
+            print(f"[WARN] failed to set_weight_manager on blocks: {e}")
+    
+    def _configure_kv_streams(self):
+        """配置 KV streams"""
+        try:
+            from . import stream_mnt
+            streams = stream_mnt.get_streams(self.args.device)
+            
+            if hasattr(self.model, "layers"):
+                for layer in self.model.layers:
+                    if hasattr(layer, "attention"):
+                        off = getattr(layer.attention, "offloader", None)
+                        if off is not None:
+                            off.h2d_stream = streams.kv_h2d
+                            off.d2h_stream = streams.kv_d2h
+        except Exception as e:
+            print(f"[WARN] failed to configure KV streams: {e}")
+    
+    def _verify_and_fix_device_placement(self):
+        """验证并修复设备放置"""
+        device = self.args.device
+        model = self.model
+        
+        if not device.startswith("cuda"):
+            return
+            
+        print("🔍 Verifying device placement before inference...")
+        
+        try:
+            # 强制同步所有核心组件到目标设备
+            print("🔧 Synchronizing all components to target device...")
+            model.embed_tokens = model.embed_tokens.to(device)
+            model.norm = model.norm.to(device)
+            model.output = model.output.to(device)
+            if hasattr(model, 'freqs_complex'):
+                model.freqs_complex = model.freqs_complex.to(device)
+            
+            # 同步所有层的 norm 权重到 GPU
+            print("🔧 Synchronizing layer norms to GPU...")
+            if hasattr(model, "layers"):
+                for layer in model.layers:
+                    if hasattr(layer, 'attn_norm'):
+                        layer.attn_norm = layer.attn_norm.to(device)
+                    if hasattr(layer, 'ffn_norm'):
+                        layer.ffn_norm = layer.ffn_norm.to(device)
+            
+            # GPU 同步确保所有操作完成
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
+            print("✅ All layer components synchronized to target device")
+                
+        except Exception as e:
+            print(f"⚠️ Error during device synchronization: {e}")
 
     # ---------- 构建 ----------
     @staticmethod
@@ -63,13 +243,22 @@ class LLaMA:
         checkpoints_dir: str,
         load_model: bool = True,
         device: str = "cuda",
+        enable_weight_streaming: bool = False,
+        streaming_config: Optional[dict] = None,
+        topk_blk: Optional[int] = None,
+        max_seq_len: int = 2048,
+        max_batch_size: int = 512,
     ) -> "LLaMA":
         ckpt_dir = Path(checkpoints_dir)
         tokenizer = LlamaTokenizerFast.from_pretrained(ckpt_dir, legacy=True)
         params_path = ckpt_dir / "params.json"
         args = ModelArgs.from_json(
-            str(params_path), max_seq_len=2048, max_batch_size=512, device=device
+            str(params_path), max_seq_len=max_seq_len, max_batch_size=max_batch_size, device=device
         )
+        
+        # 如果指定了 topk_blk，更新到 ModelArgs 中
+        if topk_blk is not None:
+            args.topk_blk = topk_blk
         
         args.checkpoints_dir = str(ckpt_dir)
 
@@ -81,7 +270,30 @@ class LLaMA:
             checkpoint = torch.load(ckpt_file, map_location="cpu")
             print(f"[INFO] Done ({time.time() - t0:.1f}s)")
 
-        return LLaMA(tokenizer, checkpoint, args)
+        # 先在 CPU 上创建 LLaMA 实例（避免 OOM）
+        cpu_args = ModelArgs.from_json(
+            str(params_path), max_seq_len=max_seq_len, max_batch_size=max_batch_size, device="cpu"
+        )
+        if topk_blk is not None:
+            cpu_args.topk_blk = topk_blk
+        cpu_args.checkpoints_dir = str(ckpt_dir)
+        
+        llama = LLaMA(tokenizer, checkpoint, cpu_args)
+        
+        # 如果启用权重流式传输且设备是 CUDA
+        if enable_weight_streaming and device.startswith("cuda"):
+            llama._configure_weight_streaming(streaming_config or {})
+        elif device.startswith("cuda"):
+            # 非流式传输模式：直接移动到 GPU
+            try:
+                llama.model = llama.model.to(device)
+                llama.args.device = device
+            except torch.cuda.OutOfMemoryError:
+                print("❌ CUDA OOM when moving model. Keeping on CPU...")
+                device = "cpu"
+                llama.args.device = "cpu"
+        
+        return llama
 
     # ---------- 推理 ----------
     def text_completion(
@@ -203,7 +415,19 @@ class LLaMA:
             4.如果所有样本都生成了 <eos>，提前退出；
             5.同时收集 KV cache profiling 信息（时间、空间）；
             '''
-            for cur_pos in tqdm(range(1, total_len), desc=f"Generating tokens for batch {batch_idx + 1}"):
+            # 获取全局批次信息以显示更准确的进度
+            try:
+                tracker = get_global_tracker()
+                if tracker and hasattr(tracker, 'current_batch') and tracker.current_batch is not None:
+                    global_batch_num = tracker.current_batch + 1
+                    total_global_batches = len(tracker.future_batches) if hasattr(tracker, 'future_batches') else 'Unknown'
+                    desc = f"Generating tokens for batch {global_batch_num}/{total_global_batches} (local {batch_idx + 1}/{num_batches})"
+                else:
+                    desc = f"Generating tokens for batch {batch_idx + 1}/{num_batches}"
+            except:
+                desc = f"Generating tokens for batch {batch_idx + 1}/{num_batches}"
+            
+            for cur_pos in tqdm(range(1, total_len), desc=desc):
                 try:
                     # ---- forward ----
                     with torch.no_grad():

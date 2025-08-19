@@ -26,7 +26,8 @@ class KVOffloader:
                  max_seq:int,
                  max_batch:int,
                  device:str,
-                 dtype_bytes:int):
+                 dtype_bytes:int,
+                 streams=None):
         n_blocks = (max_seq + BLOCK - 1) // BLOCK
         self.k_cpu = [[None for _ in range(n_blocks)] for _ in range(layers)]
         self.v_cpu = [[None for _ in range(n_blocks)] for _ in range(layers)]
@@ -45,11 +46,19 @@ class KVOffloader:
         self.device = device
         self.dtype_bytes = dtype_bytes
 
-        self.h2d_stream = (torch.cuda.Stream(device=device, priority=0)
-                           if device.startswith("cuda") else None)
-        self.d2h_stream = (torch.cuda.Stream(device=device, priority=+1)
-                           if device.startswith("cuda") else None)
-        self.copy_stream = self.h2d_stream
+        # 使用统一的流管理
+        if streams is not None:
+            # 使用外部提供的流（来自 get_streams）
+            self.h2d_stream = getattr(streams, 'kv_h2d', None)
+            self.d2h_stream = getattr(streams, 'kv_d2h', None)
+            self.copy_stream = self.h2d_stream
+        else:
+            # 回退到内部创建的流
+            self.h2d_stream = (torch.cuda.Stream(device=device, priority=0)
+                               if device.startswith("cuda") else None)
+            self.d2h_stream = (torch.cuda.Stream(device=device, priority=+1)
+                               if device.startswith("cuda") else None)
+            self.copy_stream = self.h2d_stream
 
         self.heads = heads
         self.dim = dim

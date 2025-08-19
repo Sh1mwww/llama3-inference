@@ -15,23 +15,42 @@ def _pinned_clone_cpu(t: torch.Tensor) -> torch.Tensor:
 
 def _collect_block_modules(block: nn.Module) -> Dict[str, nn.Module]:
     """
-    优先使用 block.attention/_get_modules_dict 和 block.feed_forward/_get_modules_dict。
-    若不存在，则退化为把整个 block 视为一个模块整体搬运（也可用）。
+    收集 block 中所有需要流式管理的模块：
+    1. attention 和 feed_forward 的子模块（通过 _get_modules_dict）
+    2. norm 层（attn_norm, ffn_norm）- 这些是小权重，适合常驻 GPU
+    3. 若都不存在，则退化为把整个 block 视为一个模块整体搬运
     """
     mods: Dict[str, nn.Module] = {}
+    
+    # 收集 attention 子模块
     if hasattr(block, "attention") and hasattr(block.attention, "_get_modules_dict"):
         try:
             mods.update(block.attention._get_modules_dict())
         except Exception:
             pass
+    
+    # 收集 feed_forward 子模块        
     if hasattr(block, "feed_forward") and hasattr(block.feed_forward, "_get_modules_dict"):
         try:
             mods.update(block.feed_forward._get_modules_dict())
         except Exception:
             pass
+    
+    # 收集 norm 层（小权重，适合常驻 GPU）
+    norm_modules = {}
+    for norm_name in ["attn_norm", "ffn_norm", "attention_norm", "ffn_norm_pre", "ffn_norm_post"]:
+        if hasattr(block, norm_name):
+            norm_module = getattr(block, norm_name)
+            if isinstance(norm_module, nn.Module):
+                norm_modules[f"norm_{norm_name}"] = norm_module
+    
+    if norm_modules:
+        mods.update(norm_modules)
+    
+    # 兜底：若没有收集到任何模块，把整个 block 搬运
     if not mods:
-        # 兜底：把整个 block 搬运（参数会一次性切换）
         mods["__block__"] = block
+    
     return mods
 
 class WeightStreamingManager:
@@ -94,12 +113,37 @@ class WeightStreamingManager:
         for i, blk in enumerate(self.blocks):
             blk.register_forward_pre_hook(self._pre_hook_factory(i))
 
+        # 将 norm 层移到 GPU 并常驻（这些是小权重）
+        self._setup_resident_norms()
+        
         # （可选）预热前几层，降低第 0 层等待
         if warmup_layers > 0:
             warm = list(range(min(warmup_layers, len(self.blocks))))
             self.prefetch(warm)
             if self.verbose:
                 print(f"[WSM] warmup prefetch: {warm}")
+
+    def _setup_resident_norms(self):
+        """将 norm 层移到 GPU 并常驻（这些是小权重，不需要流式传输）"""
+        if self.verbose:
+            print("[WSM] Setting up resident norm layers...")
+            
+        norm_count = 0
+        for layer_id, modules_dict in self.block_mods.items():
+            for module_name, module in modules_dict.items():
+                # 如果是 norm 模块，移到 GPU 并从流式管理中排除
+                if module_name.startswith("norm_"):
+                    try:
+                        module.to(self.device)
+                        norm_count += 1
+                        if self.verbose:
+                            print(f"[WSM] Layer {layer_id}: {module_name} -> {self.device} (resident)")
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"[WSM] Warning: Failed to move {module_name} to {self.device}: {e}")
+        
+        if self.verbose:
+            print(f"[WSM] {norm_count} norm layers set as resident on GPU")
 
     # ============ 基元：参数/模块的 CPU/GPU 切换 ============
 
@@ -174,9 +218,10 @@ class WeightStreamingManager:
             while len(self.gpu_cache) >= self.max_cached_layers:
                 old, _ = self.gpu_cache.popitem(last=False)
                 self._evict_layer_to_cpu(old)
-            # H2D 当前层
-            for _name, mod in self.block_mods[idx].items():
-                self._ensure_module_on_gpu(mod)
+            # H2D 当前层（跳过 norm 模块，它们已经常驻 GPU）
+            for module_name, mod in self.block_mods[idx].items():
+                if not module_name.startswith("norm_"):
+                    self._ensure_module_on_gpu(mod)
             self.gpu_cache[idx] = None
             if self.verbose:
                 print(f"[WSM] ->GPU layer={idx}")
@@ -198,8 +243,9 @@ class WeightStreamingManager:
                 print(f"[WSM] prefetch layer={idx}")
 
     def _evict_layer_to_cpu(self, idx: int):
-        for _name, mod in self.block_mods[idx].items():
-            self._evict_module_to_cpu(mod)
+        for module_name, mod in self.block_mods[idx].items():
+            if not module_name.startswith("norm_"):  # 跳过常驻的 norm 模块
+                self._evict_module_to_cpu(mod)
         if self.verbose:
             print(f"[WSM]   evict layer={idx}")
     
