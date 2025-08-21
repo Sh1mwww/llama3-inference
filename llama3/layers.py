@@ -11,6 +11,19 @@ import time
 # 配置日志
 logger = logging.getLogger(__name__)
 
+# NVTX profiling support
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+    # Fallback no-op functions
+    class nvtx:
+        @staticmethod
+        def range_push(name): pass
+        @staticmethod
+        def range_pop(): pass
+
 from .config import ModelArgs
 from .kv_offload import KVOffloader, BLOCK
 from .global_state_tracker import GlobalStateTracker, get_global_tracker, init_global_tracker
@@ -581,6 +594,7 @@ class SelfAttention(nn.Module):
         needed = torch.tensor(blocks, device=x.device)
         
         # 异步获取KV
+        nvtx.range_push(f"layer_{self.layer_id}_kv_fetch")
         with cuda_timer("kv_fetch_us", self.layer_id):
         #     k_full, v_full = self.offloader.fetch(self.layer_id, needed)
             fetch_evt_start = torch.cuda.Event(enable_timing=True)
@@ -597,6 +611,7 @@ class SelfAttention(nn.Module):
             else:
                 # 非profiling模式：不阻塞GPU管道
                 self.kv_elapsed_time = 0
+        nvtx.range_pop()  # kv_fetch
             
 
         # 形状调整以支持多batch
@@ -626,6 +641,7 @@ class SelfAttention(nn.Module):
         # 注意力计算
         q = q.transpose(1, 2)  # (B, H, Tq, D)
         
+        nvtx.range_push(f"layer_{self.layer_id}_attention_compute")
         with cuda_timer("attn_us", self.layer_id):
             # 使用优化的注意力计算
             attn_evt_start = torch.cuda.Event(enable_timing=True)
@@ -654,6 +670,7 @@ class SelfAttention(nn.Module):
             else:
                 # 非profiling模式：不阻塞GPU管道
                 self.attn_time = 0
+        nvtx.range_pop()  # attention_compute
         out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
         
         stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
@@ -785,12 +802,18 @@ class EncoderBlock(nn.Module):
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
         forward_start = time.time()
         
+        nvtx.range_push(f"layer_{self.layer_id}_forward")
         with cuda_timer("total_forward_us", self.layer_id):
             # 注意力块
+            nvtx.range_push(f"layer_{self.layer_id}_attention")
             h = x + self.attention(self.attn_norm(x), start_pos, freqs_complex)
+            nvtx.range_pop()  # attention
             
             # 前馈块
+            nvtx.range_push(f"layer_{self.layer_id}_ffn")
             out = h + self.feed_forward(self.ffn_norm(h))
+            nvtx.range_pop()  # ffn
+        nvtx.range_pop()  # layer_forward
         
         # 更新统计
         self.forward_count += 1

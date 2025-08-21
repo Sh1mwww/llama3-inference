@@ -11,17 +11,19 @@ class Streams:
     """流集合"""
     # 权重流式传输相关流
     weight_h2d: Optional[torch.cuda.Stream] = None    # 权重从 CPU 到 GPU
-    weight_d2h: Optional[torch.cuda.Stream] = None    # 权重从 GPU 到 CPU
+    # weight_d2h: Optional[torch.cuda.Stream] = None    # 权重从 GPU 到 CPU
     weight_compute: Optional[torch.cuda.Stream] = None # 权重计算流
     
     # KV cache 相关流
     kv_h2d: Optional[torch.cuda.Stream] = None       # KV cache 从 DRAM 到 GPU
     kv_d2h: Optional[torch.cuda.Stream] = None       # KV cache 从 GPU 到 DRAM
     
-    def wait_weight_ready_on_current(self):
-        """等待权重流准备就绪"""
-        if self.weight_h2d is not None:
-            self.weight_h2d.synchronize()
+    def wait_weight_ready_on_current(self, device: Optional[str] = None):
+        """在“当前计算流”上等待“权重H2D流”，不阻塞主机线程"""
+        if self.weight_h2d is None:
+            return
+        dev = device if device is not None else torch.cuda.current_device()
+        torch.cuda.current_stream(dev).wait_stream(self.weight_h2d)
 
 
 _streams_cache = {}
@@ -42,7 +44,7 @@ def get_streams(device: str) -> Streams:
         try:
             streams = Streams(
                 weight_h2d=torch.cuda.Stream(device=device, priority=0),
-                weight_d2h=torch.cuda.Stream(device=device, priority=1),
+                # weight_d2h=torch.cuda.Stream(device=device, priority=1),
                 weight_compute=torch.cuda.Stream(device=device, priority=-1),
                 kv_h2d=torch.cuda.Stream(device=device, priority=0),
                 kv_d2h=torch.cuda.Stream(device=device, priority=1),

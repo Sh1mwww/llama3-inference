@@ -11,6 +11,19 @@ from transformers import LlamaTokenizerFast
 from .config import ModelArgs
 from .model import Transformer
 
+# NVTX profiling support
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except ImportError:
+    NVTX_AVAILABLE = False
+    # Fallback no-op functions
+    class nvtx:
+        @staticmethod
+        def range_push(name): pass
+        @staticmethod
+        def range_pop(): pass
+
 
 class LLaMA:
     """
@@ -305,6 +318,7 @@ class LLaMA:
         profile_output_dir: Optional[str] = None,
         batch_size: int = 4,  
     ):
+        nvtx.range_push("text_completion")
         
         num_batches = (len(prompts) + batch_size - 1) // batch_size
         
@@ -325,9 +339,11 @@ class LLaMA:
         if max_gen_len is None:
             max_gen_len = self.args.max_seq_len - 1
 
+        nvtx.range_push("tokenization")
         prompts_tok = [
             self.tokenizer.encode(p, add_special_tokens=False) for p in prompts
         ]
+        nvtx.range_pop()  # tokenization
         
         '''
         all_out_tokens: 最终每个 prompt 生成的 token ID 序列
@@ -428,11 +444,15 @@ class LLaMA:
                 desc = f"Generating tokens for batch {batch_idx + 1}/{num_batches}"
             
             for cur_pos in tqdm(range(1, total_len), desc=desc):
+                nvtx.range_push(f"token_{cur_pos}_generation")
                 try:
                     # ---- forward ----
+                    nvtx.range_push(f"token_{cur_pos}_forward")
                     with torch.no_grad():
                         logits = self.model(tokens[:, cur_pos - 1 : cur_pos], cur_pos)
+                    nvtx.range_pop()  # forward
 
+                    nvtx.range_push(f"token_{cur_pos}_sampling")
                     if temperature > 0:
                         probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
                         next_tok = self._sample_top_p(probs, top_p)
@@ -443,20 +463,28 @@ class LLaMA:
                     next_tok = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_tok)
                     tokens[:, cur_pos] = next_tok
                     eos_mask |= (~prompt_mask[:, cur_pos]) & (next_tok == self.tokenizer.eos_token_id)
+                    nvtx.range_pop()  # sampling
+                    
                     if eos_mask.all():
+                        nvtx.range_pop()  # token_generation
                         break
                         
                 except torch.cuda.OutOfMemoryError as e:
                     print(f"❌ CUDA OOM during inference at position {cur_pos}: {e}")
                     torch.cuda.empty_cache()
+                    nvtx.range_pop()  # token_generation (error case)
                     raise RuntimeError(f"GPU out of memory during inference") from e
                 except RuntimeError as e:
                     if "CUDA" in str(e):
                         print(f"❌ CUDA error during inference at position {cur_pos}: {e}")
                         torch.cuda.empty_cache()
+                        nvtx.range_pop()  # token_generation (error case)
                         raise RuntimeError(f"CUDA error during inference") from e
                     else:
+                        nvtx.range_pop()  # token_generation (error case)
                         raise
+                        
+                nvtx.range_pop()  # token_generation
 
                 kv_re_time = sum(self.model.kv_times)
                 bytes_per_token = (                
