@@ -3,34 +3,30 @@ import torch.nn as nn
 from dataclasses import dataclass, fields, field
 from typing import Optional, List, Dict, Any
 
-
-
 @dataclass
 class LayerInfo:
     layer_id:int
     block: Optional[nn.Module] = None   #encoderblock
     extra: Dict[str, Any] = field(default_factory=dict)
 
-
 @dataclass
 class KVCacheArgs:
-    
     ssd_path: str = "/mnt/kv_cache/kv_cache.bin"
     ssd_size_gb: int = 500
     dram_limit_gb: float = 0.1
 
 
+"""
+HBM内存限制配置
+"""
 @dataclass
 class MemoryLimitArgs:
-    """HBM内存限制配置"""
     max_hbm_gb: float = 12.0          # 最大HBM使用量(GB)
     reserved_hbm_gb: float = 1.0      # 预留HBM(GB)  
     enable_monitoring: bool = True     # 启用内存监控
     cleanup_threshold: float = 0.9     # 清理阈值
     auto_limit: bool = True           # 自动设置限制
     
-
-
 @dataclass
 class ModelArgs:
     dim: int

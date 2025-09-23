@@ -6,7 +6,7 @@ from typing import List, Optional
 
 import torch
 from tqdm import tqdm
-from transformers import LlamaTokenizerFast
+from transformers import LlamaTokenizerFast,AutoTokenizer
 
 from .config import ModelArgs
 from .model import Transformer
@@ -24,15 +24,8 @@ except ImportError:
         @staticmethod
         def range_pop(): pass
 
-
+# tokenizer, checkpoint, args
 class LLaMA:
-    """
-    推理包装：负责
-      1. 加载 tokenizer / checkpoint
-      2. 采样 & top-p
-      3. KV profiling 保存
-    """
-
     def __init__(self, tokenizer, checkpoint, args: ModelArgs):
         self.tokenizer = tokenizer
         self.args = args
@@ -263,7 +256,7 @@ class LLaMA:
         max_batch_size: int = 512,
     ) -> "LLaMA":
         ckpt_dir = Path(checkpoints_dir)
-        tokenizer = LlamaTokenizerFast.from_pretrained(ckpt_dir, legacy=True)
+        tokenizer = LlamaTokenizerFast.from_pretrained(pretrained_model_name_or_path=ckpt_dir/tokenizer.model, legacy=True)
         params_path = ckpt_dir / "params.json"
         args = ModelArgs.from_json(
             str(params_path), max_seq_len=max_seq_len, max_batch_size=max_batch_size, device=device

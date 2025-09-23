@@ -74,7 +74,7 @@ class KVOffloader:
         # 尝试初始化SSD后端，如果失败则禁用
         try:
             self.ssd = RawBlockKVBackend(
-                dev_path="/dev/nvme0n1p3",     # 你的裸分区
+                dev_path="/dev/nvme0n1p4",     # 你的裸分区
                 n_layers=layers,
                 blk_bytes=self.block_nbytes,
                 blk_per_layer=n_blocks,

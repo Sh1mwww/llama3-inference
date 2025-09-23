@@ -20,7 +20,7 @@ set -e  # 遇到错误立即退出
 
 # ==================== 配置参数 ====================
 # 默认模型路径（可通过环境变量覆盖）
-DEFAULT_MODEL="${LLAMA_MODEL_PATH:-/mnt/model/llama/checkpoints/Llama3.2-3B}"
+DEFAULT_MODEL="${LLAMA_MODEL_PATH:-/home/roger/.llama/checkpoints/Llama3.1-8B}"
 DEFAULT_DEVICE="${LLAMA_DEVICE:-cuda}"
 DEFAULT_BATCH_SIZE=32
 DEFAULT_MAX_LEN=2048

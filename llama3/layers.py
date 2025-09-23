@@ -410,11 +410,8 @@ class SelfAttention(nn.Module):
         self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device="cpu")
         self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device="cpu")
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, device="cpu")
-        
-        # 使用优化的KV offloader
         self.block_sz = BLOCK
-        
-        # 获取统一的流管理
+
         streams = None
         try:
             import llama3.stream_mnt as stream_mnt
