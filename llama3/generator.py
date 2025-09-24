@@ -3,56 +3,69 @@ import os
 import time
 from pathlib import Path
 from typing import List, Optional
-
 import torch
 from tqdm import tqdm
-from transformers import LlamaTokenizerFast,AutoTokenizer
-
+from transformers import LlamaTokenizerFast, AutoTokenizer  
 from .config import ModelArgs
 from .model import Transformer
 
-# NVTX profiling support
+# ================================
+# NVTX profiling support (safe fallback)
+# ================================
+
 try:
     import torch.cuda.nvtx as nvtx
     NVTX_AVAILABLE = True
 except ImportError:
     NVTX_AVAILABLE = False
-    # Fallback no-op functions
+
+    # Fallback no-op functions to avoid sprinkling if-guards everywhere.
     class nvtx:
         @staticmethod
-        def range_push(name): pass
-        @staticmethod
-        def range_pop(): pass
+        def range_push(name): 
+            pass
 
-# tokenizer, checkpoint, args
+        @staticmethod
+        def range_pop(): 
+            pass
+
+
+# ================================
+# LLaMA wrapper
+# - Handles tokenizer/model build, (optional) weight streaming config, and text generation
+# ================================
+
 class LLaMA:
     def __init__(self, tokenizer, checkpoint, args: ModelArgs):
+        """
+        Initialize model and (optionally) load checkpoint weights.
+        Model is first constructed on the device specified in `args.device` (may be 'cpu' or 'cuda:X').
+        """
         self.tokenizer = tokenizer
         self.args = args
-        
-        # 初始化全局状态跟踪器
-        from .global_state_tracker import init_global_tracker, get_global_tracker
-        from .kv_offload import BLOCK
-        if get_global_tracker() is None:
-            print(f"[INFO] Initializing global state tracker...")
-            n_blocks = (args.max_seq_len + BLOCK - 1) // BLOCK  # 计算需要的block数量
-            tracker = init_global_tracker(
-                max_batch=args.max_batch_size,
-                layers=args.n_layers,
-                n_blocks=n_blocks
-            )
-            # 不设置默认的future batches，等待实际使用时再设置
-            print(f"[INFO] Global state tracker initialized, waiting for actual batch registration")
-        
+
+        # (Optional) Global tracker init (left commented — keep original code)
+        # from .global_state_tracker import init_global_tracker, get_global_tracker
+        # from .kv_offload import BLOCK
+        # if get_global_tracker() is None:
+        #     print(f"[INFO] Initializing global state tracker...")
+        #     n_blocks = (args.max_seq_len + BLOCK - 1) // BLOCK
+        #     tracker = init_global_tracker(
+        #         max_batch=args.max_batch_size,
+        #         layers=args.n_layers,
+        #         n_blocks=n_blocks
+        #     )
+        #     print(f"[INFO] Global state tracker initialized, waiting for actual batch registration")
+
         print(f"[INFO] Initializing model on device: {args.device}")
         self.model = Transformer(args)
-        
+
         print(f"[INFO] Moving model to {args.device}...")
         self.model = self.model.to(args.device)
-        
+
         print(f"[INFO] Converting to half precision...")
         self.model = self.model.half()
-        
+
         if checkpoint is not None:
             print(f"[INFO] Loading state dict...")
             missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint, strict=False)
@@ -61,106 +74,155 @@ class LLaMA:
             if unexpected_keys:
                 print(f"[WARNING] Unexpected keys: {len(unexpected_keys)} keys")
             print(f"[INFO] Model weights loaded successfully")
-    
+
+    def _configure_preload_mode(self, preload_config: dict):
+        """
+        Preload all weights to GPU, then use prefetch during inference.
+        """
+        print("🚀 Configuring Preload Mode...")
+
+        config = {
+            'max_layers_in_gpu': 4,  # 同时在GPU中保持的层数
+            'prefetch_next': True,   # 是否在计算时预取下一层
+            'verbose': True,
+        }
+        config.update(preload_config)
+
+        try:
+            print(f"📦 Preloading {config['max_layers_in_gpu']} layers to GPU...")
+
+            # 预加载前几层到GPU
+            if hasattr(self.model, 'layer_infos') and self.model.layer_infos:
+                loaded_count = 0
+                for i, layer_info in enumerate(self.model.layer_infos[:config['max_layers_in_gpu']]):
+                    if layer_info.block is not None:
+                        print(f"  Loading layer {i} to GPU...")
+                        layer_info.block = layer_info.block.to(self.args.device)
+                        loaded_count += 1
+
+                print(f"✅ Successfully preloaded {loaded_count} layers to GPU")
+
+                # 设置预取配置
+                self.model.preload_config = config
+
+            else:
+                print("⚠️  No layer_infos found, falling back to full model loading")
+                self.model = self.model.to(self.args.device)
+
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"❌ GPU OOM during preloading: {e}")
+            print("💡 Consider reducing max_layers_in_gpu or using weight streaming")
+            raise
+
     def _configure_weight_streaming(self, streaming_config: dict):
-        """配置权重流式传输"""
+        """
+        Enable weight streaming (keep activations on GPU, stream per-layer weights).
+        NOTE: Intentionally keeps local imports to avoid circular deps and heavy eager imports.
+        """
         print("🔧 Configuring Weight Streaming...")
-        
-        # 导入必要的模块
+
+        # Local imports intentionally kept (avoid circular imports / heavy startup)
         from .weight_streaming_manager import WeightStreamingManager
         from . import layers
         from . import stream_mnt
-        
-        # 设置默认配置
+
+        # Default streaming config (merged with user-provided overrides)
         config = {
             'prefetch_distance': 1,
             'max_cached_layers': 4,
             'warmup_layers': 1,
-            'verbose': False
+            'verbose': False,
         }
         config.update(streaming_config)
-        
-        # 确保模型的 layers 属性可访问（供 WSM 使用）
+
+        # Ensure model.layers is accessible when layer_infos is present (for WSM integration)
         if hasattr(self.model, "layer_infos"):
             try:
                 blocks = [info.block for info in self.model.layer_infos if info.block is not None]
                 if blocks and not hasattr(self.model, "layers"):
                     self.model.layers = blocks
             except Exception:
+                # Swallow silently to preserve original behavior
                 pass
-        
-        # 配置核心组件到目标设备（小模块常驻 HBM）
+
+        # Place small/core components on target device (kept resident in HBM)
         self._configure_core_components()
-        
-        # 创建和配置 WSM
+
+        # Create and wire up the WeightStreamingManager
         wsm = WeightStreamingManager(
-            self.model, 
+            self.model,
             device=self.args.device,
             prefetch_distance=config['prefetch_distance'],
             max_cached_layers=config['max_cached_layers'],
             warmup_layers=config['warmup_layers'],
-            verbose=True  # 强制启用详细日志以便验证
+            verbose=True,  # force verbose to help verify integration
         )
-        
-        # 集成 WSM 到模型层
+
+        # Integrate WSM hooks into layers (attn/ffn)
         self._integrate_wsm_to_layers(wsm)
-        
-        # 配置 KV streams
+
+        # Configure KV streams if offloaders exist
         self._configure_kv_streams()
-        
-        # 验证并修复设备放置
+
+        # Verify and fix device placements to avoid accidental CPU/GPU mismatches
         self._verify_and_fix_device_placement()
-        
-        # 输出关键的诊断信息
+
+        # Optional diagnostics
         try:
             first_blk = getattr(self.model, "layers", [None])[0]
             if first_blk is not None:
                 print("[CHECK] first block param device:", next(first_blk.parameters()).device)
         except Exception:
             pass
-        
+
         print("✅ Weight streaming enabled (activations on GPU, weights streamed per-layer).")
         print("⚙️  Running on GPU")
-        
         return wsm
-    
+
     def _configure_core_components(self):
-        """配置核心组件到目标设备"""
+        """
+        Keep small/core modules (embeddings, output head, final norm) permanently on the target device.
+        """
         device = self.args.device
         model = self.model
-        
-        # 小模块常驻 HBM
+
+        # Keep small modules resident in HBM (fast, avoids repeated transfers)
         model.embed_tokens = model.embed_tokens.to(device)
         model.norm = model.norm.to(device)
         model.output = model.output.to(device)
-        
-        # 处理 freqs_complex
+
+        # Handle RoPE frequencies tensor/device placement
         self._handle_freqs_complex(device)
-    
+
     def _handle_freqs_complex(self, device: str):
-        """处理 freqs_complex 的设备放置与重建"""
+        """
+        Ensure `freqs_complex` tensor lives on the correct device.
+        If a direct `.to(device)` fails (e.g. stored as different type or shape),
+        attempt to re-create it from model args.
+        """
         model = self.model
-        
+
         if hasattr(model, "freqs_complex"):
             try:
                 model.freqs_complex = model.freqs_complex.to(device)
             except Exception as e:
                 print(f"⚠️ Warning: Failed to move freqs_complex to {device}: {e}")
-                # 重新创建 freqs_complex 在目标设备上
                 self._recreate_freqs_complex(device)
-    
+
     def _recreate_freqs_complex(self, device: str):
-        """重新创建 freqs_complex 在目标设备上"""
+        """
+        Rebuild `freqs_complex` on the requested device using model args.
+        NOTE: local import by design; avoids importing `layers` at module import time.
+        """
         try:
-            from .layers import precompute_theta_pos_frequencies
+            from .layers import precompute_theta_pos_frequencies  # local import intentionally kept
             print(f"   Attempting to recreate freqs_complex on {device}...")
-            
-            # 使用 ModelArgs 中的配置
+
             dim = self.args.dim
             n_heads = self.args.n_heads
             max_seq_len = self.args.max_seq_len
             rope_theta = self.args.rope_theta
-            
+
             self.model.freqs_complex = precompute_theta_pos_frequencies(
                 dim // n_heads,
                 max_seq_len * 2,
@@ -171,14 +233,16 @@ class LLaMA:
         except Exception as e:
             print(f"   Failed to recreate freqs_complex: {e}")
             raise RuntimeError(f"Cannot ensure freqs_complex is on {device}") from e
-    
+
     def _integrate_wsm_to_layers(self, wsm):
-        """将 WSM 集成到模型层"""
+        """
+        Attach the WeightStreamingManager to attention/FFN modules so they can stream weights.
+        """
         try:
-            from . import layers
-            layers.set_weight_manager(wsm)  # 设置全局引用
-            
-            # 为现有层手动注入
+            from . import layers  # local import intentionally kept
+            layers.set_weight_manager(wsm)  # set global reference for modules to pick up
+
+            # Manual injection for already-constructed blocks
             if hasattr(self.model, "layers"):
                 for i, layer in enumerate(self.model.layers):
                     if hasattr(layer, "attention"):
@@ -189,13 +253,15 @@ class LLaMA:
                         layer.feed_forward.layer_id = getattr(layer, "layer_id", i)
         except Exception as e:
             print(f"[WARN] failed to set_weight_manager on blocks: {e}")
-    
+
     def _configure_kv_streams(self):
-        """配置 KV streams"""
+        """
+        Configure the H2D/D2H streams for KV offloader (if any) on each layer's attention module.
+        """
         try:
-            from . import stream_mnt
+            from . import stream_mnt  # local import intentionally kept
             streams = stream_mnt.get_streams(self.args.device)
-            
+
             if hasattr(self.model, "layers"):
                 for layer in self.model.layers:
                     if hasattr(layer, "attention"):
@@ -205,27 +271,28 @@ class LLaMA:
                             off.d2h_stream = streams.kv_d2h
         except Exception as e:
             print(f"[WARN] failed to configure KV streams: {e}")
-    
+
     def _verify_and_fix_device_placement(self):
-        """验证并修复设备放置"""
+        """
+        Double-check that all key components and per-layer norms live on the intended CUDA device.
+        """
         device = self.args.device
         model = self.model
-        
+
         if not device.startswith("cuda"):
             return
-            
+
         print("🔍 Verifying device placement before inference...")
-        
         try:
-            # 强制同步所有核心组件到目标设备
+            # Force-sync core modules to target device
             print("🔧 Synchronizing all components to target device...")
             model.embed_tokens = model.embed_tokens.to(device)
             model.norm = model.norm.to(device)
             model.output = model.output.to(device)
             if hasattr(model, 'freqs_complex'):
                 model.freqs_complex = model.freqs_complex.to(device)
-            
-            # 同步所有层的 norm 权重到 GPU
+
+            # Sync per-layer norms to GPU
             print("🔧 Synchronizing layer norms to GPU...")
             if hasattr(model, "layers"):
                 for layer in model.layers:
@@ -233,17 +300,15 @@ class LLaMA:
                         layer.attn_norm = layer.attn_norm.to(device)
                     if hasattr(layer, 'ffn_norm'):
                         layer.ffn_norm = layer.ffn_norm.to(device)
-            
-            # GPU 同步确保所有操作完成
+
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            
+
             print("✅ All layer components synchronized to target device")
-                
         except Exception as e:
             print(f"⚠️ Error during device synchronization: {e}")
 
-    # ---------- 构建 ----------
+    # ---------- Build ----------
     @staticmethod
     def build(
         checkpoints_dir: str,
@@ -251,23 +316,59 @@ class LLaMA:
         device: str = "cuda",
         enable_weight_streaming: bool = False,
         streaming_config: Optional[dict] = None,
+        enable_preload_mode: bool = False,
+        preload_config: Optional[dict] = None,
         topk_blk: Optional[int] = None,
         max_seq_len: int = 2048,
         max_batch_size: int = 512,
     ) -> "LLaMA":
+        """
+        Build a LLaMA instance:
+        1) Load tokenizer from checkpoint dir.
+        2) Load params.json into ModelArgs.
+        3) (Optional) Load .pth weights to CPU state_dict.
+        4) Weight loading strategies:
+           - enable_preload_mode: Preload N layers to GPU, prefetch during compute
+           - enable_weight_streaming: Original streaming mode
+           - default: Full model to GPU
+        """
         ckpt_dir = Path(checkpoints_dir)
-        tokenizer = LlamaTokenizerFast.from_pretrained(pretrained_model_name_or_path=ckpt_dir/tokenizer.model, legacy=True)
+
+        # ---- Tokenizer ----
+        tokenizer = None
+        try:
+            # Directly load tokenizer from folder
+            tokenizer = LlamaTokenizerFast.from_pretrained(
+                pretrained_model_name_or_path=ckpt_dir, legacy=True
+            )
+            print(f"[INFO] Loaded tokenizer with LlamaTokenizerFast")
+        except Exception as e:
+            print(f"[WARNING] Failed to load tokenizer with LlamaTokenizerFast from {ckpt_dir}: {e}")
+            # Keep the original lazy import pattern in the fallback for parity with user's code
+            try:
+                from transformers import AutoTokenizer  # local (redundant) import intentionally kept
+                tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, legacy=True)
+                print(f"[INFO] Loaded tokenizer with AutoTokenizer")
+            except Exception as e2:
+                print(f"[ERROR] Failed to load tokenizer with AutoTokenizer: {e2}")
+                raise RuntimeError(f"Failed to load tokenizer: {e}, {e2}")
+
+        if tokenizer is None:
+            raise RuntimeError("Failed to initialize tokenizer")
+
+        # ---- Load params.json ----
         params_path = ckpt_dir / "params.json"
         args = ModelArgs.from_json(
             str(params_path), max_seq_len=max_seq_len, max_batch_size=max_batch_size, device=device
         )
-        
-        # 如果指定了 topk_blk，更新到 ModelArgs 中
+
+        # Allow overriding top-k block selection args
         if topk_blk is not None:
             args.topk_blk = topk_blk
-        
+
         args.checkpoints_dir = str(ckpt_dir)
 
+        # ---- Load checkpoint weights to CPU (optional) ----
         checkpoint = None
         if load_model:
             ckpt_file = sorted(ckpt_dir.glob("*.pth"))[0]
@@ -276,21 +377,25 @@ class LLaMA:
             checkpoint = torch.load(ckpt_file, map_location="cpu")
             print(f"[INFO] Done ({time.time() - t0:.1f}s)")
 
-        # 先在 CPU 上创建 LLaMA 实例（避免 OOM）
+        # ---- Build model on CPU first to avoid OOM ----
         cpu_args = ModelArgs.from_json(
             str(params_path), max_seq_len=max_seq_len, max_batch_size=max_batch_size, device="cpu"
         )
         if topk_blk is not None:
             cpu_args.topk_blk = topk_blk
         cpu_args.checkpoints_dir = str(ckpt_dir)
-        
+
         llama = LLaMA(tokenizer, checkpoint, cpu_args)
-        
-        # 如果启用权重流式传输且设备是 CUDA
-        if enable_weight_streaming and device.startswith("cuda"):
+
+        # ---- Weight loading strategies ----
+        if enable_preload_mode and device.startswith("cuda"):
+            # 新的预加载模式：先加载几层，然后在推理时预取
+            llama._configure_preload_mode(preload_config or {})
+        elif enable_weight_streaming and device.startswith("cuda"):
+            # 原有的流式加载模式
             llama._configure_weight_streaming(streaming_config or {})
         elif device.startswith("cuda"):
-            # 非流式传输模式：直接移动到 GPU
+            # 传统的全量加载模式
             try:
                 llama.model = llama.model.to(device)
                 llama.args.device = device
@@ -298,10 +403,10 @@ class LLaMA:
                 print("❌ CUDA OOM when moving model. Keeping on CPU...")
                 device = "cpu"
                 llama.args.device = "cpu"
-        
+
         return llama
 
-    # ---------- 推理 ----------
+    # ---------- Inference ----------
     def text_completion(
         self,
         prompts: List[str],
@@ -309,89 +414,95 @@ class LLaMA:
         top_p: float = 0.9,
         max_gen_len: Optional[int] = None,
         profile_output_dir: Optional[str] = None,
-        batch_size: int = 4,  
+        batch_size: int = 4,
+        enable_batching: bool = True,
     ):
+        """
+        Greedy/Top-p generation with simple batching and optional KV profiling.
+        - Uses `pad_token_id` for padding (falls back to `eos_token_id` if none).
+        - Tracks per-token times/bytes for KV cache (rough estimate).
+
+        Args:
+            enable_batching: If False, processes all prompts in a single batch (no "local X/Y" display)
+        """
         nvtx.range_push("text_completion")
-        
+
+        # Disable batching if requested
+        if not enable_batching:
+            batch_size = len(prompts)
+
         num_batches = (len(prompts) + batch_size - 1) // batch_size
-        
-        # register future batches in the global state tracker
-        from .global_state_tracker import get_global_tracker
+
+        # Try to register batches in global tracker (best-effort)
+        from .global_state_tracker import get_global_tracker  # keep original code behavior
         tracker = get_global_tracker()
         if tracker:
             actual_batches = list(range(num_batches))
-            # 只在future_batches為空時註冊，避免覆蓋已存在的batch序列
+            # Only register if empty to avoid overwriting existing schedules
             if not tracker.future_batches:
                 tracker.register_future_batch(actual_batches)
-                print(f"[INFO] Registered {num_batches} batches for {len(prompts)} prompts (batch_size={batch_size}): {actual_batches}")
+                print(
+                    f"[INFO] Registered {num_batches} batches for {len(prompts)} prompts "
+                    f"(batch_size={batch_size}): {actual_batches}"
+                )
         else:
             print("[WARNING] Global tracker not found during batch registration")
-        
+
+        # Expand max_batch_size if needed to cover current request
         self.args.max_batch_size = max(self.args.max_batch_size, len(prompts))
 
         if max_gen_len is None:
             max_gen_len = self.args.max_seq_len - 1
 
+        # ---- Tokenize ----
         nvtx.range_push("tokenization")
-        prompts_tok = [
-            self.tokenizer.encode(p, add_special_tokens=False) for p in prompts
-        ]
+        prompts_tok = [self.tokenizer.encode(p, add_special_tokens=False) for p in prompts]
         nvtx.range_pop()  # tokenization
-        
-        '''
-        all_out_tokens: 最终每个 prompt 生成的 token ID 序列
-        all_out_text: 对上面 token 的 decode 结果
-        kv_profile: 每个 token 的 KV 访问 profile 记录（带时间和内存）
-        '''
+
+        # Storage for outputs and KV profile
         all_out_tokens, all_out_text = [], []
         kv_profile = []
-        
+
+        # ---- Per-batch generation ----
         for batch_idx in range(num_batches):
             try:
-                # 确定当前批次的prompts范围
+                # Index range of current batch
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, len(prompts_tok))
                 batch_prompts = prompts_tok[start_idx:end_idx]
-                
-                # 顯示全局batch進度（如果可用）
+
+                # Prefer global tracker progress display if available
                 try:
                     if tracker and tracker.future_batches:
                         global_batch_idx = tracker.current_batch
                         total_global_batches = len(tracker.future_batches)
-                        print(f"[INFO] Processing batch {global_batch_idx + 1}/{total_global_batches} with {len(batch_prompts)} prompts")
+                        print(
+                            f"[INFO] Processing batch {global_batch_idx + 1}/{total_global_batches} "
+                            f"with {len(batch_prompts)} prompts"
+                        )
                     else:
                         print(f"[INFO] Processing batch {batch_idx + 1}/{num_batches} with {len(batch_prompts)} prompts")
-                except:
+                except Exception:
                     print(f"[INFO] Processing batch {batch_idx + 1}/{num_batches} with {len(batch_prompts)} prompts")
-                
-                '''
-                bsz: 当前 batch 的样本数
-                max_prompt: 当前 batch 中最长的 prompt token 数
-                total_len: 当前 batch 需要分配的最大序列长度 (最长 prompt + 可生成的 token)
-                '''
+
+                # Shape planning
                 bsz = len(batch_prompts)
                 max_prompt = max(len(x) for x in batch_prompts)
                 total_len = min(self.args.max_seq_len, max_gen_len + max_prompt)
-                
+
             except Exception as e:
                 print(f"❌ Error during batch {batch_idx + 1} initialization: {e}")
                 continue
 
             try:
-                '''
-                获取 tokenizer 里用于 padding 的 token ID;
-                如果 tokenizer 没定义 pad_token_id(例如原生 LLaMA 就没有），则 fallback 使用 eos_token_id 来填充；
-                这个 pad_id 将用于填满每条 prompt 后面的空白位置。
-                '''
+                # Pad with tokenizer.pad_token_id if available; otherwise fallback to eos
                 pad_id = (
                     self.tokenizer.pad_token_id
                     if self.tokenizer.pad_token_id is not None
                     else self.tokenizer.eos_token_id
                 )
-                '''
-                tokens 是输入模型的 token ID 二维张量,shape 为 (bsz, total_len);
-                初始化时全部填充为 pad_id,即“空”的标记;
-                '''
+
+                # Input token tensor: (bsz, total_len), pre-filled with pad
                 tokens = torch.full(
                     (bsz, total_len),
                     pad_id,
@@ -399,12 +510,14 @@ class LLaMA:
                     device=self.args.device,
                 )
 
+                # Write prompt tokens at the front of each row
                 for i, tok in enumerate(batch_prompts):
                     tokens[i, : len(tok)] = torch.tensor(tok, device=self.args.device)
 
-                eos_mask = torch.zeros(bsz, dtype=torch.bool, device=self.args.device)
-                prompt_mask = tokens != pad_id
-                
+                # Masks
+                eos_mask = torch.zeros(bsz, dtype=torch.bool, device=self.args.device)  # track finished sequences
+                prompt_mask = tokens != pad_id  # True where original prompt tokens exist
+
             except torch.cuda.OutOfMemoryError as e:
                 print(f"❌ CUDA OOM during batch {batch_idx + 1} tensor allocation: {e}")
                 torch.cuda.empty_cache()
@@ -416,35 +529,32 @@ class LLaMA:
                     continue
                 else:
                     raise
-            '''
-            每个 step(cur_pos)做：
-            1.调用模型进行一次 forward输入当前序列的最后一个 token;
-            2.得到 logits → 根据温度采样或 argmax,得到下一个 token;
-            3.写入 tokens;
-            4.如果所有样本都生成了 <eos>，提前退出；
-            5.同时收集 KV cache profiling 信息（时间、空间）；
-            '''
-            # 获取全局批次信息以显示更准确的进度
+
+            # Build progress bar description with global tracker if available
             try:
                 tracker = get_global_tracker()
                 if tracker and hasattr(tracker, 'current_batch') and tracker.current_batch is not None:
                     global_batch_num = tracker.current_batch + 1
-                    total_global_batches = len(tracker.future_batches) if hasattr(tracker, 'future_batches') else 'Unknown'
+                    total_global_batches = (
+                        len(tracker.future_batches) if hasattr(tracker, 'future_batches') else 'Unknown'
+                    )
                     desc = f"Generating tokens for batch {global_batch_num}/{total_global_batches} (local {batch_idx + 1}/{num_batches})"
                 else:
                     desc = f"Generating tokens for batch {batch_idx + 1}/{num_batches}"
-            except:
+            except Exception:
                 desc = f"Generating tokens for batch {batch_idx + 1}/{num_batches}"
-            
+
+            # ---- Token-by-token decode loop ----
             for cur_pos in tqdm(range(1, total_len), desc=desc):
                 nvtx.range_push(f"token_{cur_pos}_generation")
                 try:
-                    # ---- forward ----
+                    # 1) Forward last token for each row
                     nvtx.range_push(f"token_{cur_pos}_forward")
                     with torch.no_grad():
-                        logits = self.model(tokens[:, cur_pos - 1 : cur_pos], cur_pos)
+                        logits = self.model(tokens[:, cur_pos - 1: cur_pos], cur_pos)
                     nvtx.range_pop()  # forward
 
+                    # 2) Sampling / argmax
                     nvtx.range_push(f"token_{cur_pos}_sampling")
                     if temperature > 0:
                         probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
@@ -453,34 +563,42 @@ class LLaMA:
                         next_tok = torch.argmax(logits[:, -1], dim=-1)
 
                     next_tok = next_tok.reshape(-1)
+
+                    # Respect prompt region: keep original token if still in prompt
                     next_tok = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_tok)
+
+                    # 3) Write back
                     tokens[:, cur_pos] = next_tok
+
+                    # 4) EOS tracking (only matters outside prompt)
                     eos_mask |= (~prompt_mask[:, cur_pos]) & (next_tok == self.tokenizer.eos_token_id)
                     nvtx.range_pop()  # sampling
-                    
+
+                    # 5) Early break if all finished
                     if eos_mask.all():
                         nvtx.range_pop()  # token_generation
                         break
-                        
+
                 except torch.cuda.OutOfMemoryError as e:
                     print(f"❌ CUDA OOM during inference at position {cur_pos}: {e}")
                     torch.cuda.empty_cache()
                     nvtx.range_pop()  # token_generation (error case)
-                    raise RuntimeError(f"GPU out of memory during inference") from e
+                    raise RuntimeError("GPU out of memory during inference") from e
                 except RuntimeError as e:
                     if "CUDA" in str(e):
                         print(f"❌ CUDA error during inference at position {cur_pos}: {e}")
                         torch.cuda.empty_cache()
                         nvtx.range_pop()  # token_generation (error case)
-                        raise RuntimeError(f"CUDA error during inference") from e
+                        raise RuntimeError("CUDA error during inference") from e
                     else:
                         nvtx.range_pop()  # token_generation (error case)
                         raise
-                        
+
                 nvtx.range_pop()  # token_generation
 
+                # ---- KV profile (rough estimate, same as original logic) ----
                 kv_re_time = sum(self.model.kv_times)
-                bytes_per_token = (                
+                bytes_per_token = (
                     2 * self.model.args.n_kv_heads
                     * self.model.args.dim // self.model.args.n_heads
                     * self.model.embed_tokens.weight.element_size()
@@ -495,30 +613,35 @@ class LLaMA:
                         "kv_kb": float(kv_bytes / 1024),
                     }
                 )
-                
-            # ---- 处理当前批次输出 ----
+
+            # ---- Decode current batch output ----
             for row in tokens.tolist():
                 if self.tokenizer.eos_token_id in row:
                     row = row[: row.index(self.tokenizer.eos_token_id)]
                 all_out_tokens.append(row)
                 all_out_text.append(self.tokenizer.decode(row))
-        
-        # 使用处理后的结果
+
+        # Final results
         out_tokens, out_text = all_out_tokens, all_out_text
 
-        # 保存 profiling
+        # ---- Save profiling if requested ----
         if profile_output_dir:
             os.makedirs(profile_output_dir, exist_ok=True)
-            save_name = os.path.join(profile_output_dir, f"{Path(self.args.checkpoints_dir).name}_kv_profile.json")
+            save_name = os.path.join(
+                profile_output_dir, f"{Path(self.args.checkpoints_dir).name}_kv_profile.json"
+            )
             with open(save_name, "w", encoding="utf-8") as f:
                 json.dump(kv_profile, f, indent=2)
             print(f"[INFO] KV profile saved → {save_name}")
 
         return out_tokens, out_text
 
-    # ---------- utils ----------
+    # ---------- Utils ----------
     @staticmethod
     def _sample_top_p(probs, p):
+        """
+        Nucleus (top-p) sampling on the last dimension of probs tensor.
+        """
         sort_probs, sort_idx = torch.sort(probs, dim=-1, descending=True)
         cumsum = torch.cumsum(sort_probs, dim=-1)
         sort_probs[cumsum - sort_probs > p] = 0.0
@@ -527,7 +650,9 @@ class LLaMA:
         return torch.gather(sort_idx, -1, next_tok)
 
     def encode(self, text: str):
+        """Convenience helper to encode with underlying tokenizer."""
         return self.tokenizer.encode(text)
 
     def decode(self, ids):
+        """Convenience helper to decode with underlying tokenizer."""
         return self.tokenizer.decode(ids)

@@ -1,4 +1,3 @@
-# SSDBacked.py
 import os, numpy as np, torch, threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,21 +15,19 @@ class RawBlockKVBackend:
                  max_concurrent_io: int = 4):
         self.fd = None
         try:
-            # 改为可写 + O_DIRECT
             self.fd = os.open(dev_path, os.O_RDWR | os.O_DIRECT)
         except FileNotFoundError:
             print(f"[ERROR] Device not found: {dev_path}")
             raise
 
-        self.blk_bytes = blk_bytes             # 逻辑有效字节（整 token）
+        self.blk_bytes = blk_bytes             # 逻辑有效字节
         self.stride    = ((blk_bytes + ALIGN - 1) // ALIGN) * ALIGN   # 物理步距
-        self.blk_pl    = blk_per_layer         # 每层的槽位数量（这里= max_seq_len）
+        self.blk_pl    = blk_per_layer         # 每层的槽位数量 = max_seq_len
         self.n_layers  = n_layers
         self.pool = ThreadPoolExecutor(max_workers=max_concurrent_io,
                                        thread_name_prefix="rbd_io")
 
     def _offset(self, layer, slot):
-        # slot 可以是 token_idx
         return (layer * self.blk_pl + slot) * self.stride
 
     # ---------- sync write ----------

@@ -15,18 +15,6 @@ class KVCacheArgs:
     ssd_size_gb: int = 500
     dram_limit_gb: float = 0.1
 
-
-"""
-HBM内存限制配置
-"""
-@dataclass
-class MemoryLimitArgs:
-    max_hbm_gb: float = 12.0          # 最大HBM使用量(GB)
-    reserved_hbm_gb: float = 1.0      # 预留HBM(GB)  
-    enable_monitoring: bool = True     # 启用内存监控
-    cleanup_threshold: float = 0.9     # 清理阈值
-    auto_limit: bool = True           # 自动设置限制
-    
 @dataclass
 class ModelArgs:
     dim: int
@@ -46,7 +34,6 @@ class ModelArgs:
     device: str = "cuda"
     topk_blk: int = 8
     layer_infos: List[LayerInfo] = field(default_factory=list)
-    memory_limit: MemoryLimitArgs = field(default_factory=MemoryLimitArgs) 
     
     @staticmethod
     def from_json(params_path: str,
@@ -54,13 +41,12 @@ class ModelArgs:
                   max_batch_size: int,
                   device: str = None,
                   memory_limit_gb: float = None):
-        # 导入GPU工具
         try:
             from .gpu_utils import get_optimal_device, GPUHealthMonitor
-            from .memory_manager import set_global_memory_limit, get_memory_info
+            from .memory_manager import MemoryConfig, set_global_memory_limit, get_memory_info
         except ImportError:
-            # 如果GPU工具不可用，使用基本的设备检查
             import torch
+            
             def get_optimal_device(prefer_cuda=True, min_memory_gb=1.0):
                 if prefer_cuda and torch.cuda.is_available():
                     return "cuda"
@@ -69,13 +55,22 @@ class ModelArgs:
                 pass
             def get_memory_info(device):
                 return {"no_limit": True}
+
+            class MemoryConfig:
+                def __init__(self, max_hbm_gb=14.0, reserved_hbm_gb=1.0,
+                           enable_monitoring=True, cleanup_threshold=0.9,
+                           oom_retry_count=3, monitor_interval=1.0):
+                    self.max_hbm_gb = max_hbm_gb
+                    self.reserved_hbm_gb = reserved_hbm_gb
+                    self.enable_monitoring = enable_monitoring
+                    self.cleanup_threshold = cleanup_threshold
+                    self.oom_retry_count = oom_retry_count
+                    self.monitor_interval = monitor_interval
         
-        # 智能设备选择
         if device is None:
             device = get_optimal_device(prefer_cuda=True, min_memory_gb=1.0)
             print(f"Auto-selected device: {device}")
         else:
-            # 验证指定的设备
             if device.startswith("cuda"):
                 try:
                     monitor = GPUHealthMonitor()
@@ -88,6 +83,7 @@ class ModelArgs:
                         if fallback_device != device:
                             print(f"Falling back to {fallback_device}")
                             device = fallback_device
+                            
                 except Exception as e:
                     print(f"Warning: GPU health check failed: {e}")
                     if not torch.cuda.is_available():
@@ -99,40 +95,43 @@ class ModelArgs:
 
         allowed = {f.name for f in fields(ModelArgs)}
         filtered = {k: v for k, v in params.items() if k in allowed}
-
-        # 设置内存限制
-        memory_limit_config = MemoryLimitArgs()
+        
+        # 处理 memory_limit 参数
         if memory_limit_gb is not None:
-            memory_limit_config.max_hbm_gb = memory_limit_gb
+            memory_limit_config = MemoryConfig(max_hbm_gb=memory_limit_gb)
         elif device and device.startswith("cuda"):
-            # 自动设置内存限制
             try:
                 memory_info = get_memory_info(device)
                 if "total_gb" in memory_info:
-                    # 默认使用80%的显存，预留20%
-                    auto_limit = memory_info["total_gb"] * 0.8
-                    memory_limit_config.max_hbm_gb = auto_limit
-                    memory_limit_config.reserved_hbm_gb = memory_info["total_gb"] * 0.2
-                    print(f"Auto-set memory limit: {auto_limit:.1f}GB (reserved: {memory_limit_config.reserved_hbm_gb:.1f}GB)")
+                    # 控制默认最大使用HBM为总量的95%
+                    auto_limit = memory_info["total_gb"] * 0.95
+                    reserved_limit = memory_info["total_gb"] * 0.05  
+                    memory_limit_config = MemoryConfig(
+                        max_hbm_gb=auto_limit,
+                        reserved_hbm_gb=reserved_limit
+                    )
+                    print(f"Auto-set memory limit: {auto_limit:.1f}GB (reserved: {reserved_limit:.1f}GB)")
+                else:
+                    memory_limit_config = MemoryConfig()  
             except Exception as e:
                 print(f"Failed to auto-set memory limit: {e}")
+                memory_limit_config = MemoryConfig()  
+        else:
+            memory_limit_config = MemoryConfig()  
 
         args =  ModelArgs(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             device=device,
-            memory_limit=memory_limit_config,
             **filtered
         )
 
-        # 应用全局内存限制
+        # 动态添加 memory_limit 属性
+        args.memory_limit = memory_limit_config
+
         if device and device.startswith("cuda"):
             try:
-                set_global_memory_limit(
-                    limit_gb=args.memory_limit.max_hbm_gb,
-                    device=device,
-                    reserved_gb=args.memory_limit.reserved_hbm_gb
-                )
+                set_global_memory_limit(config=args.memory_limit, device=device)
             except Exception as e:
                 print(f"Warning: Failed to set global memory limit: {e}")
 

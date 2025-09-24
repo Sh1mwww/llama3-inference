@@ -17,12 +17,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MemoryConfig:
     """内存配置"""
-    max_hbm_gb: float = 12.0          # 最大HBM使用量(GB)
-    reserved_hbm_gb: float = 1.0      # 预留HBM(GB)
-    enable_monitoring: bool = True     # 启用内存监控
-    cleanup_threshold: float = 0.9     # 清理阈值(使用率)
-    oom_retry_count: int = 3          # OOM重试次数
-    monitor_interval: float = 1.0     # 监控间隔(秒)
+    max_hbm_gb: float = 14.0         
+    reserved_hbm_gb: float = 1.0     
+    enable_monitoring: bool = True     
+    cleanup_threshold: float = 0.9     
+    oom_retry_count: int = 3          
+    monitor_interval: float = 1.0    
 
 
 class HBMMemoryManager:
@@ -318,20 +318,25 @@ def hbm_memory_limit(limit_gb: float, device: str = "cuda:0",
         manager.stop_monitoring()
 
 
-def set_global_memory_limit(limit_gb: float, device: str = "cuda:0", 
-                          reserved_gb: float = 1.0):
+def set_global_memory_limit(limit_gb: float = None, device: str = "cuda:0",
+                          reserved_gb: float = None, config: MemoryConfig = None):
     """设置全局内存限制"""
-    config = MemoryConfig(
-        max_hbm_gb=limit_gb,
-        reserved_hbm_gb=reserved_gb,
-        enable_monitoring=True
-    )
-    
+    if config is not None:
+        # 直接使用传入的 MemoryConfig
+        memory_config = config
+    else:
+        # 向后兼容：从参数构建 MemoryConfig
+        memory_config = MemoryConfig(
+            max_hbm_gb=limit_gb or 12.0,
+            reserved_hbm_gb=reserved_gb or 1.0,
+            enable_monitoring=True
+        )
+
     # 重置并创建新的全局管理器
     GlobalMemoryManager.reset()
-    GlobalMemoryManager(config, device)
+    GlobalMemoryManager(memory_config, device)
     
-    logger.info(f"Global memory limit set to {limit_gb}GB on {device}")
+    logger.info(f"Global memory limit set to {memory_config.max_hbm_gb}GB on {device}")
 
 
 def get_memory_info(device: str = "cuda:0") -> Dict[str, Any]:

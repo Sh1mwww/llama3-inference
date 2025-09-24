@@ -1,7 +1,3 @@
-"""
-GPU错误处理和内存管理工具类
-提供GPU状态检查、错误恢复、内存管理等功能
-"""
 import torch
 import psutil
 import time
@@ -10,23 +6,19 @@ from typing import Optional, Callable, Any, Dict
 from contextlib import contextmanager
 from functools import wraps
 
-# 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class GPUMemoryError(Exception):
-    """GPU内存相关错误"""
     pass
 
 
 class GPUDeviceError(Exception):
-    """GPU设备相关错误"""
     pass
 
 
 class GPUHealthMonitor:
-    """GPU健康状态监控器"""
     
     def __init__(self):
         self.gpu_available = torch.cuda.is_available()
@@ -34,7 +26,6 @@ class GPUHealthMonitor:
         self.min_free_memory_gb = 1.0  # 最小保留显存(GB)
         
     def check_gpu_health(self, device_id: int = 0) -> Dict[str, Any]:
-        """检查GPU健康状态"""
         if not self.gpu_available:
             return {
                 "status": "unavailable",
@@ -42,7 +33,6 @@ class GPUHealthMonitor:
             }
         
         try:
-            # 检查设备有效性
             if device_id >= self.device_count:
                 return {
                     "status": "invalid_device",
@@ -60,7 +50,7 @@ class GPUHealthMonitor:
                     "memory_info": memory_info
                 }
             
-            # 检查GPU温度和利用率(如果支持)
+            # 检查GPU温度和利用率
             try:
                 torch.cuda.synchronize(device_id)
                 # 简单的GPU功能测试

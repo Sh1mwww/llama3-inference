@@ -468,11 +468,21 @@ def main():
             'warmup_layers': 1,
             'verbose': args.verbose
         } if enable_streaming else None
-        
+
+        print(f"[DEBUG] About to call LLaMA.build with:")
+        print(f"  ckpt: {ckpt}")
+        print(f"  load_model: True")
+        print(f"  device: {args.device}")
+        print(f"  enable_weight_streaming: {enable_streaming}")
+        print(f"  streaming_config: {streaming_config}")
+        print(f"  topk_blk: {args.topk_blk}")
+        print(f"  max_seq_len: {args.max_seq_len}")
+        print(f"  max_batch_size: {args.batch_size}")
+
         # 使用新的 LLaMA.build() API 进行统一构建
         llama = LLaMA.build(
-            ckpt, 
-            load_model=True, 
+            ckpt,
+            load_model=True,
             device=args.device,
             enable_weight_streaming=enable_streaming,
             streaming_config=streaming_config,
@@ -480,13 +490,16 @@ def main():
             max_seq_len=args.max_seq_len,
             max_batch_size=args.batch_size
         )
-        
+
         if not hasattr(llama, 'model') or llama.model is None:
             raise RuntimeError("Model failed to load properly - llama.model is None")
         print(f"✅ Model loaded successfully: {type(llama.model)}")
-        
+
     except Exception as e:
-        print(f"❌ Error loading model: {e}"); sys.exit(1)
+        print(f"❌ Error loading model: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     
     print("✅ Model ready for inference")
 

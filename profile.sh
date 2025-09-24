@@ -1,9 +1,5 @@
 #!/bin/bash
 # ================================
-# Enhanced Profile LLaMA3 Script
-# ================================
-# 
-# 增强版本的 LLaMA3 性能分析脚本，支持多种运行模式和高级功能
 # 
 # 用法示例:
 #   ./profile.sh "Hello world"                    # 直接文本输入
@@ -12,8 +8,6 @@
 #   ./profile.sh prompts.txt --csv results.csv   # 导出CSV
 #   ./profile.sh prompts.txt --runs 3 --topk 8   # 多次运行
 # 
-# 作者: LLaMA3 Project Team
-# 版本: 2.0
 # ================================
 
 set -e  # 遇到错误立即退出
