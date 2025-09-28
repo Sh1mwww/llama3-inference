@@ -1,25 +1,29 @@
-import torch
-import torch.nn as nn
-from collections import OrderedDict
-from typing import Dict, List, Optional
 import time
 import json
+from collections import OrderedDict
+from typing import Dict, List, Optional
+
+import torch
+import torch.nn as nn
+
 from .stream_mnt import get_streams
 
-# NVTX profiling support
+# NVTX profiling support (no-op fallback if unavailable)
 try:
     import torch.cuda.nvtx as nvtx
     NVTX_AVAILABLE = True
 except ImportError:
     NVTX_AVAILABLE = False
-    # Fallback no-op functions
+
     class nvtx:
         @staticmethod
-        def range_push(name): pass
+        def range_push(name): ...
         @staticmethod
-        def range_pop(): pass
+        def range_pop(): ...
+
 
 def _pinned_clone_cpu(t: torch.Tensor) -> torch.Tensor:
+    """Return a contiguous, (best-effort) pinned CPU copy of tensor t."""
     x = t.detach().cpu().contiguous()
     try:
         x = x.pin_memory()
@@ -27,57 +31,67 @@ def _pinned_clone_cpu(t: torch.Tensor) -> torch.Tensor:
         pass
     return x
 
+
 def _collect_block_modules(block: nn.Module) -> Dict[str, nn.Module]:
     """
-    收集 block 中所有需要流式管理的模块：
-    1. attention 和 feed_forward 的子模块（通过 _get_modules_dict）
-    2. norm 层（attn_norm, ffn_norm）- 这些是小权重，适合常驻 GPU
-    3. 若都不存在，则退化为把整个 block 视为一个模块整体搬运
+    Collect submodules within a transformer block that should be streamed:
+      - Prefer fine-grained modules exposed by attention/feed_forward via `_get_modules_dict`.
+      - Collect common norm layers (small, suitable for GPU residency).
+      - Fallback to the entire block if nothing else is found.
+    The returned dict maps a descriptive name -> submodule.
     """
     mods: Dict[str, nn.Module] = {}
-    
-    # 收集 attention 子模块
+
+    # Attention submodules
     if hasattr(block, "attention") and hasattr(block.attention, "_get_modules_dict"):
         try:
             mods.update(block.attention._get_modules_dict())
         except Exception:
             pass
-    
-    # 收集 feed_forward 子模块        
+
+    # FFN submodules
     if hasattr(block, "feed_forward") and hasattr(block.feed_forward, "_get_modules_dict"):
         try:
             mods.update(block.feed_forward._get_modules_dict())
         except Exception:
             pass
-    
-    # 收集 norm 层（小权重，适合常驻 GPU）
-    norm_modules = {}
+
+    # Norm layers (small; good GPU residents)
+    norm_modules: Dict[str, nn.Module] = {}
     for norm_name in ["attn_norm", "ffn_norm", "attention_norm", "ffn_norm_pre", "ffn_norm_post"]:
         if hasattr(block, norm_name):
             norm_module = getattr(block, norm_name)
             if isinstance(norm_module, nn.Module):
                 norm_modules[f"norm_{norm_name}"] = norm_module
-    
+
     if norm_modules:
         mods.update(norm_modules)
-    
-    # 兜底：若没有收集到任何模块，把整个 block 搬运
+
+    # Fallback: stream the whole block
     if not mods:
         mods["__block__"] = block
-    
+
     return mods
+
 
 class WeightStreamingManager:
     """
-    权重流式管理器（最小侵入）：
-      - CPU 常驻主副本pinned,GPU 仅按层临时拷贝
-      - 进入层 i 前:ensure_on_gpu(i) + wait_stream
-      - 层内：异步预取 i+1 .. i+prefetch_distance(不等待)
-      - LRU: 最多保留 max_cached_layers 层在 GPU;逐出不D2H,只指针切回CPU主副本
-    用法：
-        wsm = WeightStreamingManager(model, device="cuda", prefetch_distance=1, max_cached_layers=4)
-        # 创建后立刻生效(安装了每层 forward_pre_hook)
+    Weight Streaming Manager (minimally invasive):
+
+    - Keep a pinned-CPU master copy of parameters; stage to GPU just-in-time.
+    - Before entering layer i: ensure_on_gpu(i) (optionally wait for readiness).
+    - Prefetch layers i+1..i+prefetch_distance asynchronously on a dedicated H2D stream.
+    - Simple LRU keeps up to `max_cached_layers` layers resident on GPU.
+      Eviction does not do D2H for parameters—switches pointers back to CPU master copy.
+      (Buffers may copy back to CPU if needed.)
+    - Norm modules are moved to GPU once and kept resident.
+
+    Typical usage:
+        wsm = WeightStreamingManager(model, device="cuda",
+                                     prefetch_distance=1, max_cached_layers=4)
+        # Hooks are installed automatically on each layer.
     """
+
     def __init__(self,
                  model: nn.Module,
                  device: str = "cuda",
@@ -93,13 +107,13 @@ class WeightStreamingManager:
         self.streams = get_streams(device)
         self.prefetch_distance = int(prefetch_distance)
         self.max_cached_layers = int(max_cached_layers)
-        
-        # 内存碎片化监控
-        self.monitor_fragmentation = monitor_fragmentation
-        self.memory_stats = []
-        self.fragmentation_threshold = 0.3  # 30%碎片化阈值
 
-        # 找到 block 列表
+        # Optional fragmentation monitoring
+        self.monitor_fragmentation = monitor_fragmentation
+        self.memory_stats: List[Dict] = []
+        self.fragmentation_threshold = 0.3
+
+        # Resolve transformer blocks (layers)
         blocks: Optional[List[nn.Module]] = None
         if hasattr(model, "layer_infos"):
             try:
@@ -109,50 +123,51 @@ class WeightStreamingManager:
         if blocks is None and hasattr(model, layers_attr):
             blocks = list(getattr(model, layers_attr))
         if not blocks:
-            # 最后兜底：从 children 里找一个最长的顺序容器
-            cands = []
+            candidates = []
             for _name, child in model.named_children():
                 if isinstance(child, (nn.Sequential, nn.ModuleList)):
-                    cands.append(list(child))
-            blocks = max(cands, key=len) if cands else []
+                    candidates.append(list(child))
+            blocks = max(candidates, key=len) if candidates else []
         if not blocks:
             raise RuntimeError("Cannot locate transformer blocks (layers) on model.")
 
         self.blocks: List[nn.Module] = blocks
-        # 每层需要搬运的模块集合
+
+        # Per-layer streaming units
         self.block_mods: Dict[int, Dict[str, nn.Module]] = {
             i: _collect_block_modules(b) for i, b in enumerate(self.blocks)
         }
 
-        # CPU 主副本：param_id -> pinned cpu tensor
+        # CPU master copy: Parameter object id -> pinned CPU tensor
         self.cpu_stash: Dict[int, torch.Tensor] = {}
-        # 哪些层当前在 GPU（LRU，值无用）
-        self.gpu_cache: "OrderedDict[int, None]" = OrderedDict()
+        # GPU LRU cache: layer index -> None
+        self.gpu_cache = OrderedDict()
+        # Per-layer "ready" events recorded on H2D stream
         self.layer_events: Dict[int, torch.cuda.Event] = {}
 
-        # 安装 forward_pre_hook：确保当前层 + 预取后续
+        # Install pre-forward hooks: ensure current layer + prefetch next ones
         for i, blk in enumerate(self.blocks):
             blk.register_forward_pre_hook(self._pre_hook_factory(i))
 
-        # 将 norm 层移到 GPU 并常驻（这些是小权重）
+        # Move norm modules to GPU once and keep resident
         self._setup_resident_norms()
-        
-        # （可选）预热前几层，降低第 0 层等待
+
+        # (Optional) Warm up a few layers to reduce initial latency
         if warmup_layers > 0:
             warm = list(range(min(warmup_layers, len(self.blocks))))
             self.prefetch(warm)
             if self.verbose:
                 print(f"[WSM] warmup prefetch: {warm}")
 
+    # -------- CPU/GPU movement primitives --------
+
     def _setup_resident_norms(self):
-        """将 norm 层移到 GPU 并常驻（这些是小权重，不需要流式传输）"""
+        """Move norm modules to GPU and exclude them from streaming/eviction."""
         if self.verbose:
             print("[WSM] Setting up resident norm layers...")
-            
         norm_count = 0
         for layer_id, modules_dict in self.block_mods.items():
             for module_name, module in modules_dict.items():
-                # 如果是 norm 模块，移到 GPU 并从流式管理中排除
                 if module_name.startswith("norm_"):
                     try:
                         module.to(self.device)
@@ -161,72 +176,70 @@ class WeightStreamingManager:
                             print(f"[WSM] Layer {layer_id}: {module_name} -> {self.device} (resident)")
                     except Exception as e:
                         if self.verbose:
-                            print(f"[WSM] Warning: Failed to move {module_name} to {self.device}: {e}")
-        
+                            print(f"[WSM] Warning: failed to move {module_name} to {self.device}: {e}")
         if self.verbose:
-            print(f"[WSM] {norm_count} norm layers set as resident on GPU")
-
-    # ============ 基元：参数/模块的 CPU/GPU 切换 ============
+            print(f"[WSM] {norm_count} norm modules set as GPU resident")
 
     def _record_layer_ready_event(self, idx: int):
-        """在权重H2D流上记录：该层权重拷贝已全部排队后的事件"""
+        """Record an event on the weight H2D stream marking all enqueued copies for this layer."""
         if not torch.cuda.is_available() or getattr(self.streams, "weight_h2d", None) is None:
             return
         evt = self.layer_events.get(idx)
         if evt is None:
-            # 非阻塞事件即可；用于被 compute 流 wait_event
             evt = torch.cuda.Event(blocking=False)
             self.layer_events[idx] = evt
-        # 在权重H2D流上记录事件，表示“该层所有已排队的H2D完成时触发”
         evt.record(self.streams.weight_h2d)
 
     def _wait_layer_ready(self, idx: int):
-        """在当前流上等待该层已记录的事件；若无事件则退化为流间等待"""
+        """Wait on the layer's ready event on the current stream (fallback: wait for H2D stream)."""
         evt = self.layer_events.get(idx)
         if evt is not None:
             torch.cuda.current_stream(self.device).wait_event(evt)
         else:
-            # 兜底：如果还没记录事件，就退化为等待权重流
             self.streams.wait_weight_ready_on_current(self.device)
 
     def _ensure_param_cpu_stash_inplace(self, p: torch.nn.Parameter):
-        """把 p.data 原地置换为 pinned CPU 主副本，并记录到 cpu_stash。避免 DRAM 双持。"""
+        """
+        Replace p.data with a pinned CPU master copy and stash it by Parameter id.
+        This avoids holding duplicate CPU tensors.
+        """
         pid = id(p)
         if pid in self.cpu_stash:
             return
         pinned = _pinned_clone_cpu(p.data)
-        p.data = pinned               # 置换：原CPU张量释放
-        self.cpu_stash[pid] = p.data  # 记录主副本（就是现在的 p.data）
+        p.data = pinned
+        self.cpu_stash[pid] = p.data
 
     def _ensure_param_on_gpu(self, p: torch.nn.Parameter):
-        """从主副本（pinned CPU）H2D 到 GPU，并把 p.data 切到 GPU 张量（在高优先级流上）。"""
+        """Stage parameter to GPU on the weight H2D stream and switch p.data to the GPU tensor."""
         nvtx.range_push("param_h2d")
         if p.device.type != "cpu":
             nvtx.range_pop()
             return
+
         pid = id(p)
-        
         nvtx.range_push("ensure_cpu_stash")
         self._ensure_param_cpu_stash_inplace(p)
-        nvtx.range_pop()  # ensure_cpu_stash
-        
+        nvtx.range_pop()
+
         nvtx.range_push("weight_h2d_stream")
         with torch.cuda.stream(self.streams.weight_h2d):
             nvtx.range_push("cpu_to_gpu_transfer")
             p_gpu = self.cpu_stash[pid].to(self.device, non_blocking=True)
-            nvtx.range_pop()  # cpu_to_gpu_transfer
-        nvtx.range_pop()  # weight_h2d_stream
-        
-        p.data = p_gpu  # 切到 GPU
-        nvtx.range_pop()  # param_h2d
+            nvtx.range_pop()
+        nvtx.range_pop()
+
+        p.data = p_gpu
+        nvtx.range_pop()
 
     def _evict_param_to_cpu(self, p: torch.nn.Parameter):
-        """逐出：不做 D2H，p.data 直接指回 cpu_stash（CPU 主副本）。"""
+        """Evict by re-pointing p.data back to its CPU master copy (no D2H)."""
         pid = id(p)
         if pid in self.cpu_stash:
             p.data = self.cpu_stash[pid]
 
     def _ensure_module_on_gpu(self, m: nn.Module):
+        """Ensure all params/buffers of module m are on GPU."""
         for p in m.parameters(recurse=True):
             self._ensure_param_on_gpu(p)
         for b in m.buffers(recurse=True):
@@ -239,6 +252,7 @@ class WeightStreamingManager:
                     pass
 
     def _evict_module_to_cpu(self, m: nn.Module):
+        """Evict module m: params point back to CPU master; buffers copied back to CPU."""
         for p in m.parameters(recurse=True):
             self._evict_param_to_cpu(p)
         for b in m.buffers(recurse=True):
@@ -253,247 +267,246 @@ class WeightStreamingManager:
                 except Exception:
                     pass
 
-    # ============ 层级：ensure / prefetch / evict ============
+    # -------- Layer-level ensure / prefetch / evict --------
 
     def _pre_hook_factory(self, idx: int):
         def _pre_hook(_module, _inputs):
-            # 1) 确保本层在 GPU
+            # Ensure current layer ready on GPU, then prefetch next ones (fire-and-forget).
             self.ensure_on_gpu(idx, wait=True)
-            # 2) 预取后续若干层（不等待，重叠 H2D 与 compute）
             if self.prefetch_distance > 0:
                 nxt = [j for j in range(idx + 1, min(idx + 1 + self.prefetch_distance, len(self.blocks)))]
                 self.prefetch(nxt)
         return _pre_hook
 
     def ensure_on_gpu(self, idx: int, wait: bool):
+        """Ensure layer idx is present on GPU (respecting LRU); optionally wait for readiness."""
         nvtx.range_push(f"ensure_layer_{idx}")
-        self._record_memory_stats(f"ensure_start", idx)
-        
+        self._record_memory_stats("ensure_start", idx)
+
         if idx in self.gpu_cache:
             nvtx.range_push(f"cache_hit_layer_{idx}")
             self.gpu_cache.move_to_end(idx)
-            # 命中也可能还是预取中的层，需要按层事件来精确等待
             if wait:
                 nvtx.range_push(f"wait_layer_{idx}")
                 self._wait_layer_ready(idx)
-                nvtx.range_pop()  # wait_layer
-            nvtx.range_pop()  # cache_hit
+                nvtx.range_pop()
+            nvtx.range_pop()
         else:
             nvtx.range_push(f"cache_miss_layer_{idx}")
-            
+
+            # Evict until space is available
             while len(self.gpu_cache) >= self.max_cached_layers:
                 old, _ = self.gpu_cache.popitem(last=False)
                 nvtx.range_push(f"evict_layer_{old}")
-                self._record_memory_stats(f"evict_start", old)
+                self._record_memory_stats("evict_start", old)
                 self._evict_layer_to_cpu(old)
-                self._record_memory_stats(f"evict_end", old)
-                nvtx.range_pop()  # evict
-                
-            # H2D 当前层（逐模块发起H2D）
+                self._record_memory_stats("evict_end", old)
+                nvtx.range_pop()
+
+            # H2D for current layer (skip resident norms)
             nvtx.range_push(f"h2d_transfer_layer_{idx}")
-            self._record_memory_stats(f"h2d_start", idx)
+            self._record_memory_stats("h2d_start", idx)
             for module_name, mod in self.block_mods[idx].items():
-                if not module_name.startswith("norm_"):  # 跳过常驻的norm模块
+                if not module_name.startswith("norm_"):
                     nvtx.range_push(f"h2d_{module_name}")
                     self._ensure_module_on_gpu(mod)
-                    nvtx.range_pop()  # h2d_module
-            self._record_memory_stats(f"h2d_end", idx)
-            nvtx.range_pop()  # h2d_transfer
-            
+                    nvtx.range_pop()
+            self._record_memory_stats("h2d_end", idx)
+            nvtx.range_pop()
+
             self.gpu_cache[idx] = None
-            # 关键：所有该层的H2D已排队后，记录"该层就绪事件"
+
+            # Record "layer ready" event on H2D stream after enqueuing all copies
             nvtx.range_push(f"record_event_layer_{idx}")
             self._record_layer_ready_event(idx)
-            nvtx.range_pop()  # record_event
+            nvtx.range_pop()
 
             if self.verbose:
                 print(f"[WSM] ->GPU layer={idx}")
             if wait:
                 nvtx.range_push(f"wait_layer_{idx}")
                 self._wait_layer_ready(idx)
-                nvtx.range_pop()  # wait_layer
-                
+                nvtx.range_pop()
+
             nvtx.range_pop()  # cache_miss
-        
-        self._record_memory_stats(f"ensure_end", idx)
+
+        self._record_memory_stats("ensure_end", idx)
         nvtx.range_pop()  # ensure_layer
 
-
     def prefetch(self, ids: List[int]):
+        """Asynchronously prefetch a list of layer indices, respecting the LRU budget."""
         if not ids:
             return
         nvtx.range_push(f"prefetch_layers_{ids}")
-        
+
         for idx in ids:
             nvtx.range_push(f"prefetch_layer_{idx}")
-            
+
             if idx in self.gpu_cache:
-                nvtx.range_push(f"prefetch_cache_hit_{idx}")
                 self.gpu_cache.move_to_end(idx)
-                # 命中预取就不再重复H2D；可能已经有事件了，无需操作
-                nvtx.range_pop()  # prefetch_cache_hit
-                nvtx.range_pop()  # prefetch_layer
+                nvtx.range_pop()
                 continue
-                
-            nvtx.range_push(f"prefetch_cache_miss_{idx}")
+
+            # Evict until space is available
             while len(self.gpu_cache) >= self.max_cached_layers:
                 old, _ = self.gpu_cache.popitem(last=False)
                 nvtx.range_push(f"prefetch_evict_{old}")
                 self._evict_layer_to_cpu(old)
-                nvtx.range_pop()  # prefetch_evict
-                
+                nvtx.range_pop()
+
+            # H2D for this prefetched layer (skip resident norms)
             nvtx.range_push(f"prefetch_h2d_layer_{idx}")
             for module_name, mod in self.block_mods[idx].items():
-                if not module_name.startswith("norm_"):  # 跳过常驻的norm模块
+                if not module_name.startswith("norm_"):
                     nvtx.range_push(f"prefetch_h2d_{module_name}")
                     self._ensure_module_on_gpu(mod)
-                    nvtx.range_pop()  # prefetch_h2d_module
-            nvtx.range_pop()  # prefetch_h2d_layer
-            
+                    nvtx.range_pop()
+            nvtx.range_pop()
+
             self.gpu_cache[idx] = None
-            # 关键：预取层H2D排队后，记录"该层就绪事件"（不等待）
+
+            # Record ready event (do not wait)
             nvtx.range_push(f"prefetch_record_event_{idx}")
             self._record_layer_ready_event(idx)
-            nvtx.range_pop()  # prefetch_record_event
+            nvtx.range_pop()
 
             if self.verbose:
                 print(f"[WSM] prefetch layer={idx}")
-                
-            nvtx.range_pop()  # prefetch_cache_miss
+
             nvtx.range_pop()  # prefetch_layer
-            
+
         nvtx.range_pop()  # prefetch_layers
 
     def _evict_layer_to_cpu(self, idx: int):
-        for _name, mod in self.block_mods[idx].items():
+        """Evict a layer back to CPU (parameters: pointer switch; buffers: copied)."""
+        for name, mod in self.block_mods[idx].items():
+            # Keep norm modules resident on GPU.
+            if name.startswith("norm_"):
+                continue
             self._evict_module_to_cpu(mod)
-        # 该层从GPU缓存移除后，对应的事件也一并清理（下次会重新创建/记录）
+        # Clear any stale ready event (will be recreated next time)
         self.layer_events.pop(idx, None)
         if self.verbose:
             print(f"[WSM]   evict layer={idx}")
 
-    
-    # ============ 兼容 layers.py 的接口 ============
-    
+    # -------- Compatibility shims for layers.py --------
+
     def ensure_weights_cuda(self, layer_id: int, modules: Dict[str, nn.Module], priority: bool = False):
         """
-        兼容 layers.py 中 _ensure_weights_cuda 的调用
-        将指定层的模块权重确保在 GPU 上
+        Compatibility for layers.py: ensure provided layer's modules are on GPU.
+        `priority=True` implies 'wait' for readiness.
         """
         if layer_id >= len(self.blocks):
-            return  # 超出范围，忽略
-        
-        # 使用现有的 ensure_on_gpu 逻辑
+            return
         self.ensure_on_gpu(layer_id, wait=priority)
-        
-        # 额外确保提供的模块在 GPU 上（如果与我们管理的不同）
+        # Extra safety: if caller passes a different module dict, ensure those too.
         for name, module in modules.items():
             try:
                 self._ensure_module_on_gpu(module)
             except Exception as e:
                 if self.verbose:
-                    print(f"[WSM] Warning: Failed to ensure {name} on GPU for layer {layer_id}: {e}")
-    
+                    print(f"[WSM] Warning: ensure {name} on GPU failed (layer {layer_id}): {e}")
+
     def prefetch_weights(self, layer_ids: List[int], modules_dict: Dict[int, Dict[str, nn.Module]] = None):
-        """
-        兼容 layers.py 中预取权重的调用
-        """
+        """Compatibility for layers.py: prefetch by layer ids."""
         self.prefetch(layer_ids)
-    
+
+    # -------- Memory stats / fragmentation reporting --------
+
     def _get_memory_info(self):
-        """获取当前GPU内存信息"""
+        """Return current CUDA allocator stats for the configured device."""
         if not torch.cuda.is_available():
             return None
-        
+
         allocated = torch.cuda.memory_allocated(self.device)
         reserved = torch.cuda.memory_reserved(self.device)
         max_allocated = torch.cuda.max_memory_allocated(self.device)
         max_reserved = torch.cuda.max_memory_reserved(self.device)
-        
         memory_stats = torch.cuda.memory_stats(self.device)
-        
+
         return {
-            'timestamp': time.time(),
-            'allocated_mb': allocated / 1024**2,
-            'reserved_mb': reserved / 1024**2,
-            'max_allocated_mb': max_allocated / 1024**2,
-            'max_reserved_mb': max_reserved / 1024**2,
-            'fragmentation_ratio': (reserved - allocated) / reserved if reserved > 0 else 0,
-            'allocation_count': memory_stats.get('allocation.all.current', 0),
-            'segment_count': memory_stats.get('segment.all.current', 0),
-            'large_pool_allocated': memory_stats.get('allocated_bytes.large_pool.current', 0) / 1024**2,
-            'small_pool_allocated': memory_stats.get('allocated_bytes.small_pool.current', 0) / 1024**2,
+            "timestamp": time.time(),
+            "allocated_mb": allocated / 1024**2,
+            "reserved_mb": reserved / 1024**2,
+            "max_allocated_mb": max_allocated / 1024**2,
+            "max_reserved_mb": max_reserved / 1024**2,
+            "fragmentation_ratio": (reserved - allocated) / reserved if reserved > 0 else 0.0,
+            "allocation_count": memory_stats.get("allocation.all.current", 0),
+            "segment_count": memory_stats.get("segment.all.current", 0),
+            "large_pool_allocated": memory_stats.get("allocated_bytes.large_pool.current", 0) / 1024**2,
+            "small_pool_allocated": memory_stats.get("allocated_bytes.small_pool.current", 0) / 1024**2,
         }
-    
+
     def _record_memory_stats(self, operation: str, layer_id: int = -1):
-        """记录内存统计信息"""
+        """Append a snapshot of allocator stats if monitoring is enabled."""
         if not self.monitor_fragmentation:
             return
-        
         info = self._get_memory_info()
         if info:
-            info['operation'] = operation
-            info['layer_id'] = layer_id
+            info["operation"] = operation
+            info["layer_id"] = layer_id
             self.memory_stats.append(info)
-            
-            # 检查碎片化阈值
-            if info['fragmentation_ratio'] > self.fragmentation_threshold:
-                print(f"⚠️  High fragmentation detected: {info['fragmentation_ratio']:.3f} "
-                      f"during {operation} (layer {layer_id})")
-    
+            if info["fragmentation_ratio"] > self.fragmentation_threshold:
+                print(
+                    f"⚠️  High fragmentation: {info['fragmentation_ratio']:.3f} "
+                    f"during {operation} (layer {layer_id})"
+                )
+
     def get_fragmentation_report(self):
-        """生成碎片化分析报告"""
+        """Summarize fragmentation/allocator information collected so far."""
         if not self.memory_stats:
             return {"error": "No memory statistics collected"}
-        
-        fragmentation_ratios = [s['fragmentation_ratio'] for s in self.memory_stats]
-        segment_counts = [s['segment_count'] for s in self.memory_stats]
-        
+
+        fragmentation_ratios = [s["fragmentation_ratio"] for s in self.memory_stats]
+        segment_counts = [s["segment_count"] for s in self.memory_stats]
+
         report = {
-            'total_operations': len(self.memory_stats),
-            'max_fragmentation': max(fragmentation_ratios),
-            'avg_fragmentation': sum(fragmentation_ratios) / len(fragmentation_ratios),
-            'min_fragmentation': min(fragmentation_ratios),
-            'max_segments': max(segment_counts),
-            'avg_segments': sum(segment_counts) / len(segment_counts),
-            'high_fragmentation_count': sum(1 for r in fragmentation_ratios if r > self.fragmentation_threshold),
-            'peak_allocated_mb': max(s['allocated_mb'] for s in self.memory_stats),
-            'peak_reserved_mb': max(s['reserved_mb'] for s in self.memory_stats),
+            "total_operations": len(self.memory_stats),
+            "max_fragmentation": max(fragmentation_ratios),
+            "avg_fragmentation": sum(fragmentation_ratios) / len(fragmentation_ratios),
+            "min_fragmentation": min(fragmentation_ratios),
+            "max_segments": max(segment_counts),
+            "avg_segments": sum(segment_counts) / len(segment_counts),
+            "high_fragmentation_count": sum(1 for r in fragmentation_ratios if r > self.fragmentation_threshold),
+            "peak_allocated_mb": max(s["allocated_mb"] for s in self.memory_stats),
+            "peak_reserved_mb": max(s["reserved_mb"] for s in self.memory_stats),
         }
-        
-        # 严重程度评估
-        if report['max_fragmentation'] > 0.4:
-            report['severity'] = 'CRITICAL'
-        elif report['max_fragmentation'] > 0.3:
-            report['severity'] = 'HIGH'
-        elif report['max_fragmentation'] > 0.15:
-            report['severity'] = 'MEDIUM'
+
+        if report["max_fragmentation"] > 0.4:
+            report["severity"] = "CRITICAL"
+        elif report["max_fragmentation"] > 0.3:
+            report["severity"] = "HIGH"
+        elif report["max_fragmentation"] > 0.15:
+            report["severity"] = "MEDIUM"
         else:
-            report['severity'] = 'LOW'
-        
+            report["severity"] = "LOW"
+
         return report
-    
+
     def save_memory_stats(self, filename: str):
-        """保存内存统计到文件"""
+        """Persist memory statistics + report to a JSON file."""
         if not self.memory_stats:
             print("⚠️  No memory statistics to save")
             return
-        
-        with open(filename, 'w') as f:
-            json.dump({
-                'memory_stats': self.memory_stats,
-                'fragmentation_report': self.get_fragmentation_report(),
-                'config': {
-                    'max_cached_layers': self.max_cached_layers,
-                    'prefetch_distance': self.prefetch_distance,
-                    'device': self.device,
-                    'fragmentation_threshold': self.fragmentation_threshold
-                }
-            }, f, indent=2)
-        
+
+        with open(filename, "w") as f:
+            json.dump(
+                {
+                    "memory_stats": self.memory_stats,
+                    "fragmentation_report": self.get_fragmentation_report(),
+                    "config": {
+                        "max_cached_layers": self.max_cached_layers,
+                        "prefetch_distance": self.prefetch_distance,
+                        "device": self.device,
+                        "fragmentation_threshold": self.fragmentation_threshold,
+                    },
+                },
+                f,
+                indent=2,
+            )
         print(f"💾 Memory statistics saved to {filename}")
-    
+
     def clear_memory_stats(self):
-        """清空内存统计"""
+        """Clear collected stats and reset CUDA peak tracking."""
         self.memory_stats.clear()
         torch.cuda.reset_peak_memory_stats(self.device)

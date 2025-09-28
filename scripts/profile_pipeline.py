@@ -1,7 +1,3 @@
-# (完整文件) profile_pipeline.py
-"""KV Cache SSD 传输时间专用分析器
-...（顶部注释保持不变）...
-"""
 import math
 import sys
 import argparse
@@ -14,11 +10,9 @@ import threading
 import logging
 from typing import List, Iterator, Any
 
-# 按层权重流式 & 流管理
 from llama3.weight_streaming_manager import WeightStreamingManager
 import llama3.stream_mnt as _stream_mnt
 
-# 安全导入 torch 和相关模块
 try:
     import torch
     from torch.cuda import Event, current_stream
@@ -29,7 +23,6 @@ except ImportError:
     Event = None
     current_stream = None
 
-# 安全导入 llama3 模块
 try:
     from llama3.generator import LLaMA
     from llama3.layers import PerformanceTracker
@@ -41,7 +34,6 @@ except ImportError:
     PerformanceTracker = None
     KVOffloader = None
 
-# ---------- 全局统计数据 ----------
 KV_TRANSFER_STATS = {
     'ssd_to_dram_us': 0, 'dram_to_ssd_us': 0,
     'ssd_to_dram_bytes': 0, 'dram_to_ssd_bytes': 0,
@@ -53,7 +45,6 @@ KV_TRANSFER_STATS = {
     'total_memory_allocated': 0, 'peak_memory_usage': 0, 'memory_fragmentation': 0,
 }
 
-# ---------- Batch statistics ----------
 BATCH_STATS = {
     'total_batches':   0,
     'total_prompts':   0,
@@ -64,7 +55,6 @@ BATCH_STATS = {
 
 _PATCHES_APPLIED = False
 
-# ---------- 日志配置 ----------
 def setup_logging(verbose: bool = False) -> logging.Logger:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
@@ -74,7 +64,6 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     )
     return logging.getLogger(__name__)
 
-# ---------- 辅助函数 ----------
 def chunks(lst: List[Any], n: int) -> Iterator[List[Any]]:
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
@@ -140,7 +129,6 @@ def safe_batch_processing(prompts: List[str], batch_size: int, max_seq_len: int 
         logger.debug(f"Yielding final batch with {len(current_batch)} prompts, ~{current_tokens} tokens")
         yield current_batch
 
-# ---------- 计时工具 ----------
 @contextmanager
 def precise_timer(stat_key: str, byte_key: str = None, count_key: str = None, bytes_transferred: int = 0):
     t0 = time.perf_counter(); ok = False
@@ -195,7 +183,7 @@ def update_memory_stats():
     except Exception as e:
         logging.getLogger(__name__).debug(f"Memory stats update failed: {e}")
 
-# ---------- KV Offloader 详细 Patch ----------
+# ---------- KV Offloader Patch ----------
 def patch_kv_offloader_detailed():
     global _PATCHES_APPLIED
     if _PATCHES_APPLIED: return
