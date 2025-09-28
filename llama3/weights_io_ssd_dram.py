@@ -315,31 +315,38 @@ def pack_any_to_raw(
 def build_runtime_manifest(shapes_meta_path: str, manifest_out_path: str) -> str:
     """
     每次启动调用：
-    - 读取 shapes_meta（只含 nbytes / policy / shape / dtype / layer / name）
+    - 读取 shapes_meta（它的 params 顺序 == 打包写入顺序）
     - 打开 raw 设备查询 block_size
-    - 按（layer, name）顺序线性推导 offset/stride（从 header_reserve 开始）
+    - 按 shapes_meta["params"] 的“原始顺序”线性推导 offset/stride（从 header_reserve 开始）
     - 写 runtime_manifest.json（含 offset/stride、block_size、device）
     """
+    from pathlib import Path
+    import os, json
+
     meta = json.loads(Path(shapes_meta_path).read_text(encoding="utf-8"))
     raw_dev   = meta["raw_device"]
     header_rs = int(meta.get("header_reserve", 0))
 
-    fd = os.open(raw_dev, O_DIRECT | O_LARGEFILE | os.O_RDONLY)
-    bsz = get_logical_block_size(fd)
-    os.close(fd)
+    # block size 以当前设备为准（pack 和 runtime 必须一致）
+    fd = os.open(raw_dev, os.O_RDONLY | O_DIRECT | O_LARGEFILE)
+    try:
+        bsz = get_logical_block_size(fd)
+    finally:
+        os.close(fd)
 
-    params_in = sorted(meta["params"], key=lambda p: (int(p["layer"]), p["name"]))
+    # **不要排序**：严格按 shapes_meta 记录的顺序累计 offset
+    params_in = meta["params"]  # preserve order!
+
     params_out = []
-
     cur = header_rs
     for p in params_in:
         nbytes = int(p["nbytes"])
         stride = round_up(nbytes, bsz)
         params_out.append({
-            "name": p["name"],
-            "layer": int(p["layer"]),
-            "dtype": p["dtype"],
-            "shape": p["shape"],
+            "name":   p["name"],
+            "layer":  int(p["layer"]),
+            "dtype":  p["dtype"],
+            "shape":  p["shape"],
             "offset": cur,
             "nbytes": nbytes,
             "stride": stride,
@@ -373,7 +380,7 @@ def load_resident_to_gpu(
     manifest: Dict[str, Any],
     device: str = "cuda:0",
     staging_bytes: int = 16 * 1024 * 1024,
-):
+) -> None:
     """
     启动时一次性把 policy=resident 的权重加载到 GPU。
     - 可先串行跑通，再按需要扩展为线程池并发。
@@ -400,7 +407,7 @@ def load_resident_to_gpu(
         dio.pread_into_tensor(staging, stride, p["offset"])
 
         dst = torch.empty(p["shape"], dtype=DTYPE_MAP[p["dtype"]], pin_memory=True)
-        dst.view(torch.uint8)[:p["nbytes"]].copy_(staging[:p["nbytes"]])
+        dst.view(-1).view(torch.uint8)[:p["nbytes"]].copy_(staging[:p["nbytes"]])
 
         param = name_to_param[name]
         param.data.copy_(dst.to(device, non_blocking=True))

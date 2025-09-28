@@ -1,7 +1,10 @@
 import time
 import json
+import threading
+import psutil
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Any
 
 import torch
 import torch.nn as nn
@@ -100,13 +103,34 @@ class WeightStreamingManager:
                  layers_attr: str = "layers",
                  warmup_layers: int = 1,
                  verbose: bool = False,
-                 monitor_fragmentation: bool = False):
+                 monitor_fragmentation: bool = False,
+                 ssd_manifest_path: Optional[str] = None,
+                 cpu_cache_layers: int = 50,
+                 staging_mb: int = 64):
         assert torch.cuda.is_available(), "CUDA not available"
         self.device = device
         self.verbose = verbose
         self.streams = get_streams(device)
         self.prefetch_distance = int(prefetch_distance)
         self.max_cached_layers = int(max_cached_layers)
+        self.cpu_cache_layers = int(cpu_cache_layers)
+
+        # SSD backend configuration
+        self.ssd_enabled = ssd_manifest_path is not None
+        self.ssd_manifest = None
+        self.ssd_dio = None
+        self.staging_buffer = None
+        self.layers_params = {}
+
+        # CPU cache for SSD->CPU->GPU pipeline
+        self.cpu_cache: OrderedDict[int, Dict[str, torch.Tensor]] = OrderedDict()
+        self.cpu_cache_lock = threading.Lock()
+
+        # Background prefetch management
+        self.prefetch_thread: Optional[threading.Thread] = None
+        self.prefetch_queue: List[int] = []
+        self.stop_prefetch = threading.Event()
+        self.prefetch_lock = threading.Lock()
 
         # Optional fragmentation monitoring
         self.monitor_fragmentation = monitor_fragmentation
@@ -152,12 +176,284 @@ class WeightStreamingManager:
         # Move norm modules to GPU once and keep resident
         self._setup_resident_norms()
 
+        # Initialize SSD backend if enabled
+        if self.ssd_enabled:
+            self._initialize_ssd_backend(ssd_manifest_path, staging_mb)
+
         # (Optional) Warm up a few layers to reduce initial latency
         if warmup_layers > 0:
             warm = list(range(min(warmup_layers, len(self.blocks))))
             self.prefetch(warm)
             if self.verbose:
                 print(f"[WSM] warmup prefetch: {warm}")
+
+    # -------- SSD backend initialization --------
+
+    def _initialize_ssd_backend(self, manifest_path: str, staging_mb: int):
+        """Initialize SSD raw device backend for weight streaming"""
+        try:
+            from .weights_io_ssd_dram import (
+                DirectIOFile, load_resident_to_gpu,
+                alloc_pinned_aligned, DTYPE_MAP
+            )
+
+            # Load manifest
+            self.ssd_manifest = json.loads(Path(manifest_path).read_text())
+            raw_device = self.ssd_manifest["raw_device"]
+            block_size = self.ssd_manifest["block_size"]
+
+            # Create DirectIO file handle
+            self.ssd_dio = DirectIOFile(raw_device, mode="r", block_size=block_size)
+
+            # Create staging buffer for SSD->CPU transfers
+            staging_bytes = staging_mb * 1024 * 1024
+            staging_bytes = (staging_bytes // block_size) * block_size
+            self.staging_buffer = alloc_pinned_aligned(staging_bytes, block_size)
+
+            # Organize parameters by layer
+            self._organize_params_by_layer()
+
+            # Check DRAM capacity before proceeding
+            self._check_dram_capacity()
+
+            # Load resident weights to GPU
+            # Note: This will handle uninitialized parameters by loading from SSD
+            load_resident_to_gpu(self.model, self.ssd_manifest, device=self.device)
+
+            # Start background prefetch worker if prefetch is enabled
+            if self.prefetch_distance > 0:
+                self._start_prefetch_worker()
+            else:
+                print("⚠️  Prefetch disabled - checking if all weights fit in DRAM...")
+                self._validate_no_prefetch_mode()
+
+            if self.verbose:
+                print(f"[WSM] SSD backend initialized: {raw_device}")
+                print(f"[WSM] Staging buffer: {staging_mb}MB, CPU cache: {self.cpu_cache_layers} layers")
+
+        except Exception as e:
+            if self.verbose:
+                print(f"[WSM] Failed to initialize SSD backend: {e}")
+            self.ssd_enabled = False
+
+    def _organize_params_by_layer(self):
+        """Organize manifest parameters by layer for efficient access"""
+        self.layers_params = {}
+        for param in self.ssd_manifest["params"]:
+            layer_id = param["layer"]
+            if layer_id >= 0:  # Skip non-layer params
+                if layer_id not in self.layers_params:
+                    self.layers_params[layer_id] = []
+                self.layers_params[layer_id].append(param)
+
+    def _start_prefetch_worker(self):
+        """Start background thread for SSD->CPU prefetching"""
+        def prefetch_worker():
+            while not self.stop_prefetch.is_set():
+                layer_to_prefetch = None
+
+                with self.prefetch_lock:
+                    if self.prefetch_queue:
+                        layer_to_prefetch = self.prefetch_queue.pop(0)
+
+                if layer_to_prefetch is not None:
+                    try:
+                        self._load_layer_to_cpu(layer_to_prefetch)
+                    except Exception as e:
+                        if self.verbose:
+                            print(f"[WSM] CPU prefetch failed for layer {layer_to_prefetch}: {e}")
+
+                time.sleep(0.001)  # Small delay to avoid CPU spinning
+
+        self.prefetch_thread = threading.Thread(target=prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
+
+    def _load_layer_to_cpu(self, layer_idx: int):
+        """Load layer weights from SSD to CPU cache"""
+        if not self.ssd_enabled or layer_idx in self.cpu_cache:
+            return
+
+        nvtx.range_push(f"ssd_to_cpu_layer_{layer_idx}")
+
+        with self.cpu_cache_lock:
+            # Double-check after acquiring lock
+            if layer_idx in self.cpu_cache:
+                nvtx.range_pop()
+                return
+
+            # Manage CPU cache size
+            while len(self.cpu_cache) >= self.cpu_cache_layers:
+                old_layer, _ = self.cpu_cache.popitem(last=False)
+                if self.verbose:
+                    print(f"[WSM] Evicted layer {old_layer} from CPU cache")
+
+            if layer_idx not in self.layers_params:
+                nvtx.range_pop()
+                return
+
+            layer_weights = {}
+
+            # Load stream weights for this layer
+            for param_info in self.layers_params[layer_idx]:
+                if param_info["policy"] != "stream":
+                    continue
+
+                try:
+                    # Import here to avoid circular imports
+                    from .weights_io_ssd_dram import DTYPE_MAP
+
+                    param_name = param_info["name"]
+                    stride = param_info["stride"]
+                    offset = param_info["offset"]
+                    nbytes = param_info["nbytes"]
+
+                    # Ensure staging buffer is large enough
+                    if stride > len(self.staging_buffer):
+                        from .weights_io_ssd_dram import alloc_pinned_aligned
+                        block_size = self.ssd_manifest["block_size"]
+                        new_size = ((stride + block_size - 1) // block_size) * block_size
+                        self.staging_buffer = alloc_pinned_aligned(new_size, block_size)
+                        if self.verbose:
+                            print(f"[WSM] Expanded staging buffer to {new_size} bytes")
+
+                    # Read from SSD to staging buffer
+                    self.ssd_dio.pread_into_tensor(self.staging_buffer, stride, offset)
+
+                    # Convert to proper tensor format
+                    param_tensor = torch.empty(
+                        param_info["shape"],
+                        dtype=DTYPE_MAP[param_info["dtype"]],
+                        pin_memory=True
+                    )
+                    param_tensor.view(-1).view(torch.uint8)[:nbytes].copy_(
+                        self.staging_buffer[:nbytes]
+                    )
+
+                    layer_weights[param_name] = param_tensor
+
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[WSM] Failed to load {param_name}: {e}")
+                    continue
+
+            if layer_weights:
+                self.cpu_cache[layer_idx] = layer_weights
+                if self.verbose:
+                    print(f"[WSM] Loaded layer {layer_idx} to CPU cache ({len(layer_weights)} params)")
+
+        nvtx.range_pop()
+
+    def _check_dram_capacity(self):
+        """Check if there's enough DRAM to cache the required weights"""
+        if not self.ssd_enabled:
+            return
+
+        # Calculate total weight size for stream parameters
+        total_stream_bytes = 0
+        stream_layers_count = 0
+
+        for layer_id, params in self.layers_params.items():
+            layer_bytes = 0
+            for param_info in params:
+                if param_info["policy"] == "stream":
+                    layer_bytes += param_info["nbytes"]
+
+            if layer_bytes > 0:
+                total_stream_bytes += layer_bytes
+                stream_layers_count += 1
+
+        # Calculate required DRAM for CPU cache
+        if stream_layers_count > 0:
+            avg_layer_size = total_stream_bytes / stream_layers_count
+            required_cache_bytes = avg_layer_size * self.cpu_cache_layers
+        else:
+            required_cache_bytes = 0
+
+        # Get current system memory info
+        memory = psutil.virtual_memory()
+        available_bytes = memory.available
+        total_bytes = memory.total
+
+        # Convert to human readable
+        required_gb = required_cache_bytes / (1024**3)
+        available_gb = available_bytes / (1024**3)
+        total_gb = total_bytes / (1024**3)
+
+        print(f"💾 DRAM Capacity Check:")
+        print(f"   Total system DRAM: {total_gb:.1f} GB")
+        print(f"   Available DRAM: {available_gb:.1f} GB")
+        print(f"   Required for {self.cpu_cache_layers} layer cache: {required_gb:.1f} GB")
+        print(f"   Total stream layers: {stream_layers_count}")
+        print(f"   Average layer size: {avg_layer_size/(1024**3):.2f} GB")
+
+        # Check if we have enough memory with safety margin
+        safety_margin = 0.1  # 10% safety margin
+        required_with_margin = required_cache_bytes * (1 + safety_margin)
+
+        if required_with_margin > available_bytes:
+            deficit_gb = (required_with_margin - available_bytes) / (1024**3)
+            print(f"❌ INSUFFICIENT DRAM!")
+            print(f"   Deficit: {deficit_gb:.1f} GB (including 10% safety margin)")
+            print(f"   Suggestion: Reduce cpu_cache_layers from {self.cpu_cache_layers} to {int(self.cpu_cache_layers * available_bytes / required_with_margin)}")
+            raise RuntimeError(f"Insufficient DRAM: need {required_gb:.1f}GB but only {available_gb:.1f}GB available")
+
+        print(f"✅ DRAM capacity sufficient (margin: {(available_bytes - required_cache_bytes)/(1024**3):.1f} GB)")
+
+    def _validate_no_prefetch_mode(self):
+        """Validate that all weights can fit in DRAM when prefetch is disabled"""
+        if not self.ssd_enabled:
+            return
+
+        # Calculate total size of all stream weights
+        total_stream_bytes = 0
+        for layer_id, params in self.layers_params.items():
+            for param_info in params:
+                if param_info["policy"] == "stream":
+                    total_stream_bytes += param_info["nbytes"]
+
+        # Get available memory
+        memory = psutil.virtual_memory()
+        available_bytes = memory.available
+
+        total_gb = total_stream_bytes / (1024**3)
+        available_gb = available_bytes / (1024**3)
+
+        print(f"🔍 No-Prefetch Mode Validation:")
+        print(f"   Total stream weights: {total_gb:.1f} GB")
+        print(f"   Available DRAM: {available_gb:.1f} GB")
+
+        # Check if all weights fit with safety margin
+        safety_margin = 0.15  # 15% safety margin for no-prefetch mode
+        required_with_margin = total_stream_bytes * (1 + safety_margin)
+
+        if required_with_margin > available_bytes:
+            deficit_gb = (required_with_margin - available_bytes) / (1024**3)
+            print(f"❌ CANNOT RUN WITHOUT PREFETCH!")
+            print(f"   All weights ({total_gb:.1f} GB) cannot fit in available DRAM ({available_gb:.1f} GB)")
+            print(f"   Deficit: {deficit_gb:.1f} GB (including 15% safety margin)")
+            print(f"💡 Solutions:")
+            print(f"   1. Enable prefetch mode: set prefetch_distance > 0")
+            print(f"   2. Reduce cpu_cache_layers to enable streaming")
+            print(f"   3. Add more DRAM to your system")
+            raise RuntimeError(f"Cannot run without prefetch: need {total_gb:.1f}GB but only {available_gb:.1f}GB available")
+
+        print(f"✅ All weights fit in DRAM - no prefetch mode validated")
+        # Set CPU cache to hold all layers since we're not using prefetch
+        self.cpu_cache_layers = len(self.layers_params)
+        print(f"📝 Updated CPU cache to hold all {self.cpu_cache_layers} layers")
+
+    def _schedule_cpu_prefetch(self, current_layer: int):
+        """Schedule CPU prefetch for upcoming layers"""
+        if not self.ssd_enabled:
+            return
+
+        with self.prefetch_lock:
+            for offset in range(1, self.prefetch_distance + 1):
+                next_layer = current_layer + offset
+                if (next_layer < len(self.blocks) and
+                    next_layer not in self.cpu_cache and
+                    next_layer not in self.prefetch_queue):
+                    self.prefetch_queue.append(next_layer)
 
     # -------- CPU/GPU movement primitives --------
 
@@ -210,13 +506,27 @@ class WeightStreamingManager:
         p.data = pinned
         self.cpu_stash[pid] = p.data
 
-    def _ensure_param_on_gpu(self, p: torch.nn.Parameter):
+    def _ensure_param_on_gpu(self, p: torch.nn.Parameter, layer_idx: Optional[int] = None, param_name: Optional[str] = None):
         """Stage parameter to GPU on the weight H2D stream and switch p.data to the GPU tensor."""
         nvtx.range_push("param_h2d")
         if p.device.type != "cpu":
             nvtx.range_pop()
             return
 
+        # Try to get from CPU cache first if SSD backend is enabled
+        if (self.ssd_enabled and layer_idx is not None and param_name is not None and
+            layer_idx in self.cpu_cache and param_name in self.cpu_cache[layer_idx]):
+
+            nvtx.range_push("cpu_cache_to_gpu")
+            with torch.cuda.stream(self.streams.weight_h2d):
+                cached_tensor = self.cpu_cache[layer_idx][param_name]
+                p_gpu = cached_tensor.to(self.device, non_blocking=True)
+            p.data = p_gpu
+            nvtx.range_pop()
+            nvtx.range_pop()
+            return
+
+        # Fallback to original behavior
         pid = id(p)
         nvtx.range_push("ensure_cpu_stash")
         self._ensure_param_cpu_stash_inplace(p)
@@ -238,10 +548,15 @@ class WeightStreamingManager:
         if pid in self.cpu_stash:
             p.data = self.cpu_stash[pid]
 
-    def _ensure_module_on_gpu(self, m: nn.Module):
+    def _ensure_module_on_gpu(self, m: nn.Module, layer_idx: Optional[int] = None, module_name: Optional[str] = None):
         """Ensure all params/buffers of module m are on GPU."""
-        for p in m.parameters(recurse=True):
-            self._ensure_param_on_gpu(p)
+        for param_name, p in m.named_parameters(recurse=True):
+            # Build full parameter name for CPU cache lookup
+            full_param_name = None
+            if layer_idx is not None and module_name is not None:
+                full_param_name = f"layers.{layer_idx}.{module_name}.{param_name}"
+            self._ensure_param_on_gpu(p, layer_idx, full_param_name)
+
         for b in m.buffers(recurse=True):
             if b.device.type == "cpu":
                 with torch.cuda.stream(self.streams.weight_h2d):
@@ -271,6 +586,9 @@ class WeightStreamingManager:
 
     def _pre_hook_factory(self, idx: int):
         def _pre_hook(_module, _inputs):
+            # Schedule CPU prefetch for upcoming layers
+            self._schedule_cpu_prefetch(idx)
+
             # Ensure current layer ready on GPU, then prefetch next ones (fire-and-forget).
             self.ensure_on_gpu(idx, wait=True)
             if self.prefetch_distance > 0:
@@ -309,7 +627,7 @@ class WeightStreamingManager:
             for module_name, mod in self.block_mods[idx].items():
                 if not module_name.startswith("norm_"):
                     nvtx.range_push(f"h2d_{module_name}")
-                    self._ensure_module_on_gpu(mod)
+                    self._ensure_module_on_gpu(mod, idx, module_name)
                     nvtx.range_pop()
             self._record_memory_stats("h2d_end", idx)
             nvtx.range_pop()
@@ -359,7 +677,7 @@ class WeightStreamingManager:
             for module_name, mod in self.block_mods[idx].items():
                 if not module_name.startswith("norm_"):
                     nvtx.range_push(f"prefetch_h2d_{module_name}")
-                    self._ensure_module_on_gpu(mod)
+                    self._ensure_module_on_gpu(mod, idx, module_name)
                     nvtx.range_pop()
             nvtx.range_pop()
 
@@ -402,7 +720,7 @@ class WeightStreamingManager:
         # Extra safety: if caller passes a different module dict, ensure those too.
         for name, module in modules.items():
             try:
-                self._ensure_module_on_gpu(module)
+                self._ensure_module_on_gpu(module, layer_id, name)
             except Exception as e:
                 if self.verbose:
                     print(f"[WSM] Warning: ensure {name} on GPU failed (layer {layer_id}): {e}")
@@ -510,3 +828,50 @@ class WeightStreamingManager:
         """Clear collected stats and reset CUDA peak tracking."""
         self.memory_stats.clear()
         torch.cuda.reset_peak_memory_stats(self.device)
+
+    # -------- Cleanup and resource management --------
+
+    def cleanup(self):
+        """Clean up SSD resources and background threads"""
+        if self.verbose:
+            print("[WSM] Cleaning up resources...")
+
+        # Stop prefetch thread
+        if self.ssd_enabled:
+            self.stop_prefetch.set()
+            if self.prefetch_thread and self.prefetch_thread.is_alive():
+                self.prefetch_thread.join(timeout=1.0)
+
+        # Close SSD DirectIO handle
+        if hasattr(self, 'ssd_dio') and self.ssd_dio:
+            try:
+                self.ssd_dio.close()
+            except Exception:
+                pass
+
+        # Clear caches
+        with self.cpu_cache_lock:
+            self.cpu_cache.clear()
+        self.gpu_cache.clear()
+
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+
+    def get_ssd_stats(self) -> Dict[str, Any]:
+        """Get SSD backend statistics"""
+        if not self.ssd_enabled:
+            return {"ssd_enabled": False}
+
+        return {
+            "ssd_enabled": True,
+            "cpu_cache_size": len(self.cpu_cache),
+            "cpu_cached_layers": list(self.cpu_cache.keys()),
+            "cpu_cache_max": self.cpu_cache_layers,
+            "prefetch_queue_size": len(self.prefetch_queue),
+            "staging_buffer_size": len(self.staging_buffer) if self.staging_buffer is not None else 0,
+            "total_layers": len(self.layers_params),
+        }

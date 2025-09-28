@@ -179,6 +179,106 @@ class LLaMA:
         print("⚙️  Running on GPU")
         return wsm
 
+    def _configure_ssd_streaming(self, ssd_config: dict):
+        """
+        Enable SSD-backed hybrid weight streaming: SSD -> CPU cache -> GPU streaming.
+        """
+        from pathlib import Path
+        print("🚀 Configuring SSD Hybrid Streaming...")
+
+        # Local imports intentionally kept
+        from .weight_streaming_manager import WeightStreamingManager
+        import llama3.layers
+        from llama3 import stream_mnt
+
+        # Default config
+        config = {
+            'ssd_manifest_path': None,      # required: runtime_manifest.json (or shapes_meta.json, see below)
+            'prefetch_distance': 2,
+            'max_cached_layers': 4,
+            'cpu_cache_layers': 50,
+            'staging_mb': 64,
+            'warmup_layers': 1,
+            'verbose': True,
+            'check_dram_capacity': True,
+        }
+        config.update(ssd_config)
+
+        if not str(self.args.device).startswith("cuda"):
+            raise RuntimeError("SSD streaming requires a CUDA device")
+
+        if config['ssd_manifest_path'] is None:
+            raise ValueError("ssd_manifest_path is required (runtime_manifest.json or shapes_meta.json)")
+
+        mp = str(config['ssd_manifest_path'])
+        if not Path(mp).exists():
+            raise FileNotFoundError(f"SSD manifest not found: {mp}")
+
+        # Optional: if a shapes_meta.json is provided, build runtime manifest on the fly.
+        if mp.endswith(".shapes_meta.json"):
+            try:
+                from .weights_io_ssd_dram import build_runtime_manifest
+                out_path = "/dev/shm/runtime_manifest.json"
+                build_runtime_manifest(mp, out_path)
+                config['ssd_manifest_path'] = out_path
+                print(f"[SSD] Built runtime manifest → {out_path}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to build runtime manifest from shapes_meta: {e}")
+
+        # Ensure model.layers accessible
+        if hasattr(self.model, "layer_infos"):
+            try:
+                blocks = [info.block for info in self.model.layer_infos if info.block is not None]
+                if blocks and not hasattr(self.model, "layers"):
+                    self.model.layers = blocks
+            except Exception:
+                pass
+
+        # Keep small/core modules on HBM
+        self._configure_core_components()
+
+        # Mark streaming mode
+        if getattr(self, "_streaming_mode", None) not in (None, "ssd"):
+            raise RuntimeError(f"Another streaming mode already active: {self._streaming_mode}")
+        self._streaming_mode = "ssd"
+
+        # Normalize staging bytes (WSM will align to device block size)
+        staging_bytes = max(1, int(config['staging_mb'])) * 1024 * 1024
+
+        # Create WSM with SSD backend
+        wsm = WeightStreamingManager(
+            self.model,
+            device=self.args.device,
+            prefetch_distance=config['prefetch_distance'],
+            max_cached_layers=config['max_cached_layers'],
+            warmup_layers=config['warmup_layers'],
+            verbose=config['verbose'],
+            # SSD backend
+            ssd_manifest_path=config['ssd_manifest_path'],
+            cpu_cache_layers=config['cpu_cache_layers'],
+            staging_bytes=staging_bytes,
+            check_dram_capacity=config['check_dram_capacity'],
+        )
+
+        # Integrate WSM hooks into layers
+        self._integrate_wsm_to_layers(wsm)
+
+        # KV streams
+        self._configure_kv_streams()
+
+        # Verify placements
+        self._verify_and_fix_device_placement()
+
+        # Print status
+        stats = wsm.get_ssd_stats()
+        print("✅ SSD Hybrid Streaming enabled:")
+        print(f"   📦 CPU cache: {stats.get('cpu_cache_max', config['cpu_cache_layers'])} layers")
+        print(f"   🎯 GPU cache: {config['max_cached_layers']} layers")
+        print(f"   🔄 Prefetch distance: {config['prefetch_distance']} layers")
+        print(f"   💾 Staging buffer: {config['staging_mb']} MB")
+        print("⚙️  Pipeline: SSD → CPU (pinned) → GPU (HBM)")
+        return wsm
+
     def _configure_core_components(self):
         """
         Keep small/core modules (embeddings, output head, final norm) permanently on the target device.
@@ -318,6 +418,8 @@ class LLaMA:
         streaming_config: Optional[dict] = None,
         enable_preload_mode: bool = False,
         preload_config: Optional[dict] = None,
+        enable_ssd_streaming: bool = False,
+        ssd_streaming_config: Optional[dict] = None,
         topk_blk: Optional[int] = None,
         max_seq_len: int = 2048,
         max_batch_size: int = 512,
@@ -328,6 +430,7 @@ class LLaMA:
         2) Load params.json into ModelArgs.
         3) (Optional) Load .pth weights to CPU state_dict.
         4) Weight loading strategies:
+           - enable_ssd_streaming: SSD raw device + CPU cache + GPU streaming (NEW)
            - enable_preload_mode: Preload N layers to GPU, prefetch during compute
            - enable_weight_streaming: Original streaming mode
            - default: Full model to GPU
@@ -388,7 +491,10 @@ class LLaMA:
         llama = LLaMA(tokenizer, checkpoint, cpu_args)
 
         # ---- Weight loading strategies ----
-        if enable_preload_mode and device.startswith("cuda"):
+        if enable_ssd_streaming and device.startswith("cuda"):
+            # SSD混合流式模式：SSD -> CPU缓存 -> GPU流式传输
+            llama._configure_ssd_streaming(ssd_streaming_config or {})
+        elif enable_preload_mode and device.startswith("cuda"):
             # 新的预加载模式：先加载几层，然后在推理时预取
             llama._configure_preload_mode(preload_config or {})
         elif enable_weight_streaming and device.startswith("cuda"):
