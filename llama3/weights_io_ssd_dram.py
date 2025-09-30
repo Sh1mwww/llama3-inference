@@ -157,7 +157,8 @@ def alloc_pinned_aligned(nbytes: int, block_size: int = 4096) -> torch.Tensor:
     if nbytes % block_size != 0:
         raise ValueError(f"nbytes must be multiple of {block_size} for O_DIRECT")
    
-    # PyTorch pinned 通常页对齐（4K），但不保证更大粒度的对齐
+    # PyTorch pinned 通常页对齐（4K），但不保证 block_size 对齐（512/4K）
+    # 这里尝试多次分配，直到找到一个对齐的
     for _ in range(4):
         t = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
         if (t.data_ptr() % block_size) == 0:
@@ -421,7 +422,7 @@ def streamable_entries_for_layer(manifest: Dict[str, Any], layer_id: int) -> Lis
     return [p for p in manifest["params"] if p["policy"] == "stream" and int(p["layer"]) == int(layer_id)]
 
 
-# ========== 附：raw 读吞吐自检（可选） ==========
+# ========== raw 读吞吐自检 ==========
 
 def bench_raw_read(manifest_path: str, rounds: int = 8, chunk_bytes: int = 64*1024*1024) -> float:
     """
@@ -451,7 +452,7 @@ def bench_raw_read(manifest_path: str, rounds: int = 8, chunk_bytes: int = 64*10
     return mbps
 
 
-# ========== CLI（可选调试） ==========
+# ========== CLI ==========
 
 def _cli():
     import argparse

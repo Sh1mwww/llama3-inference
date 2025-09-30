@@ -1,13 +1,11 @@
 #!/bin/bash
 # ================================
-# 
 # 用法示例:
-#   ./profile.sh "Hello world"                    # 直接文本输入
-#   ./profile.sh /path/to/prompts.txt             # 文件输入
+#   ./profile.sh "Hello world"                   # 直接文本输入
+#   ./profile.sh /path/to/prompts.txt            # 文件输入
 #   ./profile.sh prompts.txt -l 256 -b 32 -v     # 指定参数
 #   ./profile.sh prompts.txt --csv results.csv   # 导出CSV
 #   ./profile.sh prompts.txt --runs 3 --topk 8   # 多次运行
-# 
 # ================================
 
 set -e  # 遇到错误立即退出
