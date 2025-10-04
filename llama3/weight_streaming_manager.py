@@ -132,6 +132,12 @@ class WeightStreamingManager:
         self.stop_prefetch = threading.Event()
         self.prefetch_lock = threading.Lock()
 
+        # Preload completion tracking
+        self.gpu_preload_complete = threading.Event()
+        self.cpu_preload_complete = threading.Event()
+        self.target_gpu_layers = warmup_layers
+        self.target_cpu_layers = cpu_cache_layers
+
         # Optional fragmentation monitoring
         self.monitor_fragmentation = monitor_fragmentation
         self.memory_stats: List[Dict] = []
@@ -162,6 +168,10 @@ class WeightStreamingManager:
             i: _collect_block_modules(b) for i, b in enumerate(self.blocks)
         }
 
+        # Update target layers based on actual block count
+        self.target_cpu_layers = min(self.target_cpu_layers, len(self.blocks))
+        self.target_gpu_layers = min(self.target_gpu_layers, len(self.blocks))
+
         # CPU master copy: Parameter object id -> pinned CPU tensor
         self.cpu_stash: Dict[int, torch.Tensor] = {}
         # GPU LRU cache: layer index -> None
@@ -180,12 +190,12 @@ class WeightStreamingManager:
         if self.ssd_enabled:
             self._initialize_ssd_backend(ssd_manifest_path, staging_mb)
 
-        # (Optional) Warm up a few layers to reduce initial latency
-        if warmup_layers > 0:
-            warm = list(range(min(warmup_layers, len(self.blocks))))
+        # (Optional) Warm up target GPU layers to reduce initial latency
+        if self.target_gpu_layers > 0:
+            warm = list(range(min(self.target_gpu_layers, len(self.blocks))))
             self.prefetch(warm)
             if self.verbose:
-                print(f"[WSM] warmup prefetch: {warm}")
+                print(f"[WSM] GPU warmup prefetch: {warm} (target: {self.target_gpu_layers} layers)")
 
     # -------- SSD backend initialization --------
 
@@ -249,6 +259,14 @@ class WeightStreamingManager:
     def _start_prefetch_worker(self):
         """Start background thread for SSD->CPU prefetching"""
         def prefetch_worker():
+            # Initial preload: schedule first target_cpu_layers for CPU cache
+            if self.ssd_enabled:
+                initial_layers = list(range(min(self.target_cpu_layers, len(self.blocks))))
+                with self.prefetch_lock:
+                    self.prefetch_queue.extend(initial_layers)
+                if self.verbose:
+                    print(f"[WSM] Scheduled initial CPU preload for layers: {initial_layers}")
+
             while not self.stop_prefetch.is_set():
                 layer_to_prefetch = None
 
@@ -454,6 +472,42 @@ class WeightStreamingManager:
                     next_layer not in self.cpu_cache and
                     next_layer not in self.prefetch_queue):
                     self.prefetch_queue.append(next_layer)
+
+    def wait_for_preload_ready(self, timeout: float = 300.0) -> bool:
+        """
+        等待预加载完成：GPU有target_gpu_layers层，CPU有target_cpu_layers层
+
+        Args:
+            timeout: 最大等待时间（秒）
+
+        Returns:
+            bool: 是否在超时前完成预加载
+        """
+        import time
+
+        if self.verbose:
+            print(f"[WSM] Waiting for preload: target GPU={self.target_gpu_layers}, target CPU={self.target_cpu_layers}")
+
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            gpu_ready = len(self.gpu_cache) >= self.target_gpu_layers
+            cpu_ready = len(self.cpu_cache) >= self.target_cpu_layers if self.ssd_enabled else True
+
+            if gpu_ready and cpu_ready:
+                if self.verbose:
+                    print(f"[WSM] Preload completed: {len(self.gpu_cache)} GPU layers + {len(self.cpu_cache)} CPU layers ready")
+                self.gpu_preload_complete.set()
+                self.cpu_preload_complete.set()
+                return True
+
+            if self.verbose and int(time.time() - start_time) % 5 == 0:  # Progress update every 5 seconds
+                print(f"[WSM] Preload progress: GPU {len(self.gpu_cache)}/{self.target_gpu_layers}, CPU {len(self.cpu_cache)}/{self.target_cpu_layers}")
+
+            time.sleep(0.1)
+
+        print(f"[WSM] ⚠️  Preload timeout after {timeout}s: GPU {len(self.gpu_cache)}/{self.target_gpu_layers}, CPU {len(self.cpu_cache)}/{self.target_cpu_layers}")
+        return False
 
     # -------- CPU/GPU movement primitives --------
 

@@ -47,7 +47,6 @@ class Transformer(nn.Module):
             theta=args.rope_theta,
         )
 
-        # 外部使用的 profiling 容器
         self.kv_times: List[float] = [0.0] * args.n_layers
         self.attn_times: List[float] = [0.0] * args.n_layers
 

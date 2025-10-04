@@ -33,7 +33,7 @@ class RawBlockKVBackend:
     # ---------- sync write ----------
     def write(self, layer:int, slot:int, t_cpu:torch.Tensor, sync:bool=False):
         """
-        写入单个token到SSD整 token 封包
+        写入单个token到SSD, 一个token一个slot
         """
         
         data_u8 = t_cpu.detach().cpu().contiguous().view(torch.uint8).numpy()
@@ -59,7 +59,7 @@ class RawBlockKVBackend:
     # ---------- sync read to GPU tensor ----------
     def read(self, layer:int, slot:int, t_gpu:torch.Tensor):
         """
-        读取一个 token 单元；只拷出有效 self.blk_bytes 长度
+        读取一个 token 单元, 只copy有效 self.blk_bytes 长度
         """
         buf = aligned_array((self.stride,), np.uint8)
         os.pread(self.fd, buf, self._offset(layer, slot))

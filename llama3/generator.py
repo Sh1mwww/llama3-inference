@@ -9,10 +9,6 @@ from transformers import LlamaTokenizerFast, AutoTokenizer
 from .config import ModelArgs
 from .model import Transformer
 
-# ================================
-# NVTX profiling support (safe fallback)
-# ================================
-
 try:
     import torch.cuda.nvtx as nvtx
     NVTX_AVAILABLE = True
@@ -158,6 +154,9 @@ class LLaMA:
             verbose=True,  # force verbose to help verify integration
         )
 
+        # Store WSM reference for later access
+        self.weight_streaming_manager = wsm
+
         # Integrate WSM hooks into layers (attn/ffn)
         self._integrate_wsm_to_layers(wsm)
 
@@ -198,7 +197,7 @@ class LLaMA:
             'max_cached_layers': 4,
             'cpu_cache_layers': 50,
             'staging_mb': 64,
-            'warmup_layers': 1,
+            'warmup_layers': 5,
             'verbose': True,
             'check_dram_capacity': True,
         }
@@ -256,9 +255,11 @@ class LLaMA:
             # SSD backend
             ssd_manifest_path=config['ssd_manifest_path'],
             cpu_cache_layers=config['cpu_cache_layers'],
-            staging_bytes=staging_bytes,
-            check_dram_capacity=config['check_dram_capacity'],
+            staging_mb=config['staging_mb'],
         )
+
+        # Store WSM reference for later access
+        self.weight_streaming_manager = wsm
 
         # Integrate WSM hooks into layers
         self._integrate_wsm_to_layers(wsm)
@@ -532,6 +533,21 @@ class LLaMA:
             enable_batching: If False, processes all prompts in a single batch (no "local X/Y" display)
         """
         nvtx.range_push("text_completion")
+
+        # Wait for preload completion if streaming is enabled
+        if hasattr(self, 'weight_streaming_manager'):
+            wsm = self.weight_streaming_manager
+
+            if hasattr(wsm, 'wait_for_preload_ready'):
+                streaming_mode = getattr(self, '_streaming_mode', 'weight_streaming')
+                print(f"[INFO] Waiting for preload completion in {streaming_mode} mode (target: {wsm.target_gpu_layers} GPU + {wsm.target_cpu_layers} CPU layers)...")
+                preload_success = wsm.wait_for_preload_ready(timeout=300.0)
+                if preload_success:
+                    print(f"✅ [INFO] Preload completed successfully")
+                else:
+                    print(f"⚠️ [WARNING] Preload timeout - proceeding with inference anyway")
+            else:
+                print(f"[INFO] WSM found but no preload method available")
 
         # Disable batching if requested
         if not enable_batching:

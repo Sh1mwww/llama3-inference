@@ -1,17 +1,3 @@
-#!/usr/bin/env python
-"""
-trace_kv_weight.py v1.3
------------------------
-✓ 权重上传 bytes + dur
-✓ dim_head 对齐 KV bytes
-✓ KV push / fetch bytes + dur
-✓ MHA / FFN dur
-✓ 统计本次推理 DRAM→GPU 的 KV fetch 次数
-输出:
-  trace.json             (Chrome://tracing)
-  trace_summary.csv      (event,cat,bytes,dur_us)
-  终端打印 fetch 次数
-"""
 import os, json, csv, time, argparse, functools, torch, pathlib
 from llama3.generator import LLaMA
 from llama3.kv_offload import KVOffloader

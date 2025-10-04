@@ -1,10 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Multi-batch inference launcher for llama3.generator.LLaMA
-
-用法示例
---------
 # 单文件、多行 prompt，按 batch_size 送入 GPU
 python scripts/run_inference.py \
     --model-path /path/to/model \
@@ -12,7 +6,7 @@ python scripts/run_inference.py \
     --batch-size 32 \
     --max-gen-len 64
 
-# 命令行直接给多条 prompt（与旧版兼容）
+# 命令行直接给多条 prompt
 python scripts/run_inference.py \
     --model-path /path/to/model \
     --prompt "你好" "请用中文解释牛顿第二定律" \
