@@ -14,6 +14,9 @@ class KVCacheArgs:
     ssd_path: str = "/mnt/kv_cache/kv_cache.bin"
     ssd_size_gb: int = 500
     dram_limit_gb: float = 0.1
+    ssd_device_path: str = "/dev/nvme0n1p4"  # Raw block device path for KV cache
+    max_concurrent_io: int = 4
+    ssd_capacity_gb: int = 100
 
 @dataclass
 class ModelArgs:

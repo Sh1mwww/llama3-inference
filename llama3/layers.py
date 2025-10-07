@@ -204,6 +204,7 @@ class SelfAttention(nn.Module):
         self.attention_history = []  # 用于分析注意力模式
         self.qkv_buffer = None
         self.scores_buffer = None
+        self.streams = streams  # 保存streams引用用于compute
         
     
     def _get_modules_dict(self):
@@ -307,16 +308,34 @@ class SelfAttention(nn.Module):
             if self.weight_manager:
                 self.weight_manager.prefetch_weights([self.layer_id + 1], {self.layer_id + 1: self._next_layer_modules})
         
-        # QKV投影
-        with cuda_timer("attn_us", self.layer_id):
-            # print("wq.weight.device =", self.wq.weight.device)
-            q = self.wq(x).view(bsz, seqlen, self.n_heads_q, self.head_dim)
-            k = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-            v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-            
-            # 应用旋转位置编码
-            q = apply_rotary_embeddings(q, freqs_complex)
-            k = apply_rotary_embeddings(k, freqs_complex)
+        # 确保权重H2D传输完成后再开始计算
+        if self.streams and self.streams.weight_h2d:
+            torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_h2d)
+
+        # QKV投影 - 使用专门的compute stream
+        compute_stream = self.streams.weight_compute if self.streams else None
+        if compute_stream:
+            with torch.cuda.stream(compute_stream):
+                with cuda_timer("attn_us", self.layer_id):
+                    # print("wq.weight.device =", self.wq.weight.device)
+                    q = self.wq(x).view(bsz, seqlen, self.n_heads_q, self.head_dim)
+                    k = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+                    v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+
+                    # 应用旋转位置编码
+                    q = apply_rotary_embeddings(q, freqs_complex)
+                    k = apply_rotary_embeddings(k, freqs_complex)
+        else:
+            # 回退到默认stream
+            with cuda_timer("attn_us", self.layer_id):
+                # print("wq.weight.device =", self.wq.weight.device)
+                q = self.wq(x).view(bsz, seqlen, self.n_heads_q, self.head_dim)
+                k = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+                v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+
+                # 应用旋转位置编码
+                q = apply_rotary_embeddings(q, freqs_complex)
+                k = apply_rotary_embeddings(k, freqs_complex)
         
         # Push当前block到offloader  
         bsz, seqlen, n_heads, head_dim = k.shape
@@ -384,35 +403,66 @@ class SelfAttention(nn.Module):
         
         # 确保缓冲区足够大
         q = q.transpose(1, 2)  # (B, H, Tq, D)
-        
+
+        # Attention计算 - 使用compute stream
         nvtx.range_push(f"layer_{self.layer_id}_attention_compute")
-        with cuda_timer("attn_us", self.layer_id):
-            # mha
-            attn_evt_start = torch.cuda.Event(enable_timing=True)
-            attn_evt_end = torch.cuda.Event(enable_timing=True)
-            attn_evt_start.record()  
-            scores = torch.matmul(q, k_full.transpose(2, 3))
-            scores = scores / math.sqrt(self.head_dim)
-            
-            # causal mask 
-            if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
-                seq_len_q = q.size(2)
-                seq_len_k = k_full.size(2)
-                mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
-                scores = scores.masked_fill(mask.bool(), float('-inf'))
-            
-            # Softmax和输出计算
-            attn_weights = torch.softmax(scores, dim=-1)
-            out = torch.matmul(attn_weights, v_full)
-            attn_evt_end.record()
-            
-            # 避免不必要的同步,仅在profiling时同步
-            if getattr(self, 'enable_profiling', False):
-                torch.cuda.synchronize()
-                self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
-                PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
-            else:
-                self.attn_time = 0
+        if compute_stream:
+            with torch.cuda.stream(compute_stream):
+                with cuda_timer("attn_us", self.layer_id):
+                    # mha
+                    attn_evt_start = torch.cuda.Event(enable_timing=True)
+                    attn_evt_end = torch.cuda.Event(enable_timing=True)
+                    attn_evt_start.record()
+                    scores = torch.matmul(q, k_full.transpose(2, 3))
+                    scores = scores / math.sqrt(self.head_dim)
+
+                    # causal mask
+                    if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
+                        seq_len_q = q.size(2)
+                        seq_len_k = k_full.size(2)
+                        mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
+                        scores = scores.masked_fill(mask.bool(), float('-inf'))
+
+                    # Softmax和输出计算
+                    attn_weights = torch.softmax(scores, dim=-1)
+                    out = torch.matmul(attn_weights, v_full)
+                    attn_evt_end.record()
+
+                    # 避免不必要的同步,仅在profiling时同步
+                    if getattr(self, 'enable_profiling', False):
+                        torch.cuda.synchronize()
+                        self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
+                        PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
+                    else:
+                        self.attn_time = 0
+        else:
+            with cuda_timer("attn_us", self.layer_id):
+                # mha
+                attn_evt_start = torch.cuda.Event(enable_timing=True)
+                attn_evt_end = torch.cuda.Event(enable_timing=True)
+                attn_evt_start.record()
+                scores = torch.matmul(q, k_full.transpose(2, 3))
+                scores = scores / math.sqrt(self.head_dim)
+
+                # causal mask
+                if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
+                    seq_len_q = q.size(2)
+                    seq_len_k = k_full.size(2)
+                    mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
+                    scores = scores.masked_fill(mask.bool(), float('-inf'))
+
+                # Softmax和输出计算
+                attn_weights = torch.softmax(scores, dim=-1)
+                out = torch.matmul(attn_weights, v_full)
+                attn_evt_end.record()
+
+                # 避免不必要的同步,仅在profiling时同步
+                if getattr(self, 'enable_profiling', False):
+                    torch.cuda.synchronize()
+                    self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
+                    PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
+                else:
+                    self.attn_time = 0
         nvtx.range_pop()  # attention_compute
         out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
         
@@ -432,7 +482,13 @@ class SelfAttention(nn.Module):
             
             self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx= blk_idx)
 
-        result = self.wo(out)
+        # 输出投影 - 使用compute stream
+        if compute_stream:
+            with torch.cuda.stream(compute_stream):
+                result = self.wo(out)
+        else:
+            result = self.wo(out)
+
         total_time = (time.time() - start_time) * 1000000  # 转换为微秒
         PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
         return result
@@ -449,11 +505,20 @@ class FeedForward(nn.Module):
         self.w1 = nn.Linear(args.dim, hidden_dim, bias=False, device="cpu")
         self.w2 = nn.Linear(hidden_dim, args.dim, bias=False, device="cpu")
         self.w3 = nn.Linear(args.dim, hidden_dim, bias=False, device="cpu")
-        
+
         self.device = args.device
         self.layer_id = -1
-        
+
         self.activation_buffer = None
+
+        # 获取streams引用
+        streams = None
+        try:
+            import llama3.stream_mnt as stream_mnt
+            streams = stream_mnt.get_streams(args.device)
+        except Exception:
+            pass
+        self.streams = streams
     
     def _get_modules_dict(self):
         return {
@@ -475,15 +540,31 @@ class FeedForward(nn.Module):
             except RuntimeError as e:
                 logger.error(f"CUDA context error in feedforward: {e}")
                 raise RuntimeError("CUDA context is corrupted") from e
-        
+
         self._ensure_weights_cuda()
-        
-        with cuda_timer("ffn_us", self.layer_id):
-            # SwiGLU
-            gate = self.w1(x)
-            up = self.w3(x)
-            hidden = F.silu(gate) * up
-            return self.w2(hidden)
+
+        # 确保权重H2D传输完成后再开始计算
+        if self.streams and self.streams.weight_h2d:
+            torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_h2d)
+
+        # FFN计算 - 使用compute stream
+        compute_stream = self.streams.weight_compute if self.streams else None
+        if compute_stream:
+            with torch.cuda.stream(compute_stream):
+                with cuda_timer("ffn_us", self.layer_id):
+                    # SwiGLU
+                    gate = self.w1(x)
+                    up = self.w3(x)
+                    hidden = F.silu(gate) * up
+                    result = self.w2(hidden)
+            return result
+        else:
+            with cuda_timer("ffn_us", self.layer_id):
+                # SwiGLU
+                gate = self.w1(x)
+                up = self.w3(x)
+                hidden = F.silu(gate) * up
+                return self.w2(hidden)
 
 # ---------- Optimized EncoderBlock ----------
 class EncoderBlock(nn.Module):
@@ -500,26 +581,45 @@ class EncoderBlock(nn.Module):
 
         self.attention.layer_id = layer_id
         self.feed_forward.layer_id = layer_id
-        
+
         if layer_id < args.n_layers - 1:
             self.attention._next_layer_modules = self.feed_forward._get_modules_dict()
 
         self.forward_count = 0
         self.total_forward_time = 0.0
+
+        # 获取streams引用用于同步
+        self.device = args.device
+        streams = None
+        try:
+            import llama3.stream_mnt as stream_mnt
+            streams = stream_mnt.get_streams(args.device)
+        except Exception:
+            pass
+        self.streams = streams
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
         forward_start = time.time()
-        
+
         nvtx.range_push(f"layer_{self.layer_id}_forward")
         with cuda_timer("total_forward_us", self.layer_id):
 
             nvtx.range_push(f"layer_{self.layer_id}_attention")
             h = x + self.attention(self.attn_norm(x), start_pos, freqs_complex)
             nvtx.range_pop()  # attention
-            
+
+            # 确保attention计算完成后再开始FFN (如果使用了compute stream)
+            if self.streams and self.streams.weight_compute:
+                torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_compute)
+
             nvtx.range_push(f"layer_{self.layer_id}_ffn")
             out = h + self.feed_forward(self.ffn_norm(h))
             nvtx.range_pop()  # ffn
+
+            # 确保FFN计算完成后再返回 (如果使用了compute stream)
+            if self.streams and self.streams.weight_compute:
+                torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_compute)
+
         nvtx.range_pop()  # layer_forward
 
         self.forward_count += 1

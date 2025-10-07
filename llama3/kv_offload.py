@@ -86,8 +86,9 @@ class KVOffloader:
 
         # Initialize SSD backend if available; otherwise fallback to DRAM-only mode
         try:
+            ssd_device_path = getattr(KVCacheArgs, "ssd_device_path", "/dev/nvme0n1p4")
             self.ssd = RawBlockKVBackend(
-                dev_path="/dev/nvme0n1p4",
+                dev_path=ssd_device_path,
                 n_layers=layers,
                 blk_bytes=self.block_nbytes,
                 blk_per_layer=n_blocks,

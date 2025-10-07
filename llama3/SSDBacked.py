@@ -68,7 +68,8 @@ class RawBlockKVBackend:
 
     def __del__(self):
         try:
-            self.pool.shutdown(wait=False)
+            if hasattr(self, 'pool') and self.pool is not None:
+                self.pool.shutdown(wait=False)
         finally:
-            if self.fd is not None:
+            if hasattr(self, 'fd') and self.fd is not None:
                 os.close(self.fd)
