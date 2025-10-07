@@ -1,8 +1,8 @@
 # 全层 + 大矩阵（更快）
-# python validate_all_layers_sequential.py --manifest /data1/llama-70b.runtime_manifest.json --only-stream
+# python validate_all_layers_sequential.py --manifest /data1/llama3.1-70b.runtime_manifest.json --only-stream
 
 # 或全层所有参数
-# python validate_all_layers_sequential.py --manifest /data1/llama-70b.runtime_manifest.json
+# python validate_all_layers_sequential.py --manifest /data1/llama3.1-70b.runtime_manifest.json
 
 import argparse
 import ctypes
