@@ -1,4 +1,4 @@
-# llama3/raw_param_store_improved.py
+# llama3/raw_param_store.py
 
 import ctypes
 import json
@@ -16,13 +16,23 @@ from llama3.weights_io_ssd_dram import (
 )
 
 # numpy 映射用于 reinterpret 路径
-NP_DTYPE = {
-    torch.float16: np.float16,
-    torch.float32: np.float32,
-    torch.int8:    np.int8,
-    torch.uint8:   np.uint8,
-    torch.bfloat16: np.dtype("bfloat16"),
-}
+def _get_np_dtype_map():
+    """构建 torch dtype 到 numpy dtype 的映射，处理 bfloat16 兼容性"""
+    dtype_map = {
+        torch.float16: np.float16,
+        torch.float32: np.float32,
+        torch.int8:    np.int8,
+        torch.uint8:   np.uint8,
+    }
+    # bfloat16 支持需要 numpy >= 1.24
+    try:
+        dtype_map[torch.bfloat16] = np.dtype("bfloat16")
+    except TypeError:
+        # 旧版本 numpy 不支持 bfloat16，跳过
+        pass
+    return dtype_map
+
+NP_DTYPE = _get_np_dtype_map()
 
 def _ceil_to(v: int, b: int) -> int:
     return ((v + b - 1) // b) * b
