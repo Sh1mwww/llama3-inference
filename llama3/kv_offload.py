@@ -146,14 +146,18 @@ class KVOffloader:
     ):
         """
         Save K/V of *one* block from HBM → pinned DRAM.
-        Optionally mirror the packed KV to SSD (async) when token_idx is provided.
+        Optionally mirror the packed KV to SSD (async) using block-aligned addressing.
 
         Args:
             layer: layer index
-            blk: block index
+            blk: block index (used for both DRAM and SSD addressing)
             k, v: tensors with shape (bsz, heads, dim) or (heads, dim)
-            token_idx: optional token-aligned index for SSD layout
+            token_idx: (deprecated) token index - no longer used for SSD addressing
             batch_idx: batch index for importance update and tracker accounting
+
+        Note:
+            SSD writes now use block index (blk) for consistent addressing with
+            _spill_to_ssd() and _load_from_ssd(). This ensures proper data recovery.
         """
         self._alloc_block(layer, blk, k.size(0))
 
@@ -178,25 +182,24 @@ class KVOffloader:
 
         self._maybe_evict()
 
-        # Optional SSD mirror: pack to (max_batch, heads, 2*dim) fp16 and write async
-        if token_idx is not None and self.ssd is not None:
-            if k.dim() == 2:  # (heads, dim) → (1, heads, dim)
-                k = k.unsqueeze(0)
-                v = v.unsqueeze(0)
-            bsz = k.size(0)
+        # Optional SSD mirror: pack K and V to (max_batch, heads, 2*dim) fp16 and write async
+        # Using blk (block index) for consistent addressing with _spill_to_ssd and _load_from_ssd
+        if self.ssd is not None:
+            # Get data for packing - need to wait for D2H transfer to complete
+            if self.d2h_stream is not None:
+                self.d2h_stream.synchronize()
 
-            kv_pack = torch.zeros(
-                (self.max_batch, self.heads, self.dim * 2),
-                dtype=torch.float16,
-                device=k.device,
-            )
-            kv_pack[:bsz, :, : self.dim].copy_(k)
-            kv_pack[:bsz, :, self.dim :].copy_(v)
+            # Pack K and V into aligned buffer for raw block device
+            kv_pack_cpu = torch.cat([self.k_cpu[layer][blk], self.v_cpu[layer][blk]], dim=-1)
 
             try:
-                self.ssd.write_async(layer, token_idx, kv_pack)
+                # Async write using block index (not token index) for consistent SSD layout
+                # This ensures _load_from_ssd(L, B) can correctly read data written here
+                self.ssd.write_async(layer, blk, kv_pack_cpu, sync=False)
+                # Mark as mirrored to SSD (but not evicted - still in DRAM)
+                # self.on_ssd[layer][blk] remains False until actual eviction via _spill_to_ssd
             except Exception as e:
-                print(f"[WARN] SSD mirror write failed @L{layer} T{token_idx}: {e}")
+                print(f"[WARN] SSD mirror write failed @L{layer} B{blk}: {e}")
 
     def fetch(self, layer: int, blocks: torch.Tensor, batch_idx: int = 0):
         """

@@ -1,7 +1,8 @@
 import json
 import torch.nn as nn
-from dataclasses import dataclass, fields, field
 from typing import Optional, List, Dict, Any
+import math
+from dataclasses import dataclass, field, fields, is_dataclass
 
 @dataclass
 class LayerInfo:
@@ -140,3 +141,174 @@ class ModelArgs:
 
         args.layer_infos = [LayerInfo(layer_id=i) for i in range(args.n_layers)]
         return args
+    
+    
+# ---------- 运行期总开关 ----------
+@dataclass
+class RuntimeFlags:
+    FINE_GRAINED_PIPELINE: bool = True
+    INFER_MODE_DEFAULT: str = "prefill"        # "prefill" or "decode"
+
+# ---------- HBM 窗口与预取 ----------
+@dataclass
+class WindowPrefetchConfig:
+    HBM_WINDOW_PREFILL: int = 3
+    HBM_WINDOW_DECODE: int = 5
+    PREFETCH_DIST_PREFILL_DEFAULT: int = 2
+    PREFETCH_DIST_DECODE_DEFAULT: int = 2
+    PD_CAP: int = 3
+
+# ---------- pinned 池与注册 ----------
+@dataclass
+class PinnedPoolConfig:
+    WEIGHT_PINNED_BYTES: int = 32 << 30        # 32 GiB
+    KV_PINNED_BYTES: int     = 12 << 30        # 12 GiB
+    EXTENT_BYTES: int        = 2  << 20        # 2 MiB 逻辑粒度
+    PINNED_REGISTER_CHUNK: int = 512 << 20     # 512 MiB 注册一块
+    PINNED_REGISTER_N: Optional[int] = None    # 若为 None 自动按 ceil 计算
+
+    def __post_init__(self):
+        # 基础对齐检查（与 IO.RAW_IO_ALIGN_BYTES 的跨项校验在 validate_runtime_config 里做）
+        if self.EXTENT_BYTES % 4096 != 0:
+            raise ValueError("EXTENT_BYTES 必须是 4KiB 的整数倍")
+        if self.PINNED_REGISTER_N is None:
+            self.PINNED_REGISTER_N = math.ceil(self.WEIGHT_PINNED_BYTES / self.PINNED_REGISTER_CHUNK)
+
+# ---------- DRAM 注册传送带 ----------
+@dataclass
+class RegisteredPoolConfig:
+    REG_POOL_N_BUFFERS: int = 12
+    REG_POOL_BUF_BYTES: int = 32 << 20        # 单缓冲 ~32 MiB，总 ~384 MiB
+
+# ---------- RAW I/O 与节流 ----------
+@dataclass
+class IOConfig:
+    RAW_IO_USE_ODIRECT: bool = True
+    RAW_IO_ALIGN_BYTES: int = 4096
+    RAW_IO_QD_READ: int = 32                 # 先保守，压测稳定后可调到 48
+    RAW_IO_QD_WRITE: int = 8                 # 先保守，压测稳定后可调到 24
+    RAW_PREFETCH_ON_COMPUTE: bool = True
+    PINNED_LOW_WATERMARK: float = 0.20       # 低水位：强制 PD=1
+    PINNED_HIGH_WATERMARK: float = 0.30      # 高水位：滞回上限
+    PCIE_BUSY_UTIL_TH_HI: float = 0.70       # 繁忙阈值
+    PCIE_BUSY_UTIL_TH_LO: float = 0.60       # 恢复阈值（滞回）
+    IO_RAW_THROTTLE_MS: int = 30             # 预取节流窗口
+
+# ---------- Warmup / Bootstrap ----------
+@dataclass
+class WarmupBootstrapConfig:
+    WARMUP_HOTSET_LAYERS: int = 10           # L0..L9 MHA promote→pinned
+    DECODE_BOOTSTRAP_LAYERS: int = 5         # Prefill 末把 0..4 MHA 推 HBM
+    BOOTSTRAP_PROTECT: bool = True
+
+# ---------- 策略修饰 ----------
+@dataclass
+class StreamingPolicyConfig:
+    NEXT_USE_TIE_BREAKER: str = "size"       # or "cost"
+    EVICT_PREFETCH_FIRST: bool = True
+    PREFETCH_MIN_RETAIN_MS: int = 60         # 建议= 2 * IO.IO_RAW_THROTTLE_MS
+    PREFETCH_EVICT_DIST_GUARD: int = 1       # 仅当 dist > (W+PD)//2 才优先踢
+
+# ---------- 系统稳定性 ----------
+@dataclass
+class SystemStabilityConfig:
+    REQUIRE_MEMLOCK_UNLIMITED: bool = True
+    SWAPPINESS_LOW: bool = True
+    PERSISTENT_MODE: bool = True             # nvidia-smi -pm 1
+
+# ---------- 监控 ----------
+@dataclass
+class MonitoringConfig:
+    enable_monitoring: bool = True
+    monitor_interval_s: float = 1.0
+
+# ---------- 汇总 ----------
+@dataclass
+class RuntimeConfig:
+    flags: RuntimeFlags = field(default_factory=RuntimeFlags)
+    window: WindowPrefetchConfig = field(default_factory=WindowPrefetchConfig)
+    pinned: PinnedPoolConfig = field(default_factory=PinnedPoolConfig)
+    regpool: RegisteredPoolConfig = field(default_factory=RegisteredPoolConfig)
+    io: IOConfig = field(default_factory=IOConfig)
+    warmup: WarmupBootstrapConfig = field(default_factory=WarmupBootstrapConfig)
+    policy: StreamingPolicyConfig = field(default_factory=StreamingPolicyConfig)
+    system: SystemStabilityConfig = field(default_factory=SystemStabilityConfig)
+    monitor: MonitoringConfig = field(default_factory=MonitoringConfig)
+    # 复用你已有的 KV 配置；若需要 KV 独立 QD，可在这里扩展字段或在 KV 层覆写
+    kv_cache: 'KVCacheArgs' = field(default_factory=lambda: KVCacheArgs())
+
+def _update_dataclass(dc_obj, updates: Dict[str, Any]):
+    """递归更新 dataclass 字段（只更新已存在字段），支持子结构字典。"""
+    for k, v in (updates or {}).items():
+        if not hasattr(dc_obj, k):
+            continue
+        cur = getattr(dc_obj, k)
+        if is_dataclass(cur) and isinstance(v, dict):
+            _update_dataclass(cur, v)
+        else:
+            setattr(dc_obj, k, v)
+
+def validate_runtime_config(cfg: RuntimeConfig) -> RuntimeConfig:
+    """做跨项校验并在需要时做安全收敛（避免直接抛异常导致进程退出）"""
+    errs = []
+    # 对齐关系：extent 必须是 RAW 对齐的整数倍
+    if cfg.pinned.EXTENT_BYTES % cfg.io.RAW_IO_ALIGN_BYTES != 0:
+        errs.append(f"EXTENT_BYTES({cfg.pinned.EXTENT_BYTES}) 不是 RAW_IO_ALIGN_BYTES({cfg.io.RAW_IO_ALIGN_BYTES}) 的整数倍")
+
+    # 注册块覆盖能力：注册块总和必须 ≥ WEIGHT_PINNED_BYTES
+    covered = cfg.pinned.PINNED_REGISTER_N * cfg.pinned.PINNED_REGISTER_CHUNK
+    if covered < cfg.pinned.WEIGHT_PINNED_BYTES:
+        # 自动上调块数到 ceil
+        cfg.pinned.PINNED_REGISTER_N = math.ceil(cfg.pinned.WEIGHT_PINNED_BYTES / cfg.pinned.PINNED_REGISTER_CHUNK)
+
+    # 水位与滞回区间
+    if not (0.0 < cfg.io.PINNED_LOW_WATERMARK < cfg.io.PINNED_HIGH_WATERMARK < 1.0):
+        errs.append("PINNED_[LOW,HIGH]_WATERMARK 需满足 0 < LOW < HIGH < 1")
+
+    # QD 的安全范围
+    if cfg.io.RAW_IO_QD_READ <= 0 or cfg.io.RAW_IO_QD_WRITE < 0:
+        errs.append("RAW_IO_QD_[READ/WRITE] 非法（READ>0, WRITE>=0）")
+
+    # 预取最短保留建议值：若未显式给出，自动取 2 * throttle
+    if cfg.policy.PREFETCH_MIN_RETAIN_MS <= 0:
+        cfg.policy.PREFETCH_MIN_RETAIN_MS = 2 * cfg.io.IO_RAW_THROTTLE_MS
+
+    if errs:
+        # 打印警告但不要强退（让上层可以继续跑压测）
+        for e in errs:
+            print(f"[RuntimeConfig][WARN] {e}")
+    return cfg
+
+def runtime_config_to_dict(cfg: RuntimeConfig) -> Dict[str, Any]:
+    """把多层 dataclass 展平为 dict（便于日志/导出）"""
+    def to_obj(x):
+        if is_dataclass(x):
+            return {f.name: to_obj(getattr(x, f.name)) for f in fields(x)}
+        if isinstance(x, list):
+            return [to_obj(i) for i in x]
+        return x
+    return to_obj(cfg)
+
+def load_runtime_config(overrides: Optional[Dict[str, Any]] = None) -> RuntimeConfig:
+    """
+    生成带默认值的运行期配置，并应用可选的 dict 覆盖。
+    用法：
+        RUNTIME = load_runtime_config({
+            "io": {"RAW_IO_QD_READ": 48},
+            "pinned": {"WEIGHT_PINNED_BYTES": 28<<30}
+        })
+    """
+    cfg = RuntimeConfig()
+    if overrides:
+        _update_dataclass(cfg, overrides)
+    return validate_runtime_config(cfg)
+
+# 可选导出（便于 from config import *）
+__all__ = [
+    "RuntimeFlags", "WindowPrefetchConfig", "PinnedPoolConfig", "RegisteredPoolConfig",
+    "IOConfig", "WarmupBootstrapConfig", "StreamingPolicyConfig", "SystemStabilityConfig",
+    "MonitoringConfig", "RuntimeConfig", "load_runtime_config", "validate_runtime_config",
+    "runtime_config_to_dict",
+    # 你已有的类
+    "LayerInfo", "KVCacheArgs", "ModelArgs"
+]
