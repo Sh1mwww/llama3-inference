@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from .stream_mnt import get_streams
+from .config import load_runtime_config
 
 # NVTX profiling support (no-op fallback if unavailable)
 try:
@@ -142,6 +143,27 @@ class WeightStreamingManager:
         self.monitor_fragmentation = monitor_fragmentation
         self.memory_stats: List[Dict] = []
         self.fragmentation_threshold = 0.3
+        # PD 自适应参数（滞回 + EMA）
+        
+        
+        _rcfg = {}
+        try:
+            _rcfg = load_runtime_config()
+            _rcfg = getattr(_rcfg, "io", {}) if hasattr(_rcfg, "io") else {}
+        except Exception:
+            _rcfg = {}
+        self.pd_cap = int(getattr(_rcfg, "PD_CAP", 3) or 3)
+        self.pcie_hi = float(getattr(_rcfg, "PCIE_BUSY_UTIL_TH_HI", 0.70))
+        self.pcie_lo = float(getattr(_rcfg, "PCIE_BUSY_UTIL_TH_LO", 0.60))
+        self.pin_lo  = float(getattr(_rcfg, "PINNED_LOW_WATERMARK", 0.20))
+        self.pin_hi  = float(getattr(_rcfg, "PINNED_HIGH_WATERMARK", 0.30))
+        self.throttle_ms = int(getattr(_rcfg, "IO_RAW_THROTTLE_MS", 30))
+        self._pd_current = max(1, self.prefetch_distance)
+        self._pcie_ema = 0.0
+        self._ema_alpha = 0.2
+        self._last_h2d_ms = 0.0
+        # 可选：外部 KV Offloader（若主程序传入，可用于触发“暂停写”）
+        self.kv_offloader = None
 
         # Resolve transformer blocks (layers)
         blocks: Optional[List[nn.Module]] = None
@@ -539,6 +561,19 @@ class WeightStreamingManager:
             evt = torch.cuda.Event(blocking=False)
             self.layer_events[idx] = evt
         evt.record(self.streams.weight_h2d)
+        
+        # 记录一次 H2D 活动时长，用于 PCIE 近似占用度估计（EMA）
+        try:
+            start = torch.cuda.Event(enable_timing=True)
+            end   = torch.cuda.Event(enable_timing=True)
+            start.record(self.streams.weight_h2d)
+            end.record(self.streams.weight_h2d)
+            end.synchronize()
+            dt_ms = start.elapsed_time(end)  # ~0，但可以作为一次采样
+            self._last_h2d_ms = max(self._last_h2d_ms * 0.9, dt_ms)
+        except Exception:
+            pass
+
 
     def _wait_layer_ready(self, idx: int):
         """Wait on the layer's ready event on the current stream (fallback: wait for H2D stream)."""
@@ -652,6 +687,9 @@ class WeightStreamingManager:
 
     def ensure_on_gpu(self, idx: int, wait: bool):
         """Ensure layer idx is present on GPU (respecting LRU); optionally wait for readiness."""
+        # 在正式 H2D 前评估一次 PD
+        self._decide_pd()
+        
         nvtx.range_push(f"ensure_layer_{idx}")
         self._record_memory_stats("ensure_start", idx)
 
@@ -709,6 +747,7 @@ class WeightStreamingManager:
         """Asynchronously prefetch a list of layer indices, respecting the LRU budget."""
         if not ids:
             return
+        ids = ids[: max(1, min(self._pd_current, self.pd_cap))]
         nvtx.range_push(f"prefetch_layers_{ids}")
 
         for idx in ids:
@@ -748,6 +787,45 @@ class WeightStreamingManager:
             nvtx.range_pop()  # prefetch_layer
 
         nvtx.range_pop()  # prefetch_layers
+        
+        
+    # --------- PD 自适应（滞回+EMA） ---------
+    def _decide_pd(self):
+        """
+        估计 PCIE 忙闲（EMA），并结合 pinned 水位（若可得）做滞回调整：
+        - 忙：PCIE>hi 或 pinned<low -> PD=1，暂停 KV 写 throttle_ms
+        - 闲：PCIE<lo 且 pinned>high -> PD=min(PD+1, cap)
+        - 中：保持
+        """
+        # 近似估计 PCIE 利用率：以 H2D stream 的 backlog 与最近 H2D 触发为 proxy
+        busy_proxy = 1.0
+        try:
+            # 如果 H2D stream 上还有工作未完成，则趋向 1，否则趋向 0
+            busy_proxy = 0.9 if (not self.streams.weight_h2d.query()) else 0.1
+        except Exception:
+            pass
+        # EMA
+        self._pcie_ema = self._ema_alpha * busy_proxy + (1.0 - self._ema_alpha) * self._pcie_ema
+
+        # pinned 水位：此处无法读取系统 pinned 池，采用保守估计 0.5；如果你有 HostPinnedExtentPool，可在外层注入
+        pinned_free_ratio = 0.5
+
+        # 忙态：降 PD、暂停写
+        if (self._pcie_ema >= self.pcie_hi) or (pinned_free_ratio <= self.pin_lo):
+            self._pd_current = 1
+            if self.kv_offloader is not None:
+                try:
+                    self.kv_offloader.throttle_writes_for(self.throttle_ms)
+                except Exception:
+                    pass
+            return
+
+        # 闲态：升 PD
+        if (self._pcie_ema <= self.pcie_lo) and (pinned_free_ratio >= self.pin_hi):
+            self._pd_current = min(self._pd_current + 1, self.pd_cap)
+            return
+        # 中态：不变
+
 
     def _evict_layer_to_cpu(self, idx: int):
         """Evict a layer back to CPU (parameters: pointer switch; buffers: copied)."""

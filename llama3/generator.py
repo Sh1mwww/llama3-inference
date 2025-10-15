@@ -363,13 +363,30 @@ class LLaMA:
             from . import stream_mnt  # local import intentionally kept
             streams = stream_mnt.get_streams(self.args.device)
 
+            # if hasattr(self.model, "layers"):
+            #     for layer in self.model.layers:
+            #         if hasattr(layer, "attention"):
+            #             off = getattr(layer.attention, "offloader", None)
+            #             if off is not None:
+            #                 off.h2d_stream = streams.kv_h2d
+            #                 off.d2h_stream = streams.kv_d2h
             if hasattr(self.model, "layers"):
+                first_off = None
                 for layer in self.model.layers:
                     if hasattr(layer, "attention"):
                         off = getattr(layer.attention, "offloader", None)
                         if off is not None:
                             off.h2d_stream = streams.kv_h2d
                             off.d2h_stream = streams.kv_d2h
+                            if first_off is None:
+                                first_off = off
+                # 将 KV Offloader 注入 WSM，启用“忙态暂停写”
+                if first_off is not None and hasattr(self, "weight_streaming_manager"):
+                    try:
+                        self.weight_streaming_manager.kv_offloader = first_off
+                    except Exception:
+                        pass
+
         except Exception as e:
             print(f"[WARN] failed to configure KV streams: {e}")
 
@@ -415,6 +432,8 @@ class LLaMA:
         checkpoints_dir: str,
         load_model: bool = True,
         device: str = "cuda",
+        mode: Optional[str] = None,   # "ssd" | "stream" | "preload" | "full"
+        mode_config: Optional[dict] = None,
         enable_weight_streaming: bool = False,
         streaming_config: Optional[dict] = None,
         enable_preload_mode: bool = False,
@@ -491,17 +510,53 @@ class LLaMA:
 
         llama = LLaMA(tokenizer, checkpoint, cpu_args)
 
-        # ---- Weight loading strategies ----
-        if enable_ssd_streaming and device.startswith("cuda"):
-            # SSD混合流式模式：SSD -> CPU缓存 -> GPU流式传输
-            llama._configure_ssd_streaming(ssd_streaming_config or {})
-        elif enable_preload_mode and device.startswith("cuda"):
-            # 新的预加载模式：先加载几层，然后在推理时预取
-            llama._configure_preload_mode(preload_config or {})
-        elif enable_weight_streaming and device.startswith("cuda"):
-            # 原有的流式加载模式
-            llama._configure_weight_streaming(streaming_config or {})
+        # # ---- Weight loading strategies ----
+        # if enable_ssd_streaming and device.startswith("cuda"):
+        #     # SSD混合流式模式：SSD -> CPU缓存 -> GPU流式传输
+        #     llama._configure_ssd_streaming(ssd_streaming_config or {})
+        # elif enable_preload_mode and device.startswith("cuda"):
+        #     # 新的预加载模式：先加载几层，然后在推理时预取
+        #     llama._configure_preload_mode(preload_config or {})
+        # elif enable_weight_streaming and device.startswith("cuda"):
+        #     # 原有的流式加载模式
+        #     llama._configure_weight_streaming(streaming_config or {})
+        # elif device.startswith("cuda"):
+        # ---- Weight loading strategies (统一入口) ----
+        if mode is not None:
+            m = (mode or "").lower()
+            cfg = mode_config or {}
+            if m == "ssd" and device.startswith("cuda"):
+                llama._configure_ssd_streaming(cfg)
+            elif m == "stream" and device.startswith("cuda"):
+                llama._configure_weight_streaming(cfg)
+            elif m == "preload" and device.startswith("cuda"):
+                llama._configure_preload_mode(cfg)
+            elif m == "full" and device.startswith("cuda"):
+                try:
+                    llama.model = llama.model.to(device)
+                    llama.args.device = device
+                except torch.cuda.OutOfMemoryError:
+                    print("❌ CUDA OOM when moving model. Keeping on CPU...")
+                    device = "cpu"
+                    llama.args.device = "cpu"
+            else:
+                # fallback to old flags
+                if enable_ssd_streaming and device.startswith("cuda"):
+                    llama._configure_ssd_streaming(ssd_streaming_config or {})
+                elif enable_preload_mode and device.startswith("cuda"):
+                    llama._configure_preload_mode(preload_config or {})
+                elif enable_weight_streaming and device.startswith("cuda"):
+                    llama._configure_weight_streaming(streaming_config or {})
+                elif device.startswith("cuda"):
+                    try:
+                        llama.model = llama.model.to(device)
+                        llama.args.device = device
+                    except torch.cuda.OutOfMemoryError:
+                        print("❌ CUDA OOM when moving model. Keeping on CPU...")
+                        device = "cpu"
+                        llama.args.device = "cpu"
         elif device.startswith("cuda"):
+
             # 传统的全量加载模式
             try:
                 llama.model = llama.model.to(device)

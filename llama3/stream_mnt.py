@@ -95,11 +95,15 @@ class Streams:
             self.weight_compute = self.compute_mha
             
     def wait_weight_ready_on_current(self, device: Optional[str] = None):
-        dev = device if device is not None else torch.cuda.current_device()
-        cur = torch.cuda.current_stream(dev)
-        for s in (self.weight_h2d_mha, self.weight_h2d_ffn, self.weight_h2d):
-            if s is not None:
-                cur.wait_stream(s)
+        # ★ 修正：进入 device 上下文再取 current_stream
+        dev = device if device is not None else f"cuda:{torch.cuda.current_device()}"
+        if self.weight_h2d_mha is None and self.weight_h2d_ffn is None and self.weight_h2d is None:
+            return
+        with torch.cuda.device(dev):
+            cur = torch.cuda.current_stream()
+            for s in (self.weight_h2d_mha, self.weight_h2d_ffn, self.weight_h2d):
+                if s is not None:
+                    cur.wait_stream(s)
                 
                 
 # 设备缓存

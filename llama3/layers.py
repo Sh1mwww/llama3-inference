@@ -1,5 +1,3 @@
-
-
 import math
 from typing import Optional, List, Dict
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -182,12 +180,20 @@ class SelfAttention(nn.Module):
         self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, device="cpu")
         self.block_sz = BLOCK
 
+        self.apply_causal_mask = True
+
         streams = None
         try:
             import llama3.stream_mnt as stream_mnt
             streams = stream_mnt.get_streams(args.device)
         except Exception:
             pass  # 回退到内部流创建
+        
+        self.streams = streams
+        self.compute_stream = getattr(streams, "compute_mha", None) or getattr(streams, "weight_compute", None)
+        self.weight_h2d_stream = getattr(streams, "weight_h2d_mha", None) or getattr(streams, "weight_h2d", None)
+        
+        
         
         self.offloader = KVOffloader(
             layers=args.n_layers,
@@ -204,7 +210,9 @@ class SelfAttention(nn.Module):
         self.attention_history = []  # 用于分析注意力模式
         self.qkv_buffer = None
         self.scores_buffer = None
-        self.streams = streams  # 保存streams引用用于compute
+        # self.streams = streams  # 保存streams引用用于compute
+        
+        
         
     
     def _get_modules_dict(self):
@@ -309,11 +317,15 @@ class SelfAttention(nn.Module):
                 self.weight_manager.prefetch_weights([self.layer_id + 1], {self.layer_id + 1: self._next_layer_modules})
         
         # 确保权重H2D传输完成后再开始计算
-        if self.streams and self.streams.weight_h2d:
-            torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_h2d)
+        # if self.streams and self.streams.weight_h2d:
+        if self.weight_h2d_stream:
+            with torch.cuda.device(self.device):
+                torch.cuda.current_stream().wait_stream(self.weight_h2d_stream)
+
 
         # QKV投影 - 使用专门的compute stream
-        compute_stream = self.streams.weight_compute if self.streams else None
+        # compute_stream = self.streams.weight_compute if self.streams else None
+        compute_stream = self.compute_stream
         if compute_stream:
             with torch.cuda.stream(compute_stream):
                 with cuda_timer("attn_us", self.layer_id):
@@ -344,14 +356,15 @@ class SelfAttention(nn.Module):
         for seq_idx in range(seqlen):
             blk_idx   = (start_pos + seq_idx) // self.block_sz
             token_idx =  start_pos + seq_idx
-
-            k_curr = k[:, seq_idx, :, :]
-            v_curr = v[:, seq_idx, :, :]
+            
+            # 保持 batch 维度（即便 bsz==1 也不 squeeze），避免 KVOffloader 错把 heads 当 batch
+            k_curr = k[:, seq_idx, :, :] # (bsz, heads, dim)
+            v_curr = v[:, seq_idx, :, :] # (bsz, heads, dim)
             if bsz == 1:
                 k_curr = k_curr.squeeze(0)  # (heads, dim)
                 v_curr = v_curr.squeeze(0)
-            self.offloader.push(self.layer_id, blk_idx, k_curr, v_curr,
-                        token_idx=token_idx, batch_idx=batch_idx)
+            # self.offloader.push(self.layer_id, blk_idx, k_curr, v_curr,
+            #             token_idx=token_idx, batch_idx=batch_idx)
         # 使用第一个token的位置来计算需要的block
         blk_idx = start_pos // self.block_sz 
         
@@ -360,7 +373,7 @@ class SelfAttention(nn.Module):
         if blk_idx not in blocks:
             blocks.append(blk_idx)
         blocks = sorted(blocks)
-        needed = torch.tensor(blocks, device=x.device)
+        needed = torch.tensor(blocks, device=x.device, dtype=torch.long)
         nvtx.range_push(f"layer_{self.layer_id}_kv_fetch")
         with cuda_timer("kv_fetch_us", self.layer_id):
             fetch_evt_start = torch.cuda.Event(enable_timing=True)
@@ -480,7 +493,7 @@ class SelfAttention(nn.Module):
                 score = float(token_imp[s:e].sum().item()) if s < token_imp.size(0) else 0.0
                 block_scores.append(score)
             
-            self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx= blk_idx)
+            self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx=batch_idx)
 
         # 输出投影 - 使用compute stream
         if compute_stream:
@@ -544,11 +557,16 @@ class FeedForward(nn.Module):
         self._ensure_weights_cuda()
 
         # 确保权重H2D传输完成后再开始计算
-        if self.streams and self.streams.weight_h2d:
-            torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_h2d)
+        # if self.streams and self.streams.weight_h2d:
+        #     torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_h2d)
+        weight_h2d_ffn = getattr(self.streams, "weight_h2d_ffn", None) or getattr(self.streams, "weight_h2d", None)
+        if weight_h2d_ffn:
+            torch.cuda.current_stream(self.device).wait_stream(weight_h2d_ffn)
+
 
         # FFN计算 - 使用compute stream
-        compute_stream = self.streams.weight_compute if self.streams else None
+        # compute_stream = self.streams.weight_compute if self.streams else None
+        compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
         if compute_stream:
             with torch.cuda.stream(compute_stream):
                 with cuda_timer("ffn_us", self.layer_id):
@@ -609,16 +627,16 @@ class EncoderBlock(nn.Module):
             nvtx.range_pop()  # attention
 
             # 确保attention计算完成后再开始FFN (如果使用了compute stream)
-            if self.streams and self.streams.weight_compute:
-                torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_compute)
+            if self.streams and self.streams.compute_mha:
+                torch.cuda.current_stream(self.device).wait_stream(self.streams.compute_mha)
 
             nvtx.range_push(f"layer_{self.layer_id}_ffn")
             out = h + self.feed_forward(self.ffn_norm(h))
             nvtx.range_pop()  # ffn
 
             # 确保FFN计算完成后再返回 (如果使用了compute stream)
-            if self.streams and self.streams.weight_compute:
-                torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_compute)
+            if self.streams and self.streams.compute_ffn:
+                torch.cuda.current_stream(self.device).wait_stream(self.streams.compute_ffn)
 
         nvtx.range_pop()  # layer_forward
 
