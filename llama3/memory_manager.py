@@ -367,7 +367,7 @@ def get_memory_info(device: str = "cuda:0") -> Dict[str, Any]:
 
     
 @dataclass
-class PinnedPoolParans:
+class PinnedPoolParams:
     """来自 RUNTIME.pinned 与 RUNTIME.io 的最小必要参数"""
     WEIGHT_PINNED_BYTES: int         # 例如 32<<30
     EXTENT_BYTES: int                # 例如 2<<20
@@ -401,7 +401,7 @@ class HostPinnedExtentPool:
     - 暴露 chunk 与 extent 的张量视图，供 I/O 层注册/读写
     """
     
-    def __init__(self, params: PinnedPoolParans):
+    def __init__(self, params: PinnedPoolParams):
         self.params = params
         self.lock = threading.Lock()
         
@@ -433,7 +433,7 @@ class HostPinnedExtentPool:
         extent = self.params.EXTENT_BYTES
         if extent % align != 0:
             raise ValueError(f"EXTENT_BYTES({extent}) 必须是 RAW_IO_ALIGN_BYTES({align}) 的整数倍")
-        self._extent: List[ExtentMeta] = []
+        self._extents: List[ExtentMeta] = []
         self._free_eids: List[int] = []            # 空闲 extent 索引列表
         eids = 0
         for cid in range(n_chunks):
@@ -443,7 +443,7 @@ class HostPinnedExtentPool:
             for i in range(n_extents):
                 off = head + i * extent
                 em = ExtentMeta(chunk_id=cid, offset=off, bytes=extent)
-                self._extent.append(em)
+                self._extents.append(em)
                 self._free_eids.append(eids)
                 eids += 1
                 
@@ -488,7 +488,7 @@ class HostPinnedExtentPool:
             if not self._free_eids:
                 raise RuntimeError("PinnedExtentPool: out of pinned extents")     
             eid = self._free_eids.pop()
-            meta = self._extent[eid]
+            meta = self._extents[eid]
             meta.refcnt = 1
             return eid
         
@@ -500,7 +500,7 @@ class HostPinnedExtentPool:
     
     def acquire(self, eid:int):
         with self.lock:
-            meta = self._extent[eid]
+            meta = self._extents[eid]
             if meta.refcnt <= 0:
                 raise RuntimeError(f"acquire extent {eid} with refcnt={meta.refcnt}")
             meta.refcnt += 1
@@ -522,7 +522,7 @@ class HostPinnedExtentPool:
     
     def set_inflight(self, eid:int, read:bool=False, write:bool=False):
         with self.lock:
-            m = self._extent[eid]
+            m = self._extents[eid]
             if read:
                 if m.inflight_read:
                     raise RuntimeError(f"extent {eid} already inflight read")
@@ -545,19 +545,79 @@ class HostPinnedExtentPool:
         
         
     # ---------- 视图/注册 ----------
-    def _chunk_and_offset(self, eid:int) -> Tuple[int,int]:
-        """返回 (chunk_id, offset)"""
-        if eid < 0 or eid >= self._total_extents:
-            raise ValueError(f"invalid extent id {eid}")
-        m = self._extent[eid]
-        return m.chunk_id, m.offset
+    def _chunk_and_offset(self, eid: int) -> Tuple[torch.Tensor, int]:
+        m = self._extents[eid]
+        return self._chunks[m.chunk_id], m.offset
     
     def extent_tensor(self, eid:int) -> torch.tensor:
         """
         返回 uint8 pinned tensor 视图（长度=EXTENT_BYTES，4KiB 对齐）
         """
-        cid, off = self._chunk_and_offset(eid)
-        return cid.narrow(0, off, self._extent[eid].bytes)    
+        t, off = self._chunk_and_offset(eid)
+        return t.narrow(0, off, self._extents[eid].bytes)    
         
+    def slice_view(self, eid: int, offset: int, nbytes: int) -> torch.Tensor:
+        """
+        返回 uint8 pinned tensor 视图（4KiB 对齐）
+        offset/bytes 相对于 extent 起点
+        """
+        if offset < 0 or nbytes < 0 or (offset + nbytes) > self._extents[eid].bytes:
+            raise ValueError("slice_view out of range")
+        cid, off = self._chunk_and_offset(eid)
+        return cid.narrow(0, off + offset, nbytes)
+    
+    def get_registered_chunks(self) -> List[Tuple[torch.Tensor, int ,int]]:
+        """
+        返回需要注册为 fixed buffers 的大块列表：(tensor, head_pad, usable_bytes)
+        I/O 层可以对 (tensor.data_ptr()+head_pad, usable_bytes) 做 REGISTER_BUFFERS。
+        """
+        return list(zip(self._chunks, self._chunk_head_pad, self._chunk_usable_bytes))
+        
+    def get_chunk_ptrs(self) -> List[int]:
+        """返回每块 pinned 张量的起始地址（data_ptr）列表"""
+        return [t.data_ptr() for t in self._chunks]
+    
+    # ---------- 元数据操作（策略用） ----------
+    def set_meta(self, eid: int, **kwargs):
+        m = self._extents[eid]
+        for k, v in kwargs.items():
+            if hasattr(m, k):
+                setattr(m, k, v)
+    
+    def get_meta(self, eid: int) -> ExtentMeta:
+        return self._extents[eid]
+        
+    # ---------- 辅助 ----------
+    def debug_check_alignment(self) -> bool:
+        """
+        逐块检查：extent 起点是否满足 RAW_IO_ALIGN_BYTES 对齐。
+        """
+        align = self.params.RAW_IO_ALIGN_BYTES
+        for eid, m in enumerate(self._extents):
+            base = self._chunks[m.chunk_id].data_ptr()
+            if (base + m.offset) % align != 0:
+                return False
+        return True    
+        
+        
+def create_weight_pinned_pool(RUNTIME, name: str="weights") -> HostPinnedExtentPool:
+    """
+    从 RUNTIME 读取 pinned/io 配置，创建 HostPinnedExtentPool。
+    用法：
+        from llama3.config import load_runtime_config
+        RUNTIME = load_runtime_config()
+        pool = create_weight_pinned_pool(RUNTIME)
+    """
+    pinned = RUNTIME.pinned
+    io = RUNTIME.io
+    params = PinnedPoolParams(
+        WEIGHT_PINNED_BYTES=pinned.WEIGHT_PINNED_BYTES,
+        EXTENT_BYTES=pinned.EXTENT_BYTES,
+        PINNED_REGISTER_CHUNK=pinned.PINNED_REGISTER_CHUNK,
+        PINNED_REGISTER_N=pinned.PINNED_REGISTER_N,
+        RAW_IO_ALIGN_BYTES=io.RAW_IO_ALIGN_BYTES,
+        name=name,
+    )
+    return HostPinnedExtentPool(params)            
         
         

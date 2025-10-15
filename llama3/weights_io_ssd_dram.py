@@ -117,7 +117,28 @@ class DirectIOFile:
                 err = ctypes.get_errno()
                 raise OSError(err, f"pread failed: errno={err} ({os.strerror(err)})")
             return int(ret)
-
+        
+        def fdatasync(self):
+            """确保已写数据持久化到设备（配合 warmup/回写场景使用）"""
+            if self.fd is not None:
+                os.fdatasync(self.fd)
+                
+        def fadvise_dontneed(self, offset: int, length: int):
+            """
+            提示内核丢弃页缓存（非强制）。用于“warmup 用过 buffered，推理前清缓存”的场景。
+            有的平台 libc 可能没有 posix_fadvise，这里容错处理。
+            """
+            try:
+                POSIX_FADV_DONTNEED = 4
+                ret = libc.posix_fadvise(self.fd,
+                                         ctypes.c_longlong(offset),
+                                         ctypes.c_longlong(length),
+                                         ctypes.c_int(POSIX_FADV_DONTNEED))
+                if isinstance(ret, int) and ret != 0:
+                    raise OSError(ret, f"posix_fadvise failed: errno={ret} ({os.strerror(ret)})")
+            except Exception:
+                pass
+            
         def pwrite_from_tensor(self, t: torch.Tensor, nbytes: int, offset: int) -> int:
             if not t.is_pinned():
                 raise ValueError("Tensor is not pinned (pin_memory=True)")

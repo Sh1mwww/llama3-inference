@@ -192,7 +192,43 @@ class ParamStore:
         self._ensure_staging(need_aligned)
         self.dio.pread_into_tensor(self.staging, need_aligned, aligned_off)
         return bytes(self.staging[delta:delta + want_len].cpu().numpy())
+    
+# ========  直接读入 pinned uint8 目标（READ_FIXED 优先） ========
+    def _read_into_pinned_u8(self, dst_u8: torch.Tensor, offset: int, nbytes: int):
+        """
+        将 raw 设备上的 [offset, offset+nbytes) 读入到 dst_u8（必须是 pinned/uint8/contiguous）。
+        对齐则直接 READ_FIXED；不对齐则对齐“包读”到 staging，再拷贝有效字节。
+        返回写入的有效 nbytes。
+        """
+        assert dst_u8.dtype == torch.uint8 and dst_u8.is_pinned() and dst_u8.is_contiguous(), \
+              "dst_u8 must be pinned uint8 contiguous tensor"
+        if nbytes <= 0:
+            return 0
+        bsz = self.bsz
+        aligned = (offset % bsz == 0) and (nbytes % bsz == 0)
+        if aligned:
+            nread = self.dio.pread_into_tensor(dst_u8, nbytes, offset)
+            if nread != nbytes:
+                raise RuntimeError(f"Short read into pinned u8 at offset={offset}: got {nread}, expected {nbytes}")
+            return nread
+        else:
+            # 对齐包读到 staging
+            aligned_off = (offset // bsz) * bsz
+            delta = offset - aligned_off
+            need = delta + nbytes
+            need_aligned = _ceil_to(need, bsz)
 
+            self._ensure_staging(need_aligned)
+            nread = self.dio.pread_into_tensor(self.staging, need_aligned, aligned_off)
+            if nread != need_aligned:
+                raise RuntimeError(f"Short read into staging at offset={aligned_off}: got {nread}, expected {delta + nbytes}")
+
+            # 拷贝有效字节到 dst_u8
+            ctypes.memmove(dst_u8.data_ptr(), self.staging.data_ptr() + delta, nbytes)
+            return nbytes
+        
+
+            
     def fetch_layer(self,
                     layer_id: int,
                     only_stream: bool = False,
@@ -303,6 +339,58 @@ class ParamStore:
                 f"(only_stream={only_stream}, names={names}): {e}"
             ) from e
 
+
+ # ======== 将“单个参数”直接读入 caller 提供的 pinned uint8 ========
+ 
+    def fetch_param_into_pinned_u8(self,
+                                   layer_id: int,
+                                   name: str,
+                                   dst_u8: torch.Tensor) -> int:
+        """
+        按 manifest 的多个 segment，把 layer_id:name 的参数字节连续写入 dst_u8（pinned/uint8）。
+        要求：dst_u8.numel() >= sum(seg.nbytes)。
+        """
+        groups = self.index.get(int(layer_id), {})
+        if name not in groups:
+            return 0
+        segs = groups[name]
+        total = sum(int(s["nbytes"]) for s in segs)
+        assert dst_u8.dtype == torch.uint8 and dst_u8.is_pinned() and dst_u8.is_contiguous(), \
+              "dst_u8 must be pinned uint8 contiguous tensor"
+        if dst_u8.numel() < total:
+            raise ValueError(f"dst_u8 too small for {layer_id}:{name}, need {total}, have {dst_u8.numel()}")
+        
+        cursor = 0
+        for seg in segs:
+            offset = int(seg["offset"])
+            nbytes = int(seg["nbytes"])
+            slice_u8 = dst_u8.narrow(0, cursor, nbytes)
+            self._read_into_pinned_u8(slice_u8, offset, nbytes)
+            cursor += nbytes
+        return cursor
+    
+    
+# ========  将“整层多参数”直接读入 caller 提供的 pinned 目标 ========        
+
+    def fetch_layer_into_pinned(self,
+                                layer_id: int,
+                                plan: Dict[str, torch.Tensor],
+                                only_stream: bool = True):
+        """
+        plan: {param_name: pinned_uint8_tensor}
+        仅对 plan 覆盖的参数执行加载；默认只加载 policy=stream 的参数（与 WSM 一致）。
+        返回 {name: loaded_bytes}
+        """
+        groups = self._groups_for_layer(layer_id, only_stream=only_stream, names=list(plan.keys()))
+        loaded = {}
+        for name, segs in groups.items():
+            dst = plan.get(name)
+            if dst is None:
+                continue
+            n = self.fetch_param_into_pinned_u8(layer_id, name, dst)
+            loaded[name] = n
+        return loaded
+        
     def fetch_layer_async(self,
                           layer_id: int,
                           **kwargs) -> Future:
@@ -468,6 +556,19 @@ class ParamStore:
                 cursor_bytes += nbytes
 
         return matched_pieces, total_pieces
+
+    # ======== 参数分片工具 ========
+    def list_param_segments(self, layer_id: int, name: str):
+        """返回该参数的分片列表（按 manifest 顺序）"""
+        groups = self.index.get(int(layer_id), {})
+        return list(groups.get(name, []))
+
+    def param_total_nbytes(self, layer_id: int, name: str) -> int:
+        """返回该参数所有分片 nbytes 之和"""
+        segs = self.list_param_segments(layer_id, name)
+        if not segs:
+            raise KeyError(f"param not found: L{layer_id}:{name}")
+        return sum(int(s["nbytes"]) for s in segs)
 
     # -------- 与 WeightStreamingManager 集成辅助方法 --------
 
