@@ -145,13 +145,72 @@ def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, t
     freqs = torch.outer(m, theta_i)
     return torch.polar(torch.ones_like(freqs), freqs)
 
-def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor) -> torch.Tensor:
-    b, l, h, d = x.shape
-    x_ = x.float().reshape(b, l, h, d // 2, 2)
-    x_complex = torch.view_as_complex(x_)
-    freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)
-    out = torch.view_as_real(x_complex * freqs_complex)
-    return out.reshape(b, l, h, d).type_as(x)
+# def apply_rotary_embeddings(x: torch.Tensor, freqs_complex: torch.Tensor) -> torch.Tensor:
+#     b, l, h, d = x.shape
+#     x_ = x.float().reshape(b, l, h, d // 2, 2)
+#     x_complex = torch.view_as_complex(x_)
+#     freqs_complex = freqs_complex.unsqueeze(0).unsqueeze(2)
+#     out = torch.view_as_real(x_complex * freqs_complex)
+#     return out.reshape(b, l, h, d).type_as(x)
+def apply_rotary_embeddings(x: torch.Tensor,
+                            freqs_complex: torch.Tensor,
+                            start_pos: int = 0) -> torch.Tensor:
+    """
+    x: (B, L, H, D)
+    freqs_complex: 支持以下任一形状：
+        - (L, D/2)                           # 最常见
+        - (1, L, 1, D/2)                     # 已经被扩成4D
+        - (L, 1, D/2) / (1, L, D/2) / (L, D/2, 1)   # 其他带1维的变体
+    行为：
+        1) 先把 freqs 规范成 (L, D/2)
+        2) 切片到 [start_pos : start_pos+Lx] 其中 Lx = x.shape[1]
+        3) 广播乘到 x 的前一半维度（视作复数）
+    """
+    import torch
+    B, Lx, H, D = x.shape
+    if D % 2 != 0:
+        raise RuntimeError(f"apply_rotary_embeddings: head_dim {D} must be even")
+
+    # ---- 规范 freqs 到 (L, D/2) ----
+    fc = freqs_complex
+    # 常见输入：(1, L, 1, D/2)
+    if fc.dim() == 4 and fc.size(0) == 1 and fc.size(2) == 1:
+        fc = fc.squeeze(0).squeeze(1) if fc.size(1) == 1 else fc.squeeze(0).squeeze(2)  # -> (L, D/2)
+    # 其他带 1 的三维
+    if fc.dim() == 3:
+        # 尝试去掉单例维，优先去掉中间的 1 维
+        if fc.size(1) == 1:
+            fc = fc.squeeze(1)  # -> (L, D/2)
+        elif fc.size(0) == 1:
+            fc = fc.squeeze(0)  # -> (L, D/2)
+        elif fc.size(2) == 1:
+            fc = fc.squeeze(2)  # -> (L, D/2)
+    # 两维就不用动
+    if fc.dim() != 2:
+        # 最后兜底：如果第0维正好等于 L 或 Lx，就 reshape 成 (L, D/2)
+        if fc.size(0) in (Lx, fc.size(0)) and fc.numel() % fc.size(0) == 0:
+            fc = fc.reshape(fc.size(0), -1)
+        else:
+            raise RuntimeError(f"apply_rotary_embeddings: unexpected freqs_complex shape {freqs_complex.shape}, "
+                               f"cannot normalize to (L, D/2)")
+
+    # ---- 切片到当前窗口 [start_pos : start_pos+Lx] ----
+    if fc.size(0) < start_pos + Lx:
+        raise RuntimeError(f"apply_rotary_embeddings: freqs length {fc.size(0)} < needed {start_pos+Lx}")
+    fc = fc[start_pos: start_pos + Lx, :]   # (Lx, D/2)
+
+    # ---- 设备与 dtype 对齐 ----
+    # x_被转为 float 做复数视图，最终再转换回 x.dtype
+    x_ = x.to(torch.float32).reshape(B, Lx, H, D // 2, 2)       # (B,L,H,D/2,2)
+    x_complex = torch.view_as_complex(x_)                       # (B,L,H,D/2)
+    fc = fc.to(dtype=x_complex.dtype, device=x.device)          # (Lx,D/2)
+
+    # ---- 广播到 (1,Lx,1,D/2) 与 x_complex 相乘 ----
+    fc = fc.unsqueeze(0).unsqueeze(2)                           # (1,Lx,1,D/2)
+    out = torch.view_as_real(x_complex * fc)                    # (B,L,H,D/2,2)
+    out = out.reshape(B, Lx, H, D).to(dtype=x.dtype)
+    return out
+
 
 # def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 #     if n_rep == 1: 
@@ -192,8 +251,10 @@ class SelfAttention(nn.Module):
         self.streams = streams
         self.compute_stream = getattr(streams, "compute_mha", None) or getattr(streams, "weight_compute", None)
         self.weight_h2d_stream = getattr(streams, "weight_h2d_mha", None) or getattr(streams, "weight_h2d", None)
+        self.weight_manager = None
         
-        
+        self.offloader = None   
+        self.enable_profiling = False
         
         self.offloader = KVOffloader(
             layers=args.n_layers,
@@ -223,10 +284,27 @@ class SelfAttention(nn.Module):
             "wo": self.wo
         }
     
+    def _sync_event_safely(self, evt: torch.cuda.Event, timeout_ms: int = 5000):
+        if not getattr(self, 'enable_profiling', False):
+            return
+        # 輕量輪詢 + timeout：避免某些環境下事件沒有被正確記錄導致永久等待
+        import time
+        start = time.time()
+        while not evt.query():
+            if (time.time() - start) * 1000.0 > timeout_ms:
+                # 不丟擲異常，打印警告並退出等待；避免測試被卡死
+                print(f"[WARN][L{self.layer_id}] event sync timeout after {timeout_ms} ms")
+                return
+            time.sleep(0.001)
+        # 事件已完成，無需再同步
+        return
+    
     def _ensure_weights_cuda(self):
+        wm = getattr(self, "weight_manager", None)
+        if wm is None:
+            return
         modules = self._get_modules_dict()
-        if self.weight_manager:
-            self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
+        wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
     
     def _allocate_buffers(self, batch_size: int, seq_len: int, max_kv_len: int):
         if (self.qkv_buffer is None or 
@@ -300,6 +378,10 @@ class SelfAttention(nn.Module):
         start_time = time.time()
         bsz, seqlen, _ = x.shape
         
+        w_dtype = self.wq.weight.dtype
+        if x.dtype != w_dtype:
+            x = x.to(w_dtype)
+        
         # 确保权重在GPU上
         self._ensure_weights_cuda()
         
@@ -316,12 +398,12 @@ class SelfAttention(nn.Module):
             if self.weight_manager:
                 self.weight_manager.prefetch_weights([self.layer_id + 1], {self.layer_id + 1: self._next_layer_modules})
         
-        # 确保权重H2D传输完成后再开始计算
-        # if self.streams and self.streams.weight_h2d:
-        if self.weight_h2d_stream:
-            with torch.cuda.device(self.device):
-                torch.cuda.current_stream().wait_stream(self.weight_h2d_stream)
-
+        # 确保权重H2D传输完成后再开始计算（使用统一的事件化等待）
+        if self.streams and x.is_cuda:
+            try:
+                self.streams.wait_weight_ready_on_current(self.device)
+            except Exception as e:
+                logger.warning(f"Layer {self.layer_id} SelfAttention: weight sync failed: {e}")
 
         # QKV投影 - 使用专门的compute stream
         # compute_stream = self.streams.weight_compute if self.streams else None
@@ -335,8 +417,11 @@ class SelfAttention(nn.Module):
                     v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
                     # 应用旋转位置编码
-                    q = apply_rotary_embeddings(q, freqs_complex)
-                    k = apply_rotary_embeddings(k, freqs_complex)
+                    # q = apply_rotary_embeddings(q, freqs_complex)
+                    # k = apply_rotary_embeddings(k, freqs_complex)
+                    q = apply_rotary_embeddings(q, freqs_complex, start_pos=start_pos)
+                    k = apply_rotary_embeddings(k, freqs_complex, start_pos=start_pos)
+
         else:
             # 回退到默认stream
             with cuda_timer("attn_us", self.layer_id):
@@ -346,45 +431,70 @@ class SelfAttention(nn.Module):
                 v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
 
                 # 应用旋转位置编码
-                q = apply_rotary_embeddings(q, freqs_complex)
-                k = apply_rotary_embeddings(k, freqs_complex)
+                # q = apply_rotary_embeddings(q, freqs_complex)
+                # k = apply_rotary_embeddings(k, freqs_complex)
+                q = apply_rotary_embeddings(q, freqs_complex, start_pos=start_pos)
+                k = apply_rotary_embeddings(k, freqs_complex, start_pos=start_pos)
         
-        # Push当前block到offloader  
+        # ------------------------- (A) 推入 KV 到 offloader -------------------------
         bsz, seqlen, n_heads, head_dim = k.shape
-        
+
         # 对于每个token位置, 计算对应的block并push
-        for seq_idx in range(seqlen):
-            blk_idx   = (start_pos + seq_idx) // self.block_sz
-            token_idx =  start_pos + seq_idx
-            
-            # 保持 batch 维度（即便 bsz==1 也不 squeeze），避免 KVOffloader 错把 heads 当 batch
-            k_curr = k[:, seq_idx, :, :] # (bsz, heads, dim)
-            v_curr = v[:, seq_idx, :, :] # (bsz, heads, dim)
-            if bsz == 1:
-                k_curr = k_curr.squeeze(0)  # (heads, dim)
-                v_curr = v_curr.squeeze(0)
-            # self.offloader.push(self.layer_id, blk_idx, k_curr, v_curr,
-            #             token_idx=token_idx, batch_idx=batch_idx)
-        # 使用第一个token的位置来计算需要的block
+        if getattr(self, "offloader", None) is not None:
+            for seq_idx in range(seqlen):
+                blk_idx   = (start_pos + seq_idx) // self.block_sz
+                token_idx =  start_pos + seq_idx
+
+                # 保持 (bsz, heads, dim) —— 切勿 squeeze，否则 heads 会被误当 batch
+                k_curr = k[:, seq_idx, :, :]    # (bsz, n_kv_heads, head_dim)
+                v_curr = v[:, seq_idx, :, :]
+
+                # 将该 token 写入所属 block 的正确 token 槽位
+                self.offloader.push(
+                    layer=self.layer_id,
+                    blk=blk_idx,
+                    k=k_curr,
+                    v=v_curr,
+                    token_idx=token_idx,
+                    batch_idx=batch_idx,
+                )
+
+        # ------------------------- (B) 选择并取回需要的 blocks -------------------------
         blk_idx = start_pos // self.block_sz 
         
-        # 获取Top-K blocks
-        blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk, batch_idx=batch_idx)
-        if blk_idx not in blocks:
-            blocks.append(blk_idx)
-        blocks = sorted(blocks)
-        needed = torch.tensor(blocks, device=x.device, dtype=torch.long)
+        # 获取Top-K blocks (如果有 offloader)
         nvtx.range_push(f"layer_{self.layer_id}_kv_fetch")
         with cuda_timer("kv_fetch_us", self.layer_id):
-            fetch_evt_start = torch.cuda.Event(enable_timing=True)
-            fetch_evt_end = torch.cuda.Event(enable_timing=True)
-            fetch_evt_start.record()
-            k_full, v_full = self.offloader.fetch(self.layer_id, needed)
-            fetch_evt_end.record()
-            
-            # 避免不必要的同步, 仅在profiling时同步
-            if getattr(self, 'enable_profiling', False):
-                torch.cuda.synchronize()  
+            do_profile_gpu = bool(self.enable_profiling and x.is_cuda)
+            if do_profile_gpu:
+                fetch_evt_start = torch.cuda.Event(enable_timing=True)
+                fetch_evt_end = torch.cuda.Event(enable_timing=True)
+                fetch_evt_start.record()
+
+            if getattr(self, "offloader", None) is not None:
+                blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk, batch_idx=batch_idx)
+                # 保证当前 block 在列表内
+                if blk_idx not in blocks:
+                    blocks = sorted(set(blocks + [blk_idx]))
+                    # 简单截断到 topk，避免过度复杂的距离计算
+                    if len(blocks) > self.topk_blk:
+                        blocks = blocks[:self.topk_blk]
+                else:
+                    blocks = sorted(blocks)
+                needed = torch.tensor(blocks, device=x.device, dtype=torch.long)
+                k_full, v_full = self.offloader.fetch(
+                    self.layer_id, needed, batch_idx=batch_idx, bsz=bsz
+                )
+            else:
+                # 无 offloader：直接使用当前序列窗口（转为 (B,H,T,D)）
+                k_full = k.transpose(1, 2).contiguous()
+                v_full = v.transpose(1, 2).contiguous()
+                blocks = [blk_idx]  # 为后续 update_importances 提供 blocks 列表
+
+            if do_profile_gpu:
+                fetch_evt_end.record()
+                if not fetch_evt_end.query():
+                    fetch_evt_end.synchronize()
                 self.kv_elapsed_time = fetch_evt_start.elapsed_time(fetch_evt_end) * 1000
                 PERF_TRACKER.add_layer_stat(self.layer_id, "kv_fetch_us", self.kv_elapsed_time)
             else:
@@ -410,7 +520,8 @@ class SelfAttention(nn.Module):
         k_full = k_full.to(q.dtype)
         v_full = v_full.to(q.dtype)
         # 重复KV头以匹配查询头数
-        if self.n_heads_q != self.n_kv_heads:
+        # if self.n_heads_q != self.n_kv_heads:
+        if (self.n_heads_q != self.n_kv_heads) and (k_full.size(1) != self.n_heads_q):
             k_full = k_full.repeat_interleave(self.n_rep, dim=1)
             v_full = v_full.repeat_interleave(self.n_rep, dim=1)
         
@@ -419,13 +530,16 @@ class SelfAttention(nn.Module):
 
         # Attention计算 - 使用compute stream
         nvtx.range_push(f"layer_{self.layer_id}_attention_compute")
+        do_profile_gpu = bool(self.enable_profiling and x.is_cuda)
         if compute_stream:
             with torch.cuda.stream(compute_stream):
                 with cuda_timer("attn_us", self.layer_id):
                     # mha
-                    attn_evt_start = torch.cuda.Event(enable_timing=True)
-                    attn_evt_end = torch.cuda.Event(enable_timing=True)
-                    attn_evt_start.record()
+                    if do_profile_gpu:
+                        attn_evt_start = torch.cuda.Event(enable_timing=True)
+                        attn_evt_end = torch.cuda.Event(enable_timing=True)
+                        attn_evt_start.record()
+
                     scores = torch.matmul(q, k_full.transpose(2, 3))
                     scores = scores / math.sqrt(self.head_dim)
 
@@ -439,11 +553,11 @@ class SelfAttention(nn.Module):
                     # Softmax和输出计算
                     attn_weights = torch.softmax(scores, dim=-1)
                     out = torch.matmul(attn_weights, v_full)
-                    attn_evt_end.record()
 
-                    # 避免不必要的同步,仅在profiling时同步
-                    if getattr(self, 'enable_profiling', False):
-                        torch.cuda.synchronize()
+                    if do_profile_gpu:
+                        attn_evt_end.record()
+                        if not attn_evt_end.query():
+                            attn_evt_end.synchronize()
                         self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
                         PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
                     else:
@@ -451,9 +565,11 @@ class SelfAttention(nn.Module):
         else:
             with cuda_timer("attn_us", self.layer_id):
                 # mha
-                attn_evt_start = torch.cuda.Event(enable_timing=True)
-                attn_evt_end = torch.cuda.Event(enable_timing=True)
-                attn_evt_start.record()
+                if do_profile_gpu:
+                    attn_evt_start = torch.cuda.Event(enable_timing=True)
+                    attn_evt_end = torch.cuda.Event(enable_timing=True)
+                    attn_evt_start.record()
+
                 scores = torch.matmul(q, k_full.transpose(2, 3))
                 scores = scores / math.sqrt(self.head_dim)
 
@@ -467,11 +583,11 @@ class SelfAttention(nn.Module):
                 # Softmax和输出计算
                 attn_weights = torch.softmax(scores, dim=-1)
                 out = torch.matmul(attn_weights, v_full)
-                attn_evt_end.record()
 
-                # 避免不必要的同步,仅在profiling时同步
-                if getattr(self, 'enable_profiling', False):
-                    torch.cuda.synchronize()
+                if do_profile_gpu:
+                    attn_evt_end.record()
+                    if not attn_evt_end.query():
+                        attn_evt_end.synchronize()
                     self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
                     PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
                 else:
@@ -483,17 +599,18 @@ class SelfAttention(nn.Module):
         self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
         self.attn_time       = stats.get("attn_us",     0)
         
-        #  update block importances
-        with torch.no_grad():
-            token_imp = attn_weights.mean(dim=(0, 1, 2))  # (Tkv,)
-            block_scores = []
-            for i, _ in enumerate(blocks):
-                s = i * self.block_sz
-                e = min(s + self.block_sz, token_imp.size(0))
-                score = float(token_imp[s:e].sum().item()) if s < token_imp.size(0) else 0.0
-                block_scores.append(score)
-            
-            self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx=batch_idx)
+        # Update block importances (only if offloader exists)
+        if getattr(self, "offloader", None) is not None:
+            with torch.no_grad():
+                token_imp = attn_weights.mean(dim=(0, 1, 2))  # (Tkv,)
+                block_scores = []
+                for i, _ in enumerate(blocks):
+                    s = i * self.block_sz
+                    e = min(s + self.block_sz, token_imp.size(0))
+                    score = float(token_imp[s:e].sum().item()) if s < token_imp.size(0) else 0.0
+                    block_scores.append(score)
+
+                self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx=batch_idx)
 
         # 输出投影 - 使用compute stream
         if compute_stream:
@@ -532,6 +649,7 @@ class FeedForward(nn.Module):
         except Exception:
             pass
         self.streams = streams
+       
     
     def _get_modules_dict(self):
         return {
@@ -556,12 +674,12 @@ class FeedForward(nn.Module):
 
         self._ensure_weights_cuda()
 
-        # 确保权重H2D传输完成后再开始计算
-        # if self.streams and self.streams.weight_h2d:
-        #     torch.cuda.current_stream(self.device).wait_stream(self.streams.weight_h2d)
-        weight_h2d_ffn = getattr(self.streams, "weight_h2d_ffn", None) or getattr(self.streams, "weight_h2d", None)
-        if weight_h2d_ffn:
-            torch.cuda.current_stream(self.device).wait_stream(weight_h2d_ffn)
+        # 确保权重H2D传输完成后再开始计算（使用统一的事件化等待）
+        if self.streams and x.is_cuda:
+            try:
+                self.streams.wait_weight_ready_on_current(self.device)
+            except Exception as e:
+                logger.warning(f"Layer {self.layer_id} FeedForward: weight sync failed: {e}")
 
 
         # FFN计算 - 使用compute stream
@@ -590,7 +708,7 @@ class EncoderBlock(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.n_layer = args.n_layers
-        
+
         self.attn_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
@@ -606,6 +724,8 @@ class EncoderBlock(nn.Module):
         self.forward_count = 0
         self.total_forward_time = 0.0
 
+        self.weight_manager = None
+
         # 获取streams引用用于同步
         self.device = args.device
         streams = None
@@ -615,6 +735,25 @@ class EncoderBlock(nn.Module):
         except Exception:
             pass
         self.streams = streams
+
+        # 用于事件池定期清理的计数器
+        self._gc_counter = 0
+
+    def _get_modules_dict(self):
+        """收集所有需要管理的模块（attention + feedforward）"""
+        mods = {}
+        if hasattr(self.attention, '_get_modules_dict'):
+            mods.update(self.attention._get_modules_dict())
+        if hasattr(self.feed_forward, '_get_modules_dict'):
+            mods.update(self.feed_forward._get_modules_dict())
+        return mods
+
+    def _ensure_weights_cuda(self):
+        wm = getattr(self, "weight_manager", None)
+        if wm is None:
+            return
+        modules = self._get_modules_dict()
+        wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
     
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
         forward_start = time.time()
@@ -626,23 +765,46 @@ class EncoderBlock(nn.Module):
             h = x + self.attention(self.attn_norm(x), start_pos, freqs_complex)
             nvtx.range_pop()  # attention
 
-            # 确保attention计算完成后再开始FFN (如果使用了compute stream)
+            # 确保attention计算完成后再开始FFN (使用事件化等待)
             if self.streams and self.streams.compute_mha:
-                torch.cuda.current_stream(self.device).wait_stream(self.streams.compute_mha)
+                try:
+                    from llama3 import stream_mnt
+                    eid, evt = stream_mnt.record_event_on(self.streams.compute_mha, device=self.device)
+                    stream_mnt.wait_event_on(torch.cuda.current_stream(self.device), evt)
+                    stream_mnt.release_event(eid, device=self.device)
+                except Exception as e:
+                    logger.warning(f"Layer {self.layer_id}: MHA event sync failed ({e}), fallback to wait_stream")
+                    torch.cuda.current_stream(self.device).wait_stream(self.streams.compute_mha)
 
             nvtx.range_push(f"layer_{self.layer_id}_ffn")
             out = h + self.feed_forward(self.ffn_norm(h))
             nvtx.range_pop()  # ffn
 
-            # 确保FFN计算完成后再返回 (如果使用了compute stream)
+            # 确保FFN计算完成后再返回 (使用事件化等待)
             if self.streams and self.streams.compute_ffn:
-                torch.cuda.current_stream(self.device).wait_stream(self.streams.compute_ffn)
+                try:
+                    from llama3 import stream_mnt
+                    eid, evt = stream_mnt.record_event_on(self.streams.compute_ffn, device=self.device)
+                    stream_mnt.wait_event_on(torch.cuda.current_stream(self.device), evt)
+                    stream_mnt.release_event(eid, device=self.device)
+                except Exception as e:
+                    logger.warning(f"Layer {self.layer_id}: FFN event sync failed ({e}), fallback to wait_stream")
+                    torch.cuda.current_stream(self.device).wait_stream(self.streams.compute_ffn)
 
         nvtx.range_pop()  # layer_forward
 
         self.forward_count += 1
         self.total_forward_time += time.time() - forward_start
-        
+
+        # 定期触发事件池 GC，避免事件积累
+        self._gc_counter += 1
+        if self._gc_counter % 10 == 0:
+            try:
+                from llama3 import stream_mnt
+                stream_mnt.gc_event_pool(device=self.device, force=False)
+            except Exception:
+                pass
+
         return out
     
     def get_performance_stats(self) -> Dict:

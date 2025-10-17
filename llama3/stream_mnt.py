@@ -1,7 +1,7 @@
 import torch
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 
 # 说明：
 # - 设备常见仅支持两级优先级（-1=高，0=普通）。原文件里使用 priority=1 可能越界导致创建失败，
@@ -25,47 +25,78 @@ def _make_stream(device: str, priority: int) -> Optional[torch.cuda.Stream]:
 
 
 class _EventPool:
+    """
+    改进的事件池：使用 ID 追踪，自动释放已完成事件，避免内存泄漏。
+    - record_on() 返回 (event_id, event) 元组
+    - release(event_id) 在等待完成后调用，将事件归还到池中
+    - gc() 批量回收已完成但未显式释放的事件
+    """
     def __init__(self, device: str):
         self.device = device
         self._free: list[torch.cuda.Event] = []
-        self._pending: list[torch.cuda.Event] = []
+        self._pending: dict[int, torch.cuda.Event] = {}  # 改用 dict 追踪
+        self._next_id = 0
 
     def _new_event(self) -> torch.cuda.Event:
         with torch.cuda.device(self.device):
             return torch.cuda.Event(enable_timing=False, blocking=False, interprocess=False)
-    
+
     def acquire(self) -> torch.cuda.Event:
         if self._free:
             return self._free.pop()
         return self._new_event()
-    
-    def record_on(self, stream: torch.cuda.Stream) -> torch.cuda.Event:
+
+    def record_on(self, stream: torch.cuda.Stream) -> tuple[int, torch.cuda.Event]:
+        """
+        在指定流上记录事件，返回 (event_id, event)。
+        调用方应在等待完成后调用 release(event_id)。
+        """
         event = self.acquire()
         with torch.cuda.device(self.device):
             event.record(stream)
-        self._pending.append(event)
-        return event
 
-    def release(self, event: torch.cuda.Event):
-        if event.query():
+        event_id = self._next_id
+        self._next_id += 1
+        self._pending[event_id] = event
+        return event_id, event
+
+    def release(self, event_id: int):
+        """
+        释放事件 ID。如果事件已完成，归还到空闲池；否则丢弃让 CUDA 自动清理。
+        """
+        if event_id not in self._pending:
+            return
+        event = self._pending.pop(event_id)
+        if event.query():  # 已完成
             self._free.append(event)
-        else:
-            self._pending.append(event)
+        # 如果未完成，直接丢弃（CUDA 会在事件销毁时自动处理）
 
-    def gc(self, limit: int = 64) -> int :
-        """尝试将已完成的 pending 事件回收到 free；limit 控制每次检查数量"""
+    def gc(self, force: bool = False) -> int:
+        """
+        批量回收已完成的 pending 事件。
+        - force=False: 只回收前 64 个
+        - force=True: 回收所有已完成事件
+        返回回收的事件数量。
+        """
         if not self._pending:
             return 0
+
         count = 0
-        remaining = []
-        for event in self._pending[:limit]:
-            if event.query():
-                self._free.append(event)
+        to_remove = []
+        items = list(self._pending.items())
+        check_limit = len(items) if force else min(64, len(items))
+
+        for i, (eid, evt) in enumerate(items):
+            if i >= check_limit:
+                break
+            if evt.query():
+                self._free.append(evt)
+                to_remove.append(eid)
                 count += 1
-            else:
-                remaining.append(event)
-        remaining.extend(self._pending[limit:])
-        self._pending = remaining
+
+        for eid in to_remove:
+            self._pending.pop(eid)
+
         return count
 
 
@@ -95,10 +126,13 @@ class Streams:
             self.weight_compute = self.compute_mha
             
     def wait_weight_ready_on_current(self, device: Optional[str] = None):
-        # ★ 修正：进入 device 上下文再取 current_stream
-        dev = device if device is not None else f"cuda:{torch.cuda.current_device()}"
+        # 仅在 GPU 上进行流同步
+        if not torch.cuda.is_available():
+            return
         if self.weight_h2d_mha is None and self.weight_h2d_ffn is None and self.weight_h2d is None:
             return
+        # ★ 修正：进入 device 上下文再取 current_stream
+        dev = device if device is not None else f"cuda:{torch.cuda.current_device()}"
         with torch.cuda.device(dev):
             cur = torch.cuda.current_stream()
             for s in (self.weight_h2d_mha, self.weight_h2d_ffn, self.weight_h2d):
@@ -190,23 +224,29 @@ def clear_streams_cache():
     _event_pools.clear()
     
 # ---------- 事件工具（供各层/WSM 使用） ----------
-def record_event_on(store: Dict[Any, torch.cuda.Event],
-                    key : Any,
-                    stream: torch.cuda.Stream,
-                    device: Optional[str] = None) -> Optional[torch.cuda.Event]:
+def record_event_on(stream: torch.cuda.Stream,
+                    device: Optional[str] = None) -> tuple[int, torch.cuda.Event]:
     """
-    在指定 stream 上记录事件，并保存到 store[key]。
+    在指定 stream 上记录事件，返回 (event_id, event)。
     - device 未提供时，使用当前设备。
-    - 事件记录后加入 pending 集，待 gc() 完成再回收。
+    - 调用方需在等待完成后调用 release_event(event_id, device)。
+
+    示例：
+        eid, evt = record_event_on(some_stream)
+        current_stream.wait_event(evt)
+        release_event(eid)
     """
     dev = device if device is not None else f"cuda:{torch.cuda.current_device()}"
     pool = _get_event_pool(dev)
-    evt = pool.record_on(stream)
-    if store is not None:
-        if not isinstance(store, dict):
-            raise ValueError("store must be a dict or None")
-        store[key] = evt
-    return evt
+    return pool.record_on(stream)
+
+def release_event(event_id: int, device: Optional[str] = None):
+    """
+    释放事件 ID，将事件归还到池中。
+    """
+    dev = device if device is not None else f"cuda:{torch.cuda.current_device()}"
+    pool = _get_event_pool(dev)
+    pool.release(event_id)
 
 def wait_event_on(stream: torch.cuda.Stream,
                   evt: Optional[torch.cuda.Event]):
@@ -214,7 +254,18 @@ def wait_event_on(stream: torch.cuda.Stream,
     if evt is None:
         return
     stream.wait_event(evt)
-    
+
+def gc_event_pool(device: Optional[str] = None, force: bool = False) -> int:
+    """
+    触发事件池的垃圾回收。
+    - device: 指定设备，默认使用当前设备
+    - force: 是否强制回收所有已完成事件
+    返回回收的事件数量。
+    """
+    dev = device if device is not None else f"cuda:{torch.cuda.current_device()}"
+    pool = _get_event_pool(dev)
+    return pool.gc(force=force)
+
 # ---------- 默认流禁用：提供显式 on_stream 语法糖 ----------
 class on_stream:
     """

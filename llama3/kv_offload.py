@@ -1,6 +1,6 @@
 from __future__ import annotations
 import threading, time, collections
-from queue import Empty, Queue
+from queue import Empty, Queue, Full
 from typing import List, Iterable, Tuple, Union
 import numpy as np
 import torch
@@ -56,9 +56,15 @@ class KVOffloader:
             self.h2d_stream = torch.cuda.Stream(device=device, priority=0) if device.startswith("cuda") else None
             self.d2h_stream = torch.cuda.Stream(device=device, priority=+1) if device.startswith("cuda") else None
 
-        # bytes accounting (K+V)
-        self.token_nbytes = (max_batch * heads * dim) * dtype_bytes * 2
-        self.block_nbytes = self.token_nbytes * BLOCK   # ★ 修正：乘以 BLOCK（一个 block 的 token 数）
+        # bytes accounting (K+V) -- use a smaller sizing batch for DRAM quota estimation
+        # 使用较小的 sizing batch 用于 DRAM 配额估算
+        # 真实 decode 时 batch 常远小于 max_batch，用 max_batch 估算会过于悲观
+        alloc_bsz = int(getattr(KVCacheArgs, "dram_sizing_batch", 8))
+        alloc_bsz = max(1, min(max_batch, alloc_bsz))
+        self.token_nbytes = (alloc_bsz * heads * dim) * dtype_bytes * 2
+        self.block_nbytes = self.token_nbytes * BLOCK   # bytes per block (K+V)
+
+        # 注意：数据结构仍使用 max_batch（self.k_cpu/v_cpu），这里只改配额计算
 
         # SSD backend
         try:
@@ -78,7 +84,25 @@ class KVOffloader:
         self.on_ssd = [[False] * self.n_blocks for _ in range(layers)]
 
         # DRAM capacity (in blocks)
-        self.dram_limit_blk = int(KVCacheArgs.dram_limit_gb * (1024**3) // self.block_nbytes)
+        # self.dram_limit_blk = int(KVCacheArgs.dram_limit_gb * (1024**3) // self.block_nbytes)
+        # DRAM capacity in blocks (based on KVCacheArgs.dram_limit_gb), with a safety margin
+        _dram_bytes = int(KVCacheArgs.dram_limit_gb * (1024**3))
+        _safety = int(0.25 * _dram_bytes)  # 25% safety margin
+        self.dram_limit_blk = max(0, (_dram_bytes - _safety) // self.block_nbytes)
+
+        # 打印配额计算信息
+        print(f"[KVOffloader] DRAM quota estimation:")
+        print(f"  - Sizing batch: {alloc_bsz} (actual max_batch: {max_batch})")
+        print(f"  - Block size: {self.block_nbytes / (1024**2):.2f} MB")
+        print(f"  - DRAM limit: {self.dram_limit_blk} blocks ({self.dram_limit_blk * self.block_nbytes / (1024**3):.2f} GB)")
+
+        if self.dram_limit_blk == 0:
+            print("[KVOffloader][WARN] dram_limit_blk computed as 0; consider increasing KVCacheArgs.dram_limit_gb")
+
+        # --- SSD writer throttle (thread-safe flag) ---
+        self._throttle_lock = threading.Lock()
+        self._pause_write_until = 0.0  # monotonic seconds
+
 
         # global tracker
         self.global_tracker = get_global_tracker()
@@ -92,7 +116,7 @@ class KVOffloader:
             maxsize=getattr(KVCacheArgs, "RAW_IO_QD_WRITE", 24)
         )
         self._writer_stop = threading.Event()   # ★ 统一命名：_writer_stop
-        self._pause_write_until: float = 0.0
+        # self._pause_write_until: float = 0.0
         self._win_ms = getattr(KVCacheArgs, "IO_RAW_THROTTLE_MS", 30)
         self._write_target_bps = int(getattr(KVCacheArgs, "NVME_WRITE_TARGET_MBPS", 900) * 1024 * 1024)
         self._win_bytes = collections.deque()
@@ -234,16 +258,11 @@ class KVOffloader:
             kv_pack_cpu = torch.cat(
                 [self.k_cpu[layer][blk], self.v_cpu[layer][blk]], dim=-1
             ).contiguous()
+            # 改用阻塞式 put，避免轻易丢块（保留超时告警）
             try:
-                self._write_queue.put_nowait((layer, blk, kv_pack_cpu))
-            except Exception:
-                # Queue full: sleep briefly to avoid blocking compute
-                # 队列满：短暂休眠以避免阻塞计算
-                time.sleep(0.001)
-                try:
-                    self._write_queue.put_nowait((layer, blk, kv_pack_cpu))
-                except Exception as e:
-                    print(f"[KV][WARN] drop mirror write @L{layer} B{blk}: {e}")
+                self._write_queue.put((layer, blk, kv_pack_cpu), timeout=1.0)
+            except Full:
+                print(f"[KV][WARN] write queue full for 1.0s, drop mirror @L{layer} B{blk}")
         
         
         
@@ -570,6 +589,18 @@ class KVOffloader:
         self.k_cpu[L][B].copy_(k_gpu.cpu())
         self.v_cpu[L][B].copy_(v_gpu.cpu())
         self.on_ssd[L][B] = False
+
+
+    def throttle_writes_for(self, ms: int):
+        """Externally pause SSD writes for 'ms' milliseconds (thread-safe)."""
+        until = time.monotonic() + (ms / 1000.0)
+        with self._throttle_lock:
+            self._pause_write_until = max(self._pause_write_until, until)
+
+    def _should_pause_writes(self) -> bool:
+        with self._throttle_lock:
+            return time.monotonic() < self._pause_write_until
+
 
     # ---------------- global tracker helpers -----------------
     def set_current_execution(self, batch_idx: int, layer_idx: int):

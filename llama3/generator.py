@@ -59,8 +59,8 @@ class LLaMA:
         print(f"[INFO] Moving model to {args.device}...")
         self.model = self.model.to(args.device)
 
-        print(f"[INFO] Converting to half precision...")
-        self.model = self.model.half()
+        # print(f"[INFO] Converting to half precision...")
+        # self.model = self.model.half()
 
         if checkpoint is not None:
             print(f"[INFO] Loading state dict...")
@@ -535,6 +535,8 @@ class LLaMA:
                 try:
                     llama.model = llama.model.to(device)
                     llama.args.device = device
+                    # 仅当已经在 CUDA 上，才进行半精度转换
+                    llama.model = llama.model.half()
                 except torch.cuda.OutOfMemoryError:
                     print("❌ CUDA OOM when moving model. Keeping on CPU...")
                     device = "cpu"
@@ -551,6 +553,8 @@ class LLaMA:
                     try:
                         llama.model = llama.model.to(device)
                         llama.args.device = device
+                        # 传统全量加载模式下，GPU 就绪后再 half
+                        llama.model = llama.model.half()
                     except torch.cuda.OutOfMemoryError:
                         print("❌ CUDA OOM when moving model. Keeping on CPU...")
                         device = "cpu"
@@ -561,6 +565,8 @@ class LLaMA:
             try:
                 llama.model = llama.model.to(device)
                 llama.args.device = device
+                # 默认路径：GPU 上再 half
+                llama.model = llama.model.half()
             except torch.cuda.OutOfMemoryError:
                 print("❌ CUDA OOM when moving model. Keeping on CPU...")
                 device = "cpu"
@@ -812,6 +818,24 @@ class LLaMA:
             print(f"[INFO] KV profile saved → {save_name}")
 
         return out_tokens, out_text
+
+    def _integrate_wsm_to_layers(self, wsm, streams):
+        """把 weight_manager / streams 注入到每一层（attn/ffn），并设置 layer_id。"""
+        if not hasattr(self.model, "layers"):
+            return
+        for lid, block in enumerate(self.model.layers):
+            # SelfAttention
+            if hasattr(block, "attn"):
+                block.attn.layer_id = lid
+                block.attn.weight_manager = wsm
+                block.attn.streams = streams
+                block.attn.weight_h2d_stream = getattr(streams, "weight_h2d_mha", None)
+            # FeedForward
+            if hasattr(block, "ffn"):
+                block.ffn.layer_id = lid
+                block.ffn.weight_manager = wsm
+                block.ffn.streams = streams
+                block.ffn.weight_h2d_stream = getattr(streams, "weight_h2d_ffn", None)
 
     # ---------- Utils ----------
     @staticmethod

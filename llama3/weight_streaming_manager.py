@@ -115,6 +115,11 @@ class WeightStreamingManager:
         self.prefetch_distance = int(prefetch_distance)
         self.max_cached_layers = int(max_cached_layers)
         self.cpu_cache_layers = int(cpu_cache_layers)
+        # retain policy to avoid evicting "now" or "soon" layers
+        self._retain_set = set()               # layers to avoid evicting
+        self._last_touch = {}                  # layer_id -> monotonic seconds
+        self._min_retain_ms = 50               # default 50ms; tune via runtime cfg if needed
+
 
         # SSD backend configuration
         self.ssd_enabled = ssd_manifest_path is not None
@@ -218,6 +223,37 @@ class WeightStreamingManager:
             self.prefetch(warm)
             if self.verbose:
                 print(f"[WSM] GPU warmup prefetch: {warm} (target: {self.target_gpu_layers} layers)")
+
+    # ---- Retention helpers --------------------------------------------------
+    def _refresh_retain_window(self, current_idx: int):
+        now = time.monotonic()
+        self._last_touch[current_idx] = now
+        hi = min(current_idx + max(1, self._pd_current) + 1, len(self.blocks))
+        self._retain_set = set(range(current_idx, hi))
+
+    def _should_retain(self, layer_id: int) -> bool:
+        if layer_id in self._retain_set:
+            return True
+        last = self._last_touch.get(layer_id)
+        if last is None:
+            return False
+        return (time.monotonic() - last) < (self._min_retain_ms / 1000.0)
+
+    def _evict_one_not_retained(self):
+        # Try oldest→newest; evict the first not "retained recently"
+        for old in list(self.gpu_cache.keys()):
+            if not self._should_retain(old):
+                self.gpu_cache.pop(old, None)
+                self._evict_layer_to_cpu(old)
+                if self.verbose:
+                    print(f"[WSM]   evict layer={old}")
+                return old
+        # Fallback: all are retained; evict LRU anyway (warn)
+        old, _ = self.gpu_cache.popitem(last=False)
+        if self.verbose:
+            print(f"[WSM][WARN] retain window full; evict LRU layer={old}")
+        self._evict_layer_to_cpu(old)
+        return old
 
     # -------- SSD backend initialization --------
 
@@ -427,8 +463,10 @@ class WeightStreamingManager:
         print(f"   Average layer size: {avg_layer_size/(1024**3):.2f} GB")
 
         # Check if we have enough memory with safety margin
-        safety_margin = 0.1  # 10% safety margin
-        required_with_margin = required_cache_bytes * (1 + safety_margin)
+        safety_margin = 0.25  # align with KVOffloader
+        # peak concurrent: current H2D + one next prefetch layer
+        peak_concurrent_bytes = avg_layer_size * 2 if stream_layers_count > 0 else 0
+        required_with_margin = (required_cache_bytes + peak_concurrent_bytes) * (1 + safety_margin)
 
         if required_with_margin > available_bytes:
             deficit_gb = (required_with_margin - available_bytes) / (1024**3)
@@ -561,7 +599,7 @@ class WeightStreamingManager:
             evt = torch.cuda.Event(blocking=False)
             self.layer_events[idx] = evt
         evt.record(self.streams.weight_h2d)
-        
+
         # 记录一次 H2D 活动时长，用于 PCIE 近似占用度估计（EMA）
         try:
             start = torch.cuda.Event(enable_timing=True)
@@ -571,6 +609,13 @@ class WeightStreamingManager:
             end.synchronize()
             dt_ms = start.elapsed_time(end)  # ~0，但可以作为一次采样
             self._last_h2d_ms = max(self._last_h2d_ms * 0.9, dt_ms)
+        except Exception:
+            pass
+
+        # Light-weight GC of event pool to avoid pending growth
+        try:
+            from . import stream_mnt
+            stream_mnt._get_event_pool(self.device).gc(limit=512)
         except Exception:
             pass
 
@@ -688,11 +733,14 @@ class WeightStreamingManager:
     def ensure_on_gpu(self, idx: int, wait: bool):
         """Ensure layer idx is present on GPU (respecting LRU); optionally wait for readiness."""
         # 在正式 H2D 前评估一次 PD
+
         self._decide_pd()
-        
+
         nvtx.range_push(f"ensure_layer_{idx}")
         self._record_memory_stats("ensure_start", idx)
 
+        # prepare retention window
+        self._refresh_retain_window(idx)
         if idx in self.gpu_cache:
             nvtx.range_push(f"cache_hit_layer_{idx}")
             self.gpu_cache.move_to_end(idx)
@@ -706,12 +754,9 @@ class WeightStreamingManager:
 
             # Evict until space is available
             while len(self.gpu_cache) >= self.max_cached_layers:
-                old, _ = self.gpu_cache.popitem(last=False)
-                nvtx.range_push(f"evict_layer_{old}")
-                self._record_memory_stats("evict_start", old)
-                self._evict_layer_to_cpu(old)
-                self._record_memory_stats("evict_end", old)
-                nvtx.range_pop()
+                self._record_memory_stats("evict_start", -1)
+                self._evict_one_not_retained()
+                self._record_memory_stats("evict_end", -1)
 
             # H2D for current layer (skip resident norms)
             nvtx.range_push(f"h2d_transfer_layer_{idx}")
@@ -752,6 +797,7 @@ class WeightStreamingManager:
 
         for idx in ids:
             nvtx.range_push(f"prefetch_layer_{idx}")
+            self._refresh_retain_window(idx)
 
             if idx in self.gpu_cache:
                 self.gpu_cache.move_to_end(idx)
@@ -760,10 +806,7 @@ class WeightStreamingManager:
 
             # Evict until space is available
             while len(self.gpu_cache) >= self.max_cached_layers:
-                old, _ = self.gpu_cache.popitem(last=False)
-                nvtx.range_push(f"prefetch_evict_{old}")
-                self._evict_layer_to_cpu(old)
-                nvtx.range_pop()
+                self._evict_one_not_retained()
 
             # H2D for this prefetched layer (skip resident norms)
             nvtx.range_push(f"prefetch_h2d_layer_{idx}")
@@ -812,7 +855,8 @@ class WeightStreamingManager:
 
         # 忙态：降 PD、暂停写
         if (self._pcie_ema >= self.pcie_hi) or (pinned_free_ratio <= self.pin_lo):
-            self._pd_current = 1
+            # step-down, not cliff-drop
+            self._pd_current = max(1, self._pd_current - 1)
             if self.kv_offloader is not None:
                 try:
                     self.kv_offloader.throttle_writes_for(self.throttle_ms)
