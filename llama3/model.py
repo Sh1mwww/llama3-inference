@@ -60,7 +60,8 @@ class Transformer(nn.Module):
         # assert seqlen == 1, "一次只能处理一个 token"
 
         h = self.embed_tokens(tokens)            # (B, seqlen, D)
-        freqs = self.freqs_complex[start_pos : start_pos + seqlen].to(h.device)
+        # 传递完整的 freqs_complex，让 apply_rotary_embeddings 自己切片
+        freqs = self.freqs_complex.to(h.device)
 
         for idx, info in enumerate(self.layer_infos):
             blk = info["block"]                  # EncoderBlock

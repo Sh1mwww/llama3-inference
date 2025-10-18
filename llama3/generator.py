@@ -119,12 +119,12 @@ class LLaMA:
 
         # Local imports intentionally kept (avoid circular imports / heavy startup)
         from .weight_streaming_manager import WeightStreamingManager
-        from . import layers
-        from . import stream_mnt
-
+        # from .layers import .
+        from .stream_mnt import get_streams
+        
         # Default streaming config (merged with user-provided overrides)
         config = {
-            'prefetch_distance': 1,
+            'prefetch_distance': 4,
             'max_cached_layers': 4,
             'warmup_layers': 1,
             'verbose': False,
@@ -144,6 +144,8 @@ class LLaMA:
         # Place small/core components on target device (kept resident in HBM)
         self._configure_core_components()
 
+        self.streams = get_streams(self.args.device) 
+
         # Create and wire up the WeightStreamingManager
         wsm = WeightStreamingManager(
             self.model,
@@ -158,7 +160,7 @@ class LLaMA:
         self.weight_streaming_manager = wsm
 
         # Integrate WSM hooks into layers (attn/ffn)
-        self._integrate_wsm_to_layers(wsm)
+        self._integrate_wsm_to_layers(wsm, self.streams)
 
         # Configure KV streams if offloaders exist
         self._configure_kv_streams()
@@ -241,6 +243,9 @@ class LLaMA:
             raise RuntimeError(f"Another streaming mode already active: {self._streaming_mode}")
         self._streaming_mode = "ssd"
 
+        # Create streams for SSD mode
+        self.streams = stream_mnt.get_streams(self.args.device)
+
         # Normalize staging bytes (WSM will align to device block size)
         staging_bytes = max(1, int(config['staging_mb'])) * 1024 * 1024
 
@@ -262,7 +267,7 @@ class LLaMA:
         self.weight_streaming_manager = wsm
 
         # Integrate WSM hooks into layers
-        self._integrate_wsm_to_layers(wsm)
+        self._integrate_wsm_to_layers(wsm, self.streams)
 
         # KV streams
         self._configure_kv_streams()
@@ -335,25 +340,6 @@ class LLaMA:
             print(f"   Failed to recreate freqs_complex: {e}")
             raise RuntimeError(f"Cannot ensure freqs_complex is on {device}") from e
 
-    def _integrate_wsm_to_layers(self, wsm):
-        """
-        Attach the WeightStreamingManager to attention/FFN modules so they can stream weights.
-        """
-        try:
-            from . import layers  # local import intentionally kept
-            layers.set_weight_manager(wsm)  # set global reference for modules to pick up
-
-            # Manual injection for already-constructed blocks
-            if hasattr(self.model, "layers"):
-                for i, layer in enumerate(self.model.layers):
-                    if hasattr(layer, "attention"):
-                        layer.attention.weight_manager = wsm
-                        layer.attention.layer_id = getattr(layer, "layer_id", i)
-                    if hasattr(layer, "feed_forward"):
-                        layer.feed_forward.weight_manager = wsm
-                        layer.feed_forward.layer_id = getattr(layer, "layer_id", i)
-        except Exception as e:
-            print(f"[WARN] failed to set_weight_manager on blocks: {e}")
 
     def _configure_kv_streams(self):
         """
@@ -825,17 +811,17 @@ class LLaMA:
             return
         for lid, block in enumerate(self.model.layers):
             # SelfAttention
-            if hasattr(block, "attn"):
-                block.attn.layer_id = lid
-                block.attn.weight_manager = wsm
-                block.attn.streams = streams
-                block.attn.weight_h2d_stream = getattr(streams, "weight_h2d_mha", None)
+            if hasattr(block, "attention"):
+                block.attention.layer_id = lid
+                block.attention.weight_manager = wsm
+                block.attention.streams = streams
+                block.attention.weight_h2d_stream = getattr(streams, "weight_h2d_mha", None)
             # FeedForward
-            if hasattr(block, "ffn"):
-                block.ffn.layer_id = lid
-                block.ffn.weight_manager = wsm
-                block.ffn.streams = streams
-                block.ffn.weight_h2d_stream = getattr(streams, "weight_h2d_ffn", None)
+            if hasattr(block, "feed_forward"):
+                block.feed_forward.layer_id = lid
+                block.feed_forward.weight_manager = wsm
+                block.feed_forward.streams = streams
+                block.feed_forward.weight_h2d_stream = getattr(streams, "weight_h2d_ffn", None)
 
     # ---------- Utils ----------
     @staticmethod

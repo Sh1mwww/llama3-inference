@@ -110,11 +110,16 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
                 torch.cuda.synchronize()
                 
                 elapsed_us = int(start_event.elapsed_time(end_event) * 1000)
-                
+
                 with PERF_TRACKER.lock:
                     PERF_TRACKER.stats[key] += elapsed_us
                     if layer_id is not None:
-                        PERF_TRACKER.add_layer_stat(layer_id, key, elapsed_us)
+                        # 直接更新，避免嵌套锁
+                        if layer_id not in PERF_TRACKER.layer_stats:
+                            PERF_TRACKER.layer_stats[layer_id] = {}
+                        if key not in PERF_TRACKER.layer_stats[layer_id]:
+                            PERF_TRACKER.layer_stats[layer_id][key] = 0
+                        PERF_TRACKER.layer_stats[layer_id][key] += elapsed_us
             except Exception as e:
                 logger.warning(f"Error in cuda_timer cleanup for {key}: {e}")
                 # Don't re-raise exceptions in cleanup
@@ -382,9 +387,11 @@ class SelfAttention(nn.Module):
         if x.dtype != w_dtype:
             x = x.to(w_dtype)
         
+        print(f"[ATTN] Layer {self.layer_id} forward starting...")
         # 确保权重在GPU上
         self._ensure_weights_cuda()
-        
+        print(f"[ATTN] Layer {self.layer_id} weights ensured")
+
         # 更新全局状态跟踪器
         tracker = get_global_tracker()
         # 獲取當前batch索引（從global tracker中讀取，而不是重新設置）
@@ -392,18 +399,20 @@ class SelfAttention(nn.Module):
             batch_idx = tracker.current_batch  # 使用tracker中已設置的值
         else:
             batch_idx = 0  # 回退值
-        
+
         # 预取下一层权重
         if hasattr(self, '_next_layer_modules'):
             if self.weight_manager:
                 self.weight_manager.prefetch_weights([self.layer_id + 1], {self.layer_id + 1: self._next_layer_modules})
-        
+
         # 确保权重H2D传输完成后再开始计算（使用统一的事件化等待）
         if self.streams and x.is_cuda:
             try:
                 self.streams.wait_weight_ready_on_current(self.device)
             except Exception as e:
                 logger.warning(f"Layer {self.layer_id} SelfAttention: weight sync failed: {e}")
+
+        print(f"[ATTN] Layer {self.layer_id} starting computation...")
 
         # QKV投影 - 使用专门的compute stream
         # compute_stream = self.streams.weight_compute if self.streams else None
@@ -507,9 +516,15 @@ class SelfAttention(nn.Module):
             k_full = k_full.permute(1, 0, 2).unsqueeze(0)
             v_full = v_full.permute(1, 0, 2).unsqueeze(0)
         elif k_full.dim() == 4:
-            # (bsz, seq_len, n_heads, head_dim) -> (bsz, n_heads, seq_len, head_dim)
-            k_full = k_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
-            v_full = v_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
+            # 检查是否已经是正确的格式 (bsz, n_heads, seq_len, head_dim)
+            # 通过比较 dimension sizes：heads 应该比 head_dim 小
+            if k_full.size(1) == self.n_kv_heads:
+                # 已经是 (bsz, n_heads, seq_len, head_dim)，不需要 transpose
+                pass
+            else:
+                # 假设是 (bsz, seq_len, n_heads, head_dim)，需要 transpose
+                k_full = k_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
+                v_full = v_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
         
         # 确保k_full和v_full与q的batch维度一致
         if k_full.size(0) == 1 and bsz > 1:
@@ -621,6 +636,7 @@ class SelfAttention(nn.Module):
 
         total_time = (time.time() - start_time) * 1000000  # 转换为微秒
         PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
+        print(f"[ATTN] Layer {self.layer_id} computation done")
         return result
 
 # ---------- Optimized FeedForward ----------
@@ -672,7 +688,9 @@ class FeedForward(nn.Module):
                 logger.error(f"CUDA context error in feedforward: {e}")
                 raise RuntimeError("CUDA context is corrupted") from e
 
+        print(f"[FFN] Layer {self.layer_id} forward starting...")
         self._ensure_weights_cuda()
+        print(f"[FFN] Layer {self.layer_id} weights ensured")
 
         # 确保权重H2D传输完成后再开始计算（使用统一的事件化等待）
         if self.streams and x.is_cuda:
@@ -681,7 +699,7 @@ class FeedForward(nn.Module):
             except Exception as e:
                 logger.warning(f"Layer {self.layer_id} FeedForward: weight sync failed: {e}")
 
-
+        print(f"[FFN] Layer {self.layer_id} starting computation...")
         # FFN计算 - 使用compute stream
         # compute_stream = self.streams.weight_compute if self.streams else None
         compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
@@ -693,6 +711,7 @@ class FeedForward(nn.Module):
                     up = self.w3(x)
                     hidden = F.silu(gate) * up
                     result = self.w2(hidden)
+            print(f"[FFN] Layer {self.layer_id} computation done")
             return result
         else:
             with cuda_timer("ffn_us", self.layer_id):
@@ -700,7 +719,9 @@ class FeedForward(nn.Module):
                 gate = self.w1(x)
                 up = self.w3(x)
                 hidden = F.silu(gate) * up
-                return self.w2(hidden)
+                result = self.w2(hidden)
+            print(f"[FFN] Layer {self.layer_id} computation done")
+            return result
 
 # ---------- Optimized EncoderBlock ----------
 class EncoderBlock(nn.Module):

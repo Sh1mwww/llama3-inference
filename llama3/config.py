@@ -12,7 +12,7 @@ class LayerInfo:
 
 @dataclass
 class KVCacheArgs:
-    ssd_path: str = "/mnt/kv_cache/kv_cache.bin"
+    # ssd_path: str = "/mnt/kv_cache/kv_cache.bin"
     ssd_size_gb: int = 500
     dram_limit_gb: float = 0.1
     ssd_device_path: str = "/dev/nvme0n1p4"  # Raw block device path for KV cache
@@ -161,7 +161,7 @@ class WindowPrefetchConfig:
 # ---------- pinned 池与注册 ----------
 @dataclass
 class PinnedPoolConfig:
-    WEIGHT_PINNED_BYTES: int = 32 << 30        # 32 GiB
+    WEIGHT_PINNED_BYTES: int = 64 << 30        # 64 GiB
     KV_PINNED_BYTES: int     = 12 << 30        # 12 GiB
     EXTENT_BYTES: int        = 2  << 20        # 2 MiB 逻辑粒度
     PINNED_REGISTER_CHUNK: int = 512 << 20     # 512 MiB 注册一块

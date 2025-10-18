@@ -12,6 +12,8 @@ from .global_state_tracker import get_global_tracker, init_global_tracker, Stora
 BLOCK = 256  # tokens / block
 
 class KVOffloader:
+    # Class-level flag to print initialization info only once
+    _init_printed = False
     """
     Off-GPU KV cache with attention-based Top-K fetch.
 
@@ -90,14 +92,17 @@ class KVOffloader:
         _safety = int(0.25 * _dram_bytes)  # 25% safety margin
         self.dram_limit_blk = max(0, (_dram_bytes - _safety) // self.block_nbytes)
 
-        # 打印配额计算信息
-        print(f"[KVOffloader] DRAM quota estimation:")
-        print(f"  - Sizing batch: {alloc_bsz} (actual max_batch: {max_batch})")
-        print(f"  - Block size: {self.block_nbytes / (1024**2):.2f} MB")
-        print(f"  - DRAM limit: {self.dram_limit_blk} blocks ({self.dram_limit_blk * self.block_nbytes / (1024**3):.2f} GB)")
+        # 打印配额计算信息 - 只在第一次初始化时打印
+        if not KVOffloader._init_printed:
+            print(f"[KVOffloader] DRAM quota estimation:")
+            print(f"  - Sizing batch: {alloc_bsz} (actual max_batch: {max_batch})")
+            print(f"  - Block size: {self.block_nbytes / (1024**2):.2f} MB")
+            print(f"  - DRAM limit: {self.dram_limit_blk} blocks ({self.dram_limit_blk * self.block_nbytes / (1024**3):.2f} GB)")
 
-        if self.dram_limit_blk == 0:
-            print("[KVOffloader][WARN] dram_limit_blk computed as 0; consider increasing KVCacheArgs.dram_limit_gb")
+            if self.dram_limit_blk == 0:
+                print("[KVOffloader][WARN] dram_limit_blk computed as 0; consider increasing KVCacheArgs.dram_limit_gb")
+
+            KVOffloader._init_printed = True
 
         # --- SSD writer throttle (thread-safe flag) ---
         self._throttle_lock = threading.Lock()

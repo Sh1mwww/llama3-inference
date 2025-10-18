@@ -623,10 +623,20 @@ class WeightStreamingManager:
     def _wait_layer_ready(self, idx: int):
         """Wait on the layer's ready event on the current stream (fallback: wait for H2D stream)."""
         evt = self.layer_events.get(idx)
+        if self.verbose:
+            print(f"[WSM] _wait_layer_ready layer={idx} event={'exists' if evt else 'None'}")
         if evt is not None:
+            if self.verbose:
+                print(f"[WSM] _wait_layer_ready layer={idx} waiting on event...")
             torch.cuda.current_stream(self.device).wait_event(evt)
+            if self.verbose:
+                print(f"[WSM] _wait_layer_ready layer={idx} event wait done")
         else:
+            if self.verbose:
+                print(f"[WSM] _wait_layer_ready layer={idx} fallback to wait_weight_ready_on_current...")
             self.streams.wait_weight_ready_on_current(self.device)
+            if self.verbose:
+                print(f"[WSM] _wait_layer_ready layer={idx} fallback done")
 
     def _ensure_param_cpu_stash_inplace(self, p: torch.nn.Parameter):
         """
@@ -777,7 +787,11 @@ class WeightStreamingManager:
             nvtx.range_pop()
 
             if self.verbose:
-                print(f"[WSM] ->GPU layer={idx}")
+                # 判断权重从哪里加载
+                source = "SSD→CPU→GPU" if (self.ssd_enabled and idx in self.cpu_cache) else \
+                         "SSD→GPU" if self.ssd_enabled else \
+                         "CPU→GPU"
+                print(f"[WSM] ->GPU layer={idx} ({source})")
             if wait:
                 nvtx.range_push(f"wait_layer_{idx}")
                 self._wait_layer_ready(idx)
@@ -825,7 +839,11 @@ class WeightStreamingManager:
             nvtx.range_pop()
 
             if self.verbose:
-                print(f"[WSM] prefetch layer={idx}")
+                # 判断权重从哪里加载
+                source = "SSD→CPU→GPU" if (self.ssd_enabled and idx in self.cpu_cache) else \
+                         "SSD→GPU" if self.ssd_enabled else \
+                         "CPU→GPU"
+                print(f"[WSM] prefetch layer={idx} ({source})")
 
             nvtx.range_pop()  # prefetch_layer
 
