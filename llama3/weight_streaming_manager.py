@@ -109,6 +109,7 @@ class WeightStreamingManager:
                  cpu_cache_layers: int = 50,
                  staging_mb: int = 64):
         assert torch.cuda.is_available(), "CUDA not available"
+        self.model = model 
         self.device = device
         self.verbose = verbose
         self.streams = get_streams(device)
@@ -642,10 +643,19 @@ class WeightStreamingManager:
         """
         Replace p.data with a pinned CPU master copy and stash it by Parameter id.
         This avoids holding duplicate CPU tensors.
+
+        WARNING: This should NOT be called on meta tensors! They should be handled by SSD backend.
         """
         pid = id(p)
         if pid in self.cpu_stash:
             return
+
+        # Sanity check: 不要在 meta tensor 上调用此函数
+        if p.device.type == "meta":
+            if self.verbose:
+                print(f"[WSM] WARNING: _ensure_param_cpu_stash_inplace called on meta tensor (param id={pid}), skipping")
+            return
+
         pinned = _pinned_clone_cpu(p.data)
         p.data = pinned
         self.cpu_stash[pid] = p.data
@@ -653,37 +663,73 @@ class WeightStreamingManager:
     def _ensure_param_on_gpu(self, p: torch.nn.Parameter, layer_idx: Optional[int] = None, param_name: Optional[str] = None):
         """Stage parameter to GPU on the weight H2D stream and switch p.data to the GPU tensor."""
         nvtx.range_push("param_h2d")
-        if p.device.type != "cpu":
+
+        # 已经在 GPU 上：直接返回
+        if p.device.type not in ("cpu", "meta"):
+             nvtx.range_pop()
+             return
+
+        # meta 参数 + SSD 后端：从 SSD/CPU cache 加载
+        if p.device.type == "meta" and self.ssd_enabled:
+            # 确保该层已加载到 CPU cache
+            if layer_idx is not None and layer_idx not in self.cpu_cache:
+                try:
+                    self._load_layer_to_cpu(layer_idx)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[WSM] Failed to load layer {layer_idx} to CPU cache: {e}")
+                    nvtx.range_pop()
+                    return
+
+            # 从 CPU cache 加载到 GPU
+            if (layer_idx is not None and param_name is not None and
+                layer_idx in self.cpu_cache and param_name in self.cpu_cache[layer_idx]):
+
+                nvtx.range_push("cpu_cache_to_gpu")
+                with torch.cuda.stream(self.streams.weight_h2d):
+                    cached_tensor = self.cpu_cache[layer_idx][param_name]
+                    p_gpu = cached_tensor.to(self.device, non_blocking=True)
+                p.data = p_gpu
+                nvtx.range_pop()
+                nvtx.range_pop()
+                return
+            else:
+                # 无法从 CPU cache 获取，说明这是个非 stream 参数（resident），应该已经被 load_resident_to_gpu 处理
+                if self.verbose:
+                    print(f"[WSM] Warning: meta param {param_name} not in CPU cache (layer {layer_idx}), skipping")
+                nvtx.range_pop()
+                return
+
+        # CPU 参数：从 CPU cache（SSD 模式）或 CPU stash（传统模式）加载到 GPU
+        if p.device.type == "cpu":
+            # SSD 模式：优先使用 CPU cache
+            if (self.ssd_enabled and layer_idx is not None and param_name is not None and
+                layer_idx in self.cpu_cache and param_name in self.cpu_cache[layer_idx]):
+
+                nvtx.range_push("cpu_cache_to_gpu")
+                with torch.cuda.stream(self.streams.weight_h2d):
+                    cached_tensor = self.cpu_cache[layer_idx][param_name]
+                    p_gpu = cached_tensor.to(self.device, non_blocking=True)
+                p.data = p_gpu
+                nvtx.range_pop()
+                nvtx.range_pop()
+                return
+
+            # 传统模式：使用 CPU stash
+            pid = id(p)
+            nvtx.range_push("ensure_cpu_stash")
+            self._ensure_param_cpu_stash_inplace(p)
             nvtx.range_pop()
-            return
 
-        # Try to get from CPU cache first if SSD backend is enabled
-        if (self.ssd_enabled and layer_idx is not None and param_name is not None and
-            layer_idx in self.cpu_cache and param_name in self.cpu_cache[layer_idx]):
-
-            nvtx.range_push("cpu_cache_to_gpu")
+            nvtx.range_push("weight_h2d_stream")
             with torch.cuda.stream(self.streams.weight_h2d):
-                cached_tensor = self.cpu_cache[layer_idx][param_name]
-                p_gpu = cached_tensor.to(self.device, non_blocking=True)
+                nvtx.range_push("cpu_to_gpu_transfer")
+                p_gpu = self.cpu_stash[pid].to(self.device, non_blocking=True)
+                nvtx.range_pop()
+            nvtx.range_pop()
+
             p.data = p_gpu
-            nvtx.range_pop()
-            nvtx.range_pop()
-            return
 
-        # Fallback to original behavior
-        pid = id(p)
-        nvtx.range_push("ensure_cpu_stash")
-        self._ensure_param_cpu_stash_inplace(p)
-        nvtx.range_pop()
-
-        nvtx.range_push("weight_h2d_stream")
-        with torch.cuda.stream(self.streams.weight_h2d):
-            nvtx.range_push("cpu_to_gpu_transfer")
-            p_gpu = self.cpu_stash[pid].to(self.device, non_blocking=True)
-            nvtx.range_pop()
-        nvtx.range_pop()
-
-        p.data = p_gpu
         nvtx.range_pop()
 
     def _evict_param_to_cpu(self, p: torch.nn.Parameter):
@@ -701,8 +747,22 @@ class WeightStreamingManager:
                 full_param_name = f"layers.{layer_idx}.{module_name}.{param_name}"
             self._ensure_param_on_gpu(p, layer_idx, full_param_name)
 
+        # for b in m.buffers(recurse=True):
+        #     if b.device.type == "cpu":
+        #         with torch.cuda.stream(self.streams.weight_h2d):
+        #             b_gpu = b.detach().to(self.device, non_blocking=True)
+        #         try:
+        #             b.data = b_gpu
+        #         except Exception:
+        #             pass
         for b in m.buffers(recurse=True):
-            if b.device.type == "cpu":
+        # 对于 meta buffer，先 to_empty(materialize) 再填充；对于已有CPU/GPU buffer，保持原逻辑
+            if getattr(b, "is_meta", False):
+                try:
+                    b = b.to_empty(device=self.device)  # 关键字参数！
+                except Exception:
+                    pass
+            elif b.device.type == "cpu":
                 with torch.cuda.stream(self.streams.weight_h2d):
                     b_gpu = b.detach().to(self.device, non_blocking=True)
                 try:
@@ -747,6 +807,14 @@ class WeightStreamingManager:
         self._decide_pd()
 
         nvtx.range_push(f"ensure_layer_{idx}")
+        
+        # 在 meta 初始化+SSD 模式下，确保有 CPU 层缓存可用（按需从 SSD 拉起）
+        if self.ssd_enabled and (idx not in self.cpu_cache):
+                try:
+                    self._load_layer_to_cpu(idx)
+                except Exception:
+                    pass
+                
         self._record_memory_stats("ensure_start", idx)
 
         # prepare retention window

@@ -75,9 +75,17 @@ def test_70b_prefill():
         print(f"  - 设备: {gpu_name}")
         print(f"  - 显存: {gpu_mem_gb:.2f} GB")
 
-        if gpu_mem_gb < 16:
-            print(f"\n⚠️  警告：GPU 显存小于 16GB，测试可能失败")
+        if gpu_mem_gb < 15:
+            print(f"\n❌ 错误：GPU 显存不足 ({gpu_mem_gb:.1f}GB < 15GB)")
+            print("70B 模型需要至少 15-16GB 显存")
+            print("\n建议:")
+            print("  1) 使用至少 16GB 显存的 GPU")
+            print("  2) 测试 8B 模型代替 (test_7b_model.py)")
+            print("  3) 如果是 RTX 4090/3090，确保没有其他程序占用显存")
             return False
+        elif gpu_mem_gb < 16:
+            print(f"\n⚠️  警告：GPU 显存接近最低要求 ({gpu_mem_gb:.1f}GB)")
+            print("测试可能会在接近显存极限的情况下运行")
     except Exception as e:
         print(f"\n❌ 错误：无法获取 GPU 信息: {e}")
         return False
@@ -94,6 +102,23 @@ def test_70b_prefill():
     except Exception as e:
         print(f"\n❌ 错误：KV Cache 配置失败: {e}")
         return False
+
+    # ---- 检查系统 DRAM 是否足够 ----
+    print("\n⚠️  重要提示：70B 模型内存需求")
+    print("=" * 60)
+    print("70B 模型完整权重大小 (FP16): ~132 GB")
+    print("推荐系统配置:")
+    print("  - 方案1 (纯DRAM): 需要 192GB+ 系统内存")
+    print("  - 方案2 (SSD混合): 需要 64GB+ 系统内存 + SSD")
+    print("  - 方案3 (量化): INT8 需要 96GB+, INT4 需要 64GB+")
+    print()
+    print("当前测试使用: 权重流式传输模式 (需要 ~140GB DRAM)")
+    print()
+    response = input("如果你的系统内存 < 192GB，建议使用 SSD 模式。继续测试？ (y/n): ")
+    if response.lower() != 'y':
+        print("\n测试已取消")
+        return False
+    print("=" * 60)
 
     # ---- Prefill 测试参数 (16GB 优化) ----
     prefill_seq_len = 256  # 较小的序列长度
@@ -129,9 +154,11 @@ def test_70b_prefill():
     llama = None
     try:
         start_time = time.time()
+        # ⚠️ 重要：load_model=False 避免一次性加载 132GB 到 CPU
+        # WSM 会按需从磁盘加载每层的权重
         llama = LLaMA.build(
             checkpoints_dir=str(ckpt_path),
-            load_model=True,
+            load_model=False,  # ❌ 不要一次性加载所有权重！
             device=device,
             mode="stream",
             mode_config=streaming_config,
@@ -324,13 +351,17 @@ if __name__ == "__main__":
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
             print(f"GPU 内存: {gpu_mem:.2f} GB")
 
-            if gpu_mem > 16.5:
+            if gpu_mem > 16:
                 print("✅ 显存充足 (>16GB)")
-            elif gpu_mem >= 15.5:
+            elif gpu_mem >= 15:
                 print("⚠️  显存刚好达到要求 (~16GB)")
             else:
-                print(f"❌ 显存不足 ({gpu_mem:.1f}GB < 16GB)")
-                print("测试可能会失败")
+                print(f"❌ 显存不足 ({gpu_mem:.1f}GB < 15GB)")
+                print("70B 模型需要至少 15GB 显存，测试终止")
+                print("\n建议:")
+                print("  - 使用至少 16GB 显存的 GPU")
+                print("  - 或者测试 8B 模型 (test_7b_model.py)")
+                sys.exit(1)
         except Exception as e:
             print(f"⚠️  警告：无法获取完整 GPU 信息: {e}")
 

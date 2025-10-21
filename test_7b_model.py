@@ -28,12 +28,29 @@ def _force_model_small_modules_to(model, target_device: torch.device):
     """
     把小模块（embedding/norm/output/频率表/各层norm）统一迁到目标设备，防止“半上卡”残留。
     """
+    
+    def _move_safely(mod):
+        # 只检测“当前模块自身”是否含有 meta 参数/缓冲
+        has_meta = False
+        for p in mod.parameters(recurse=False):
+            if getattr(p, "is_meta", False):
+                has_meta = True; break
+        if not has_meta:
+            for b in mod.buffers(recurse=False):
+                if getattr(b, "is_meta", False):
+                    has_meta = True; break
+        return mod.to_empty(device=target_device) if has_meta else mod.to(target_device)
+    
+
     if hasattr(model, "embed_tokens"):
-        model.embed_tokens = model.embed_tokens.to(target_device)
+        # model.embed_tokens = model.embed_tokens.to(target_device)
+        model.embed_tokens = _move_safely(model.embed_tokens)
     if hasattr(model, "norm"):
-        model.norm = model.norm.to(target_device)
+        # model.norm = model.norm.to(target_device)
+        model.norm = _move_safely(model.norm)
     if hasattr(model, "output"):
-        model.output = model.output.to(target_device)
+        # model.output = model.output.to(target_device)
+        model.output = _move_safely(model.output)
     if hasattr(model, "freqs_complex") and hasattr(model.freqs_complex, "device"):
         try:
             model.freqs_complex = model.freqs_complex.to(target_device)
@@ -44,7 +61,8 @@ def _force_model_small_modules_to(model, target_device: torch.device):
         for lyr in model.layers:
             for name in ("attn_norm", "ffn_norm"):
                 if hasattr(lyr, name):
-                    setattr(lyr, name, getattr(lyr, name).to(target_device))
+                    # setattr(lyr, name, getattr(lyr, name).to(target_device))
+                    setattr(lyr, name, _move_safely(getattr(lyr, name)))
 
 
 def _patch_safe_forward(llama_model):

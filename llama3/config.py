@@ -14,10 +14,18 @@ class LayerInfo:
 class KVCacheArgs:
     # ssd_path: str = "/mnt/kv_cache/kv_cache.bin"
     ssd_size_gb: int = 500
-    dram_limit_gb: float = 0.1
+    dram_limit_gb: float = 8
     ssd_device_path: str = "/dev/nvme0n1p4"  # Raw block device path for KV cache
     max_concurrent_io: int = 4
     ssd_capacity_gb: int = 100
+    block_bytes       = 256 * 1024
+    preallocate       = False
+    lazy_init         = True
+    # KV cache data type (default: float16)
+    kv_dtype          = None  # Will default to torch.float16 if None
+    prefer_bf16       = False # If True, use bfloat16 for KV cache (overrides kv_dtype if None)
+    # Verbose pool initialization messages
+    verbose_pool      = True 
 
 @dataclass
 class ModelArgs:
@@ -38,6 +46,11 @@ class ModelArgs:
     device: str = "cuda"
     topk_blk: int = 8
     layer_infos: List[LayerInfo] = field(default_factory=list)
+    # 新增：参数初始化所用的设备（"meta" | "cpu" | "cuda"）。70B 走 "meta"
+    param_init_device: str = "cpu"
+    # 新增：权重来源（"checkpoint" | "raw-ssd"），70B 走 "raw-ssd"
+    weight_source: str = "checkpoint"
+    
     
     @staticmethod
     def from_json(params_path: str,

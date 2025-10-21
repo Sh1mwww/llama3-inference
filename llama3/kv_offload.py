@@ -1,7 +1,7 @@
 from __future__ import annotations
-import threading, time, collections
+import threading, time, collections, math
 from queue import Empty, Queue, Full
-from typing import List, Iterable, Tuple, Union
+from typing import List, Iterable, Tuple, Union, Optional
 import numpy as np
 import torch
 from .SSDBacked import RawBlockKVBackend
@@ -10,6 +10,195 @@ from .global_state_tracker import get_global_tracker, init_global_tracker, Stora
 
 
 BLOCK = 256  # tokens / block
+
+
+# ============================================================================
+# Global DRAM Pool (Singleton for all layers)
+# ============================================================================
+
+class DRAMPool:
+    """
+    全局 DRAM 池，支持预分配和懒分配两种模式
+    Global DRAM pool supporting both preallocate and lazy allocation modes
+    """
+    def __init__(self, bytes_limit_gb: float, block_bytes: int,
+                 preallocate: bool = False, lazy_init: bool = True,
+                 verbose: bool = True):
+        self.bytes_limit = int(bytes_limit_gb * (1 << 30))
+        self.block_bytes = int(block_bytes)
+        # ★ 向上对齐到 4KiB（与后续可能的 O_DIRECT 对接安全）
+        self.block_bytes = int(math.ceil(self.block_bytes / 4096) * 4096)
+
+        self.preallocate = preallocate
+        self.lazy_init = lazy_init
+        self.used = 0
+        self.lock = threading.Lock()
+
+        # 懒分配池：可复用 pinned 块的栈 & 活跃集合（用 data_ptr 跟踪）
+        self.lazy_free = []
+        self.lazy_live = set()
+
+        if preallocate:
+            # Preallocate mode: allocate entire buffer upfront (旧逻辑)
+            try:
+                self.dram_buf = torch.empty(self.bytes_limit, dtype=torch.uint8, pin_memory=True)
+                self.free_segments = [(0, self.bytes_limit)]  # List of (offset, size) tuples
+                if verbose:
+                    print(f"[DRAMPool] Preallocated {self.bytes_limit / (1<<30):.2f} GB")
+            except RuntimeError as e:
+                if verbose:
+                    print(f"[DRAMPool][WARN] Preallocate failed ({e}), falling back to lazy mode")
+                self.dram_buf = None
+                self.free_segments = []
+                self.lazy_init = True
+        else:
+            # Lazy allocation mode: allocate blocks on-demand (新的懒分配模式)
+            self.dram_buf = None
+            self.free_segments = []
+            if verbose:
+                print(f"[DRAMPool] Lazy allocation mode (on-demand, limit={self.bytes_limit / (1<<30):.2f} GB)")
+
+    def _alloc_from_segments(self, need):
+        """从预分配的大缓冲 carve 出一段，返回 offset；若失败返回 None"""
+        # 最简单的 first-fit 实现
+        for i, (off, sz) in enumerate(self.free_segments):
+            if sz >= need:
+                new_off = off
+                rem = sz - need
+                if rem == 0:
+                    self.free_segments.pop(i)
+                else:
+                    self.free_segments[i] = (off + need, rem)
+                return new_off
+        return None
+
+    def _coalesce_segment(self, off, sz):
+        """把 [off, off+sz) 插回 free list，并与邻接段合并"""
+        segs = self.free_segments
+        segs.append((off, sz))
+        segs.sort()  # 按 offset
+        merged = []
+        cur_off, cur_sz = segs[0]
+        for o, s in segs[1:]:
+            if cur_off + cur_sz == o:
+                cur_sz += s
+            else:
+                merged.append((cur_off, cur_sz))
+                cur_off, cur_sz = o, s
+        merged.append((cur_off, cur_sz))
+        self.free_segments = merged
+
+    def alloc_block(self, nbytes: Optional[int] = None) -> Optional[torch.Tensor]:
+        """
+        分配一个 pinned DRAM 块，返回 torch.uint8 张量视图；失败返回 None
+        Allocate a pinned DRAM block, return torch.uint8 tensor view; None on failure
+        """
+        need_bytes = nbytes if nbytes is not None else self.block_bytes
+        # 向上对齐到 4KiB
+        need_bytes = int(math.ceil(need_bytes / 4096) * 4096)
+
+        with self.lock:
+            # 预分配模式：从大缓冲上 carve
+            if self.dram_buf is not None:
+                if self.used + need_bytes > self.bytes_limit:
+                    return None
+                off = self._alloc_from_segments(need_bytes)
+                if off is None:
+                    return None
+                self.used += need_bytes
+                # narrow 返回 pinned 的子张量（不拷贝）
+                return self.dram_buf.narrow(0, off, need_bytes)
+
+            # 懒分配模式：逐块分配或复用
+            if self.used + need_bytes > self.bytes_limit:
+                return None
+
+            # 查找匹配大小的空闲块（简单的精确匹配）
+            for i, t in enumerate(self.lazy_free):
+                if t.numel() == need_bytes:
+                    blk = self.lazy_free.pop(i)
+                    self.lazy_live.add(blk.storage().data_ptr())
+                    self.used += need_bytes
+                    return blk
+
+            # 没有匹配的，分配新块
+            try:
+                t = torch.empty(need_bytes, dtype=torch.uint8, pin_memory=True)
+                self.lazy_live.add(t.storage().data_ptr())
+                self.used += need_bytes
+                return t
+            except RuntimeError as e:
+                print(f"[DRAMPool][ERROR] Failed to allocate {need_bytes / (1<<20):.2f} MB: {e}")
+                return None
+
+    def free_block(self, buf: torch.Tensor):
+        """
+        释放一个由 alloc_block 产生的块（支持两种模式）
+        Free a block produced by alloc_block (supports both modes)
+        """
+        with self.lock:
+            if self.dram_buf is not None:
+                # 预分配模式：把子视图的 offset 封回 free list
+                off = buf.storage_offset()
+                size = buf.numel()
+                self._coalesce_segment(off, size)
+                self.used -= size
+            else:
+                # 懒分配：回收到复用栈，避免频繁 CUDA pinned alloc/free
+                ptr = buf.storage().data_ptr()
+                if ptr in self.lazy_live:
+                    self.lazy_live.remove(ptr)
+                    self.lazy_free.append(buf)
+                    self.used -= buf.numel()
+
+    def stats_str(self) -> str:
+        """返回池的统计信息字符串"""
+        with self.lock:
+            mode = "Preallocate" if self.dram_buf is not None else "Lazy"
+            used_gb = self.used / (1 << 30)
+            limit_gb = self.bytes_limit / (1 << 30)
+            util = (self.used / self.bytes_limit * 100) if self.bytes_limit > 0 else 0
+            free_count = len(self.free_segments) if self.dram_buf is not None else len(self.lazy_free)
+            live_count = len(self.lazy_live)
+            return (f"mode={mode}, used={used_gb:.2f}/{limit_gb:.2f}GB ({util:.1f}%), "
+                   f"free_blocks={free_count}, live_blocks={live_count}")
+
+
+# Global pool singleton
+_GLOBAL_DRAM_POOL: Optional[DRAMPool] = None
+_GLOBAL_POOL_CFG: Optional[tuple] = None
+
+
+def _pool_cfg_tuple():
+    """获取当前配置的元组（用于检测配置变化）"""
+    return (
+        float(KVCacheArgs.dram_limit_gb),
+        int(KVCacheArgs.block_bytes),
+        bool(getattr(KVCacheArgs, "preallocate", False)),
+        bool(getattr(KVCacheArgs, "lazy_init", True)),
+    )
+
+
+def _get_or_create_pool(verbose: bool = True) -> DRAMPool:
+    """
+    获取或创建全局 DRAM 池（单例模式）
+    Get or create global DRAM pool (singleton pattern)
+    """
+    global _GLOBAL_DRAM_POOL, _GLOBAL_POOL_CFG
+    cfg = _pool_cfg_tuple()
+    if _GLOBAL_DRAM_POOL is None or _GLOBAL_POOL_CFG != cfg:
+        _GLOBAL_DRAM_POOL = DRAMPool(
+            bytes_limit_gb=cfg[0],
+            block_bytes=cfg[1],
+            preallocate=cfg[2],
+            lazy_init=cfg[3],
+            verbose=verbose,
+        )
+        _GLOBAL_POOL_CFG = cfg
+    return _GLOBAL_DRAM_POOL
+
+
+# ============================================================================
 
 class KVOffloader:
     # Class-level flag to print initialization info only once
@@ -40,6 +229,11 @@ class KVOffloader:
         # CPU pinned buffers per (layer, block): (max_batch, heads, BLOCK, dim)
         self.k_cpu = [[None for _ in range(self.n_blocks)] for _ in range(layers)]
         self.v_cpu = [[None for _ in range(self.n_blocks)] for _ in range(layers)]
+
+        # 跟踪底层 uint8 buffer (用于 free_block)
+        # Track underlying uint8 buffers (for free_block)
+        self._k_raw_buf = [[None for _ in range(self.n_blocks)] for _ in range(layers)]
+        self._v_raw_buf = [[None for _ in range(self.n_blocks)] for _ in range(layers)]
 
         # importance / counts
         self.importance = np.zeros((max_batch, layers, self.n_blocks), dtype=np.float32)
@@ -103,6 +297,34 @@ class KVOffloader:
                 print("[KVOffloader][WARN] dram_limit_blk computed as 0; consider increasing KVCacheArgs.dram_limit_gb")
 
             KVOffloader._init_printed = True
+
+        # --- Auto-adjust KVCacheArgs.block_bytes if needed ---
+        # 计算单个 KV 块所需字节数（用于确保池块足够大）
+        bytes_per_kv = self.max_batch * self.heads * BLOCK * self.dim
+        kv_dtype = getattr(KVCacheArgs, "kv_dtype", None)
+        if kv_dtype is None:
+            # 如果 prefer_bf16=True，使用 bfloat16；否则使用 float16
+            if getattr(KVCacheArgs, "prefer_bf16", False):
+                kv_dtype = torch.bfloat16
+            else:
+                kv_dtype = torch.float16  # 默认使用 float16
+        elem_size = torch.tensor([], dtype=kv_dtype).element_size()
+        bytes_per_kv *= elem_size  # 通常是 2B for fp16/bf16
+
+        # 如果配置的块大小太小，自动提升到最近的 4KiB 对齐值
+        if KVCacheArgs.block_bytes < bytes_per_kv:
+            new_blk = int(math.ceil(bytes_per_kv / 4096) * 4096)
+            if getattr(KVCacheArgs, "verbose_pool", True):
+                print(f"[KVOffloader] Auto-enlarge block_bytes: {KVCacheArgs.block_bytes / (1<<20):.2f} MB → "
+                      f"{new_blk / (1<<20):.2f} MB (≥ one KV block {bytes_per_kv / (1<<20):.2f} MB)")
+            KVCacheArgs.block_bytes = new_blk
+
+        # --- DRAM Pool (Global Singleton) ---
+        self.pool = _get_or_create_pool(verbose=getattr(KVCacheArgs, "verbose_pool", True))
+        # 只第一次打印池信息，后续安静
+        if not hasattr(KVOffloader, "_pool_announced"):
+            print(f"[KVOffloader] DRAM pool: {self.pool.stats_str()}")
+            KVOffloader._pool_announced = True
 
         # --- SSD writer throttle (thread-safe flag) ---
         self._throttle_lock = threading.Lock()
@@ -196,11 +418,51 @@ class KVOffloader:
 
     # ---------------- internal helpers -----------------
     def _alloc_block(self, layer: int, blk: int):
-        """Pinned DRAM: (max_batch, heads, BLOCK, dim)"""
+        """
+        Allocate KV cache block using pool management: (max_batch, heads, BLOCK, dim)
+        使用池管理分配 KV cache 块：(max_batch, heads, BLOCK, dim)
+        """
         if self.k_cpu[layer][blk] is None:
             shape = (self.max_batch, self.heads, BLOCK, self.dim)
-            self.k_cpu[layer][blk] = torch.zeros(shape, dtype=torch.float16, pin_memory=True)
-            self.v_cpu[layer][blk] = torch.zeros_like(self.k_cpu[layer][blk])
+            # 计算每个 K/V 块所需字节数 (float16 = 2 bytes)
+            single_kv_bytes = self.max_batch * self.heads * BLOCK * self.dim * 2  # 2 for float16
+
+            # 从全局池中分配 K 块
+            k_buf = self.pool.alloc_block(single_kv_bytes)
+            if k_buf is None:
+                # 达到 DRAM 配额，回退到直接分配或报错
+                print(f"[KVOffloader][WARN] DRAM pool exhausted, cannot allocate K block for L{layer} B{blk}")
+                # 回退：直接分配（不受池管理）
+                self.k_cpu[layer][blk] = torch.zeros(shape, dtype=torch.float16, pin_memory=True)
+                self.v_cpu[layer][blk] = torch.zeros_like(self.k_cpu[layer][blk])
+                return
+
+            # 从全局池中分配 V 块
+            v_buf = self.pool.alloc_block(single_kv_bytes)
+            if v_buf is None:
+                # V 分配失败，释放已分配的 K 块
+                self.pool.free_block(k_buf)
+                print(f"[KVOffloader][WARN] DRAM pool exhausted, cannot allocate V block for L{layer} B{blk}")
+                # 回退：直接分配
+                self.k_cpu[layer][blk] = torch.zeros(shape, dtype=torch.float16, pin_memory=True)
+                self.v_cpu[layer][blk] = torch.zeros_like(self.k_cpu[layer][blk])
+                return
+
+            # 将 uint8 缓冲区 view 为 float16 并 reshape 到所需形状
+            k_view = k_buf[:single_kv_bytes].view(torch.float16).reshape(shape)
+            v_view = v_buf[:single_kv_bytes].view(torch.float16).reshape(shape)
+
+            # 初始化为零
+            k_view.zero_()
+            v_view.zero_()
+
+            self.k_cpu[layer][blk] = k_view
+            self.v_cpu[layer][blk] = v_view
+
+            # 保存底层 buffer 引用以便后续释放
+            self._k_raw_buf[layer][blk] = k_buf
+            self._v_raw_buf[layer][blk] = v_buf
+    
 
     # ---------------- public API -----------------
     def push(self, layer: int, blk: int, k: torch.Tensor, v: torch.Tensor,
@@ -530,6 +792,15 @@ class KVOffloader:
             if self.global_tracker:
                 for batch_idx in range(self.max_batch):
                     self.global_tracker.update_dram_storage(batch_idx, L, [B], "remove")
+
+            # 释放底层 buffer 回全局池
+            if self._k_raw_buf[L][B] is not None:
+                self.pool.free_block(self._k_raw_buf[L][B])
+                self._k_raw_buf[L][B] = None
+            if self._v_raw_buf[L][B] is not None:
+                self.pool.free_block(self._v_raw_buf[L][B])
+                self._v_raw_buf[L][B] = None
+
             self.k_cpu[L][B] = self.v_cpu[L][B] = None
             return
 
@@ -545,6 +816,15 @@ class KVOffloader:
 
         # Actual write: concat K and V on the last dim
         self.ssd.write(L, B, torch.cat([self.k_cpu[L][B], self.v_cpu[L][B]], dim=-1))
+
+        # 释放底层 buffer 回全局池
+        if self._k_raw_buf[L][B] is not None:
+            self.pool.free_block(self._k_raw_buf[L][B])
+            self._k_raw_buf[L][B] = None
+        if self._v_raw_buf[L][B] is not None:
+            self.pool.free_block(self._v_raw_buf[L][B])
+            self._v_raw_buf[L][B] = None
+
         self.k_cpu[L][B] = self.v_cpu[L][B] = None
         self.on_ssd[L][B] = True
 

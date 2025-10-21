@@ -3,8 +3,9 @@ import os
 import time
 from pathlib import Path
 from typing import List, Optional
-import torch
+import torch, torch.nn as nn
 from tqdm import tqdm
+import copy
 from transformers import LlamaTokenizerFast, AutoTokenizer  
 from .config import ModelArgs
 from .model import Transformer
@@ -32,44 +33,333 @@ except ImportError:
 # ================================
 
 class LLaMA:
+    # def __init__(self, tokenizer, checkpoint, args: ModelArgs):
+    #     """
+    #     Initialize model and (optionally) load checkpoint weights.
+    #     Model is first constructed on the device specified in `args.device` (may be 'cpu' or 'cuda:X').
+    #     """
+    #     self.tokenizer = tokenizer
+    #     self.args = args
+
+    #     # (Optional) Global tracker init (left commented — keep original code)
+    #     # from .global_state_tracker import init_global_tracker, get_global_tracker
+    #     # from .kv_offload import BLOCK
+    #     # if get_global_tracker() is None:
+    #     #     print(f"[INFO] Initializing global state tracker...")
+    #     #     n_blocks = (args.max_seq_len + BLOCK - 1) // BLOCK
+    #     #     tracker = init_global_tracker(
+    #     #         max_batch=args.max_batch_size,
+    #     #         layers=args.n_layers,
+    #     #         n_blocks=n_blocks
+    #     #     )
+    #     #     print(f"[INFO] Global state tracker initialized, waiting for actual batch registration")
+
+    #     # print(f"[INFO] Initializing model on device: {args.device}")
+    #     # self.model = Transformer(args)
+
+    #     # print(f"[INFO] Moving model to {args.device}...")
+    #     # self.model = self.model.to(args.device)
+        
+    #     use_meta_init = (
+    #     getattr(args, "param_init_device", None) == "meta"
+    #         or getattr(args, "init_on_meta", False)
+    #         or str(getattr(args, "device", "")) == "meta"
+    #     )
+    #     if use_meta_init:
+    #         meta_args = copy.copy(args)
+    #         # 避免在构造期把 freqs_complex 等建在真实设备
+    #         meta_args.device = "meta"
+    #         print("[INFO] Initializing model skeleton on device: meta")
+    #         with torch.device("meta"):
+    #             self.model = Transformer(meta_args)
+    #     else:
+    #         print(f"[INFO] Initializing model on device: {args.device}")
+    #         self.model = Transformer(args)
+    #         print(f"[INFO] Moving model to {args.device}...")
+    #         self.model = self.model.to(args.device)
+
+    #     # print(f"[INFO] Converting to half precision...")
+    #     # self.model = self.model.half()
+
+    #     import re
+    #     def _remap_ckpt_keys(sd):
+    #         out = {}
+    #         for k, v in sd.items():
+    #             nk = k
+    #             nk = re.sub(r"^layers\.(\d+)\.input_layernorm\.(weight|bias)$",
+    #                         r"layers.\1.attn_norm.\2", nk)
+    #             nk = re.sub(r"^layers\.(\d+)\.post_attention_layernorm\.(weight|bias)$",
+    #                         r"layers.\1.ffn_norm.\2", nk)
+    #             nk = nk.replace("model.embed_tokens.", "embed_tokens.")
+    #             nk = nk.replace("model.norm.", "norm.")
+    #             out[nk] = v
+    #         return out
+
+
+    #     if checkpoint is not None:
+    #         checkpoint = _remap_ckpt_keys(checkpoint)
+    #         print(f"[INFO] Loading state dict...")
+
+    #         has_meta = False
+    #         try:
+    #             has_meta = any(getattr(p, "is_meta", False) or (p.device.type == "meta")
+    #                            for p in self.model.parameters())
+    #         except Exception:
+    #             pass
+
+    #         if has_meta:
+    #             try:
+    #                 self.model = self.model.to_empty("cpu")
+    #             except Exception as e:
+    #                 print(f"[WARN] to_empty('cpu') failed on meta model: {e}")
+
+    #         # 重要：assign=True 避免"copy 到 meta 是 no-op"的警告
+    #         missing_keys, unexpected_keys = self.model.load_state_dict(
+    #             checkpoint, strict=False, assign=has_meta
+    #         )
+
+    #         if missing_keys:
+    #             print(f"[WARNING] Missing keys: {len(missing_keys)} keys")
+    #         if unexpected_keys:
+    #             print(f"[WARNING] Unexpected keys: {len(unexpected_keys)} keys")
+    #         print(f"[INFO] Model weights loaded successfully")
+            
+    #     for name, p in self.model.named_parameters():
+    #         if getattr(p, "is_meta", False):
+    #             if name.endswith("norm.weight"):
+    #                 p.data = torch.ones(p.shape, dtype=p.dtype, device="cpu")
+    #             elif name.endswith("bias"):
+    #                 p.data = torch.zeros(p.shape, dtype=p.dtype, device="cpu")
+    #             else:
+    #                 buf = torch.empty(p.shape, dtype=p.dtype, device="cpu")
+    #                 nn.init.normal_(buf, mean=0.0, std=0.02)
+    #                 p.data = buf
+
+    #     for name, b in self.model.named_buffers():
+    #         if getattr(b, "is_meta", False):
+    #             b.data = torch.zeros(b.shape, dtype=b.dtype, device="cpu")
+    
+    
     def __init__(self, tokenizer, checkpoint, args: ModelArgs):
         """
         Initialize model and (optionally) load checkpoint weights.
-        Model is first constructed on the device specified in `args.device` (may be 'cpu' or 'cuda:X').
+        - 支持 meta 骨架（参数不分配真实 storage）
+        - 若提供 checkpoint:
+            * 若骨架为 meta: 先 to_empty(device="cpu")，再 load_state_dict(assign=True)
+            * 自动 remap 关键 keys（attn_norm / ffn_norm / embed_tokens / norm）
+        - 兜底：清理所有残余 meta 参数/缓冲
         """
+        import copy as _copy
+        import re as _re
+        import torch
+        import torch.nn as nn
+
         self.tokenizer = tokenizer
         self.args = args
 
-        # (Optional) Global tracker init (left commented — keep original code)
-        # from .global_state_tracker import init_global_tracker, get_global_tracker
-        # from .kv_offload import BLOCK
-        # if get_global_tracker() is None:
-        #     print(f"[INFO] Initializing global state tracker...")
-        #     n_blocks = (args.max_seq_len + BLOCK - 1) // BLOCK
-        #     tracker = init_global_tracker(
-        #         max_batch=args.max_batch_size,
-        #         layers=args.n_layers,
-        #         n_blocks=n_blocks
+
+                
+        # ---------- 1) 构建模型骨架（meta-safe） ----------
+        use_meta_init = (
+            getattr(args, "param_init_device", None) == "meta"
+            or getattr(args, "init_on_meta", False)
+            or str(getattr(args, "device", "")) == "meta"
+        )
+
+        if use_meta_init:
+            meta_args = _copy.copy(args)
+            meta_args.device = "meta"  # 避免 freqs_complex 等在真实设备上被构造
+            print("[INFO] Initializing model skeleton on device: meta")
+            # self.model.freqs_complex = precompute_theta_pos_frequencies()
+            with torch.device("meta"):
+                self.model = Transformer(meta_args)
+        else:
+            print(f"[INFO] Initializing model on device: {args.device}")
+            self.model = Transformer(args)
+            print(f"[INFO] Moving model to {args.device}...")
+            self.model = self.model.to(args.device)
+
+        # ---------- 2) （可选）checkpoint key 映射 ----------
+        def _remap_ckpt_keys(sd):
+            out = {}
+            for k, v in sd.items():
+                nk = k
+                nk = _re.sub(r"^layers\.(\d+)\.input_layernorm\.(weight|bias)$",
+                            r"layers.\1.attention_norm.\2", nk)
+                nk = _re.sub(r"^layers\.(\d+)\.post_attention_layernorm\.(weight|bias)$",
+                            r"layers.\1.ffn_norm.\2", nk)
+                nk = nk.replace("model.embed_tokens.", "embed_tokens.")
+                nk = nk.replace("model.norm.", "norm.")
+                out[nk] = v
+            return out
+
+        # ---------- 3) 加载 checkpoint（meta → CPU 空实体化 → assign=True） ----------
+        # missing_keys = []
+        # unexpected_keys = []
+
+        # if checkpoint is not None:
+        #     checkpoint = _remap_ckpt_keys(checkpoint)
+        #     print("[INFO] Loading state dict...")
+
+        #     # 检查是否为 meta 骨架
+        #     has_meta = False
+        #     try:
+        #         for _n, _p in self.model.named_parameters():
+        #             if getattr(_p, "is_meta", False) or (_p.device.type == "meta"):
+        #                 has_meta = True
+        #                 break
+        #     except Exception:
+        #         pass
+
+        #     if has_meta:
+        #         # ☆ 关键：必须用关键字 device=，否则就是你日志里的报错
+        #         self.model = self.model.to_empty(device="cpu")
+
+        #     # 重要：assign=True → 直接绑定 storage；meta 情况下避免 no-op
+        #     missing_keys, unexpected_keys = self.model.load_state_dict(
+        #         checkpoint, strict=False, assign=has_meta
         #     )
-        #     print(f"[INFO] Global state tracker initialized, waiting for actual batch registration")
 
-        print(f"[INFO] Initializing model on device: {args.device}")
-        self.model = Transformer(args)
-
-        print(f"[INFO] Moving model to {args.device}...")
-        self.model = self.model.to(args.device)
-
-        # print(f"[INFO] Converting to half precision...")
-        # self.model = self.model.half()
-
-        if checkpoint is not None:
-            print(f"[INFO] Loading state dict...")
-            missing_keys, unexpected_keys = self.model.load_state_dict(checkpoint, strict=False)
+        #     if missing_keys:
+        #         print(f"[WARNING] Missing keys: {len(missing_keys)} keys")
+        #     if unexpected_keys:
+        #         print(f"[WARNING] Unexpected keys: {len(unexpected_keys)} keys")
+        #     print("[INFO] Model weights loaded successfully")
+        use_raw_ssd = (getattr(args, "weight_source", "") == "raw-ssd")
+        if (checkpoint is not None) and (not use_raw_ssd):
+            checkpoint = _remap_ckpt_keys(checkpoint)
+            print("[INFO] Loading state dict...")
+            any_meta = False
+            for _n, _p in self.model.named_parameters():
+                if getattr(_p, "is_meta", False) or (_p.device.type == "meta"):
+                    any_meta = True
+                    break
+            if any_meta:
+                self.model = self.model.to_empty(device="cpu")  # 关键字参数
+            missing_keys, unexpected_keys = self.model.load_state_dict(
+                checkpoint, strict=False, assign=any_meta
+            )
             if missing_keys:
                 print(f"[WARNING] Missing keys: {len(missing_keys)} keys")
             if unexpected_keys:
                 print(f"[WARNING] Unexpected keys: {len(unexpected_keys)} keys")
-            print(f"[INFO] Model weights loaded successfully")
+            print("[INFO] Model weights loaded successfully")
+            
+        # ---------- 3.5) raw-ssd 模式：只物化小参数（norm/bias），大权重保持 meta ----------
+        _SMALL_PAT = _re.compile(r"(norm(\.|$)|\.bias$)")  # 层内/全局 norm 与 bias
+        _MAX_SAFE_NUMEL = 1_000_000                       # >1e6 视为"大矩阵"，不在此处初始化
+
+        if use_raw_ssd:
+            # raw-ssd 模式：只物化小参数，大权重保持在 meta device
+            for name, p in list(self.model.named_parameters()):
+                if getattr(p, "is_meta", False) or (hasattr(p, "device") and p.device.type == "meta"):
+                    # 只处理小参数（norm/bias），且 numel 不超过阈值
+                    if _SMALL_PAT.search(name) and p.numel() <= _MAX_SAFE_NUMEL:
+                        # 小参数兜底
+                        if name.endswith("norm.weight"):
+                            new_t = torch.ones(tuple(p.shape), dtype=p.dtype, device="cpu")
+                        elif name.endswith("bias"):
+                            new_t = torch.zeros(tuple(p.shape), dtype=p.dtype, device="cpu")
+                        else:
+                            new_t = torch.zeros(tuple(p.shape), dtype=p.dtype, device="cpu")
+                        new_p = nn.Parameter(new_t, requires_grad=p.requires_grad)
+                        # 替换到模块
+                        parent = self.model
+                        parts = name.split(".")
+                        for s in parts[:-1]:
+                            parent = getattr(parent, s)
+                        setattr(parent, parts[-1], new_p)
+                    # else: 大权重或大参数 - 跳过，保持在 meta device
+                
+                
+        # ---------- 4) 兜底：消灭任何残余 meta 参数/缓冲 ----------
+        # 注意：raw-ssd 模式下，大权重保留在 meta device，只物化小参数
+        # 帮助函数：根据 "a.b.c" 定位到父模块并设置属性
+        def _set_module_attr(root_mod: nn.Module, dotted: str, value):
+            parts = dotted.split(".")
+            parent = root_mod
+            for p in parts[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, parts[-1], value)
+
+        # 4.1 参数兜底：若仍是 meta，则直接替换为新的 nn.Parameter（避免 .data = ...）
+        # 在 raw-ssd 模式下，只处理小参数（norm/bias），大权重保持 meta
+        if not use_raw_ssd:
+            with torch.no_grad():
+                for name, p in list(self.model.named_parameters()):
+                    if getattr(p, "is_meta", False) or (hasattr(p, "device") and p.device.type == "meta"):
+                        # 用 dtype/shape 构造 CPU 参数
+                        if name.endswith("norm.weight"):
+                            new_t = torch.ones(tuple(p.shape), dtype=p.dtype, device="cpu")
+                        elif name.endswith("bias"):
+                            new_t = torch.zeros(tuple(p.shape), dtype=p.dtype, device="cpu")
+                        else:
+                            new_t = torch.empty(tuple(p.shape), dtype=p.dtype, device="cpu")
+                            nn.init.normal_(new_t, mean=0.0, std=0.02)
+                        new_p = nn.Parameter(new_t, requires_grad=p.requires_grad)
+                        _set_module_attr(self.model, name, new_p)
+
+                # 4.2 缓冲兜底：若仍是 meta，则替换为 zeros buffer
+                for name, b in list(self.model.named_buffers()):
+                    if getattr(b, "is_meta", False) or (hasattr(b, "device") and b.device.type == "meta"):
+                        new_b = torch.zeros(tuple(b.shape), dtype=b.dtype, device="cpu")
+                        _set_module_attr(self.model, name, new_b)
+
+            # 4.3 哨兵：若还有 meta，直接报出具体名字，方便你定位 key 映射是否还缺
+            still_meta_params = [n for n, p in self.model.named_parameters()
+                                if getattr(p, "is_meta", False) or (hasattr(p, "device") and p.device.type == "meta")]
+            still_meta_buffers = [n for n, b in self.model.named_buffers()
+                                if getattr(b, "is_meta", False) or (hasattr(b, "device") and b.device.type == "meta")]
+            if still_meta_params or still_meta_buffers:
+                raise RuntimeError(f"After to_empty(assign) & fallback, still meta tensors exist:\n"
+                                f"params={still_meta_params[:5]} buffers={still_meta_buffers[:5]}")
+        else:
+            # raw-ssd 模式：大权重保持 meta，只检查缓冲是否需要物化
+            with torch.no_grad():
+                for name, b in list(self.model.named_buffers()):
+                    if getattr(b, "is_meta", False) or (hasattr(b, "device") and b.device.type == "meta"):
+                        new_b = torch.zeros(tuple(b.shape), dtype=b.dtype, device="cpu")
+                        _set_module_attr(self.model, name, new_b)
+            print(f"[INFO] raw-ssd mode: large weights kept on meta device, will be streamed from SSD")
+
+        def _make_causal_mask(sz: int, device: torch.device):
+            # [1, 1, T, T] 上三角（不含对角线）为 True
+            m = torch.ones((1, 1, sz, sz), dtype=torch.bool, device=device).triu(1)
+            return m
+
+        def _materialize_like(t: torch.Tensor, device="cpu"):
+            # 不依赖 zeros_like(empty_like) 在 meta 上的实现，直接用 shape/dtype
+            return torch.zeros(tuple(t.shape), dtype=t.dtype, device=device)
+
+        def _fix_single_attr(mod, name, t: torch.Tensor, max_seq_len: int):
+            """把模块 mod 的属性 name（一个 meta Tensor）实体化为合理的 CPU 张量。"""
+            # 针对常见名字做特例：timer / mask
+            lname = name.lower()
+            if "mask" in lname and t.ndim >= 2:
+                new_t = _make_causal_mask(max_seq_len, device=torch.device("cpu"))
+            elif lname.endswith("_us") or "timer" in lname or "time" in lname:
+                new_t = torch.zeros((), dtype=torch.int64, device="cpu")
+            else:
+                new_t = _materialize_like(t, device="cpu")
+            setattr(mod, name, new_t)
+
+        def _scrub_meta_tensor_attrs(module: torch.nn.Module, max_seq_len: int = 4096):
+            """递归扫描所有子模块，把“未注册的 meta 张量属性”替换为 CPU 真张量。"""
+            for child in module.children():
+                _scrub_meta_tensor_attrs(child, max_seq_len)
+
+            # 遍历 __dict__，仅处理 “不是 Parameter / 不是已注册 buffer” 的张量属性
+            for name, val in list(vars(module).items()):
+                if isinstance(val, torch.nn.Parameter):
+                    continue
+                if isinstance(val, torch.Tensor):
+                    is_meta = getattr(val, "is_meta", False) or (hasattr(val, "device") and val.device.type == "meta")
+                    if is_meta:
+                        _fix_single_attr(module, name, val, max_seq_len)
+
+        _scrub_meta_tensor_attrs(self.model, max_seq_len=getattr(self.args, "max_seq_len", 4096))
+
+    
 
     def _configure_preload_mode(self, preload_config: dict):
         """
@@ -293,9 +583,25 @@ class LLaMA:
         model = self.model
 
         # Keep small modules resident in HBM (fast, avoids repeated transfers)
-        model.embed_tokens = model.embed_tokens.to(device)
-        model.norm = model.norm.to(device)
-        model.output = model.output.to(device)
+        # model.embed_tokens = model.embed_tokens.to(device)
+        # model.norm = model.norm.to(device)
+        # model.output = model.output.to(device)
+        def _to_meta_safe(mod, device):
+            has_meta = False
+            try:
+                for p in mod.parameters(recurse=True):
+                    if getattr(p, "is_meta", False) or p.device.type == "meta":
+                        has_meta = True; break
+                if not has_meta:
+                    for b in mod.buffers(recurse=True):
+                        if getattr(b, "is_meta", False) or (hasattr(b, "device") and b.device.type == "meta"):
+                            has_meta = True; break
+            except Exception:
+                pass
+            return mod.to_empty(device=device) if has_meta else mod.to(device)
+        model.embed_tokens = _to_meta_safe(model.embed_tokens, device)
+        model.norm = _to_meta_safe(model.norm, device)
+        model.output = _to_meta_safe(model.output, device)
 
         # Handle RoPE frequencies tensor/device placement
         self._handle_freqs_complex(device)
@@ -390,9 +696,26 @@ class LLaMA:
         try:
             # Force-sync core modules to target device
             print("🔧 Synchronizing all components to target device...")
-            model.embed_tokens = model.embed_tokens.to(device)
-            model.norm = model.norm.to(device)
-            model.output = model.output.to(device)
+            # model.embed_tokens = model.embed_tokens.to(device)
+            # model.norm = model.norm.to(device)
+            # model.output = model.output.to(device)
+            def _to_meta_safe(mod, device):
+                has_meta = False
+                try:
+                    for p in mod.parameters(recurse=True):
+                        if getattr(p, "is_meta", False) or p.device.type == "meta":
+                            has_meta = True; break
+                    if not has_meta:
+                        for b in mod.buffers(recurse=True):
+                            if getattr(b, "is_meta", False) or (hasattr(b, "device") and b.device.type == "meta"):
+                                has_meta = True; break
+                except Exception:
+                    pass
+                return mod.to_empty(device=device) if has_meta else mod.to(device)
+            model.embed_tokens = _to_meta_safe(model.embed_tokens, device)
+            model.norm = _to_meta_safe(model.norm, device)
+            model.output = _to_meta_safe(model.output, device)
+            
             if hasattr(model, 'freqs_complex'):
                 model.freqs_complex = model.freqs_complex.to(device)
 
@@ -400,10 +723,14 @@ class LLaMA:
             print("🔧 Synchronizing layer norms to GPU...")
             if hasattr(model, "layers"):
                 for layer in model.layers:
-                    if hasattr(layer, 'attn_norm'):
-                        layer.attn_norm = layer.attn_norm.to(device)
-                    if hasattr(layer, 'ffn_norm'):
-                        layer.ffn_norm = layer.ffn_norm.to(device)
+                    # if hasattr(layer, 'attention_norm'):
+                    #     layer.attention_norm = layer.attention_norm.to(device)
+                    # if hasattr(layer, 'ffn_norm'):
+                    #     layer.ffn_norm = layer.ffn_norm.to(device)
+                    if hasattr(layer, "attention_norm"):
+                        layer.attention_norm = _to_meta_safe(layer.attention_norm)
+                    if hasattr(layer, "ffn_norm"):
+                        layer.ffn_norm = _to_meta_safe(layer.ffn_norm)
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
@@ -477,9 +804,14 @@ class LLaMA:
 
         args.checkpoints_dir = str(ckpt_dir)
 
+        # ---- Determine if using raw-ssd mode ----
+        use_raw_ssd = (mode in {"ssd", "mixed"}) or (mode_config and mode_config.get("weight_source") == "raw-ssd")
+
         # ---- Load checkpoint weights to CPU (optional) ----
         checkpoint = None
-        if load_model:
+        # 重要：raw-ssd 模式下不加载 checkpoint，避免把整包权重吃进 CPU
+        if load_model and not use_raw_ssd:
+            print(f"[INFO] Loading checkpoint: {ckpt_file}")
             ckpt_file = sorted(ckpt_dir.glob("*.pth"))[0]
             print(f"[INFO] Loading checkpoint: {ckpt_file}")
             t0 = time.time()
@@ -490,25 +822,92 @@ class LLaMA:
         cpu_args = ModelArgs.from_json(
             str(params_path), max_seq_len=max_seq_len, max_batch_size=max_batch_size, device="cpu"
         )
+        # 只建骨架，避免 CPU OOM：在 SSD/流式 或 不加载权重 时启用 meta 初始化
+        want_meta = (not load_model) or (mode in ("ssd", "stream")) or use_raw_ssd
+        if want_meta:
+            setattr(cpu_args, "init_on_meta", True)
+            setattr(cpu_args, "param_init_device", "meta")
+
+        if use_raw_ssd:
+            setattr(cpu_args, "weight_source", "raw-ssd")
+
         if topk_blk is not None:
             cpu_args.topk_blk = topk_blk
         cpu_args.checkpoints_dir = str(ckpt_dir)
-
+        #########
+        cpu_args.weight_source = "raw-ssd" 
+        #########
         llama = LLaMA(tokenizer, checkpoint, cpu_args)
 
-        # # ---- Weight loading strategies ----
-        # if enable_ssd_streaming and device.startswith("cuda"):
-        #     # SSD混合流式模式：SSD -> CPU缓存 -> GPU流式传输
-        #     llama._configure_ssd_streaming(ssd_streaming_config or {})
-        # elif enable_preload_mode and device.startswith("cuda"):
-        #     # 新的预加载模式：先加载几层，然后在推理时预取
-        #     llama._configure_preload_mode(preload_config or {})
-        # elif enable_weight_streaming and device.startswith("cuda"):
-        #     # 原有的流式加载模式
-        #     llama._configure_weight_streaming(streaming_config or {})
-        # elif device.startswith("cuda"):
+        # ---- raw-ssd 模式：meta 骨架 + SSD 源 + 小模块物化 ----
+        if use_raw_ssd:
+            print("[INFO] Initializing model weights on meta device for raw-ssd mode...")
+
+            # 小模块（resident）物化到 CPU（注意 to_empty 必须关键字传参）
+            def _materialize(m, dev="cpu"):
+                return m.to_empty(device=torch.device(dev))
+
+            llama.model.embed_tokens = _materialize(llama.model.embed_tokens, "cpu")
+            llama.model.norm = _materialize(llama.model.norm, "cpu")
+            llama.model.output = _materialize(llama.model.output, "cpu")
+
+            # rope 重新计算，而不是从 meta 迁移
+            from .layers import precompute_theta_pos_frequencies
+            llama.model.freqs_complex = precompute_theta_pos_frequencies(
+                head_dim=args.dim // args.n_heads,
+                seq_len=args.max_seq_len * 2,
+                device=device,
+                theta=args.rope_theta,
+            )
+
+            # 初始化 WSM 的 SSD 后端（传 raw block device + manifest）
+            from .weight_streaming_manager import WeightStreamingManager
+
+            # Ensure model.layers accessible
+            if hasattr(llama.model, "layer_infos"):
+                try:
+                    blocks = [info.block for info in llama.model.layer_infos if info.block is not None]
+                    if blocks and not hasattr(llama.model, "layers"):
+                        llama.model.layers = blocks
+                except Exception:
+                    pass
+
+            cfg = mode_config or {}
+            wsm = WeightStreamingManager(
+                model=llama.model,
+                device=device,
+                prefetch_distance=cfg.get("prefetch_distance", 1),
+                max_cached_layers=cfg.get("max_cached_layers", 3),
+                warmup_layers=cfg.get("warmup_layers", 1),
+                verbose=cfg.get("verbose", False),
+                monitor_fragmentation=False,
+                ssd_manifest_path=cfg.get("manifest_path"),
+                cpu_cache_layers=cfg.get("cpu_cache_layers", 50),
+                staging_mb=cfg.get("staging_mb", 64),
+            )
+
+            llama.weight_streaming_manager = wsm
+
+            # 用 SSD manifest 把"resident 模块"加载到目标设备（CPU->GPU 按需）
+            # 这里只加载 embed/norm/output/bias；大权重按层 on-demand。
+            if hasattr(wsm, "load_resident_from_ssd"):
+                wsm.load_resident_from_ssd(llama.model, target_device=device)
+
+            # Integrate WSM hooks into layers
+            from .stream_mnt import get_streams
+            llama.streams = get_streams(device)
+            llama._integrate_wsm_to_layers(wsm, llama.streams)
+
+            # Configure KV streams
+            llama._configure_kv_streams()
+
+            # Verify device placement
+            llama._verify_and_fix_device_placement()
+
+            print("✅ Weight streaming enabled (SSD -> CPU(pinned) -> GPU by layer)")
+
         # ---- Weight loading strategies (统一入口) ----
-        if mode is not None:
+        elif mode is not None:
             m = (mode or "").lower()
             cfg = mode_config or {}
             if m == "ssd" and device.startswith("cuda"):

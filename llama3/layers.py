@@ -238,10 +238,16 @@ class SelfAttention(nn.Module):
         self.is_cuda = str(self.device).startswith("cuda") and torch.cuda.is_available()
         
         # Linear权重初始化在CPU
-        self.wq = nn.Linear(args.dim, self.n_heads_q * self.head_dim, bias=False, device="cpu")
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device="cpu")
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device="cpu")
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, device="cpu")
+        # self.wq = nn.Linear(args.dim, self.n_heads_q * self.head_dim, bias=False, device="cpu")
+        # self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device="cpu")
+        # self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device="cpu")
+        # self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, device="cpu")
+        _dev = getattr(args, "param_init_device", None)
+        kw = ({"device": _dev} if _dev is not None else {})
+        self.wq = nn.Linear(args.dim, self.n_heads_q * self.head_dim, bias=False, **kw)
+        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, **kw)
+        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, **kw)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, **kw)
         self.block_sz = BLOCK
 
         self.apply_causal_mask = True
@@ -278,7 +284,28 @@ class SelfAttention(nn.Module):
         self.scores_buffer = None
         # self.streams = streams  # 保存streams引用用于compute
         
-        
+    def _get_causal_mask(self, t: int, device):
+        # 若缓存不存在 / 太小 / 设备不一致，就重建
+        cm = getattr(self, "_causal_mask", None)
+        if (cm is None) or (cm.device != device) or (cm.size(-1) < t):
+            cm = torch.ones((1, 1, t, t), dtype=torch.bool, device=device).triu(1)
+            try:
+                self.register_buffer("_causal_mask", cm, persistent=False)
+            except Exception:
+                self._causal_mask = cm
+        return cm[..., :t, :t]    
+    
+    @staticmethod
+    def _safe_item_sum_1d(t: torch.Tensor, s: int, e: int) -> float:
+        # t 可能是 meta；也可能为空/None；都给出 0.0
+        if t is None:
+            return 0.0
+        if getattr(t, "is_meta", False) or (hasattr(t, "device") and t.device.type == "meta"):
+            return 0.0
+        if s >= t.size(0):
+            return 0.0
+        # 用 detach().cpu().item() 保证不是 CUDA/Event 等特殊张量
+        return float(t[s:e].sum().detach().cpu().item())
         
     
     def _get_modules_dict(self):
@@ -379,9 +406,26 @@ class SelfAttention(nn.Module):
         if not self.wq.weight.is_cuda:
             for mod in (self.wq, self.wk, self.wv, self.wo):
                 mod.to(x.device, non_blocking=True)
+                
         
         start_time = time.time()
+        assert x.dim()==3, f"x dim={x.dim()}, shape={x.shape}"
         bsz, seqlen, _ = x.shape
+        
+        
+        def _ensure_cpu_scalar_attr(mod, name: str):
+            if hasattr(mod, name):
+                t = getattr(mod, name)
+                if isinstance(t, torch.Tensor) and (getattr(t, "is_meta", False)
+                                                    or (hasattr(t, "device") and t.device.type == "meta")):
+                    setattr(mod, name, torch.zeros((), dtype=torch.int64, device="cpu"))
+            else:
+                # 首次建立
+                setattr(mod, name, torch.zeros((), dtype=torch.int64, device="cpu"))
+
+        _ensure_cpu_scalar_attr(self, "attn_us")
+        _ensure_cpu_scalar_attr(self, "total_forward_us")
+        
         
         w_dtype = self.wq.weight.dtype
         if x.dtype != w_dtype:
@@ -593,7 +637,11 @@ class SelfAttention(nn.Module):
                     seq_len_q = q.size(2)
                     seq_len_k = k_full.size(2)
                     mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
-                    scores = scores.masked_fill(mask.bool(), float('-inf'))
+                    # scores = scores.masked_fill(mask.bool(), float('-inf'))
+                    
+                    mask = self._get_causal_mask(scores.size(-1), device=scores.device)
+                    scores = scores.masked_fill(mask, float('-inf'))
+
 
                 # Softmax和输出计算
                 attn_weights = torch.softmax(scores, dim=-1)
@@ -608,35 +656,149 @@ class SelfAttention(nn.Module):
                 else:
                     self.attn_time = 0
         nvtx.range_pop()  # attention_compute
-        out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
+        # out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
         
+        # stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
+        # self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
+        # self.attn_time       = stats.get("attn_us",     0)
+        
+        # # Update block importances (only if offloader exists)
+        # if getattr(self, "offloader", None) is not None:
+        #     with torch.no_grad():
+        #         token_imp = attn_weights.mean(dim=(0, 1, 2))  # (Tkv,)
+        #         block_scores = []
+        #         for i, _ in enumerate(blocks):
+        #             s = i * self.block_sz
+        #             e = min(s + self.block_sz, token_imp.size(0))
+        #             score = self._safe_item_sum_1d(token_imp, s, e)
+        #             block_scores.append(score)
+
+        #         self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx=batch_idx)
+
+        # feat = self.n_heads_q * self.head_dim  # = dim
+        # if out.dim() == 2:
+        #     # 误展平成 [B, seqlen*dim] 的情形：还原成 [B, seqlen, dim]
+        #     out = out.view(bsz, seqlen, self.n_heads_q, self.head_dim).reshape(bsz, seqlen, feat)
+        # elif out.dim() == 3 and out.size(-1) != feat:
+        #     # 例如被写成 view(bsz, -1) 合并了最后两维
+        #     out = out.reshape(bsz, seqlen, feat)
+
+        # # 输出投影 - 使用compute stream
+        # if compute_stream:
+        #     with torch.cuda.stream(compute_stream):
+        #         result = self.wo(out)
+        # else:
+        #     result = self.wo(out)
+
+        # total_time = (time.time() - start_time) * 1000000  # 转换为微秒
+        # PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
+        # print(f"[ATTN] Layer {self.layer_id} computation done")
+        # return result
+        
+        out = out.transpose(1, 2).contiguous()
+
+        # --- 统计信息（若有） ---
         stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
         self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
         self.attn_time       = stats.get("attn_us",     0)
+
+
+        feat = self.n_heads_q * self.head_dim  # = dim
+        B, Tq = bsz, seqlen
+        w = self.wo.weight
         
-        # Update block importances (only if offloader exists)
+        # 重要度（attn_weights 已实体化时才计算；blocks 缺失则按 block_sz 推导）
         if getattr(self, "offloader", None) is not None:
             with torch.no_grad():
-                token_imp = attn_weights.mean(dim=(0, 1, 2))  # (Tkv,)
-                block_scores = []
-                for i, _ in enumerate(blocks):
-                    s = i * self.block_sz
-                    e = min(s + self.block_sz, token_imp.size(0))
-                    score = float(token_imp[s:e].sum().item()) if s < token_imp.size(0) else 0.0
-                    block_scores.append(score)
+                if ('attn_weights' in locals()
+                    and attn_weights is not None
+                    and not getattr(attn_weights, "is_meta", False)):
+                    # [B, Hq, Tq, Tkv] -> (Tkv,)
+                    token_imp = attn_weights.detach().mean(dim=(0, 1, 2))
+                    if 'blocks' not in locals() or blocks is None:
+                        Tkv = int(token_imp.size(0))
+                        nblk = (Tkv + self.block_sz - 1) // self.block_sz
+                        blocks = [(i*self.block_sz, min((i+1)*self.block_sz, Tkv)) for i in range(nblk)]
+                    block_scores = []
+                    for i, _ in enumerate(blocks):
+                        s = i * self.block_sz
+                        e = min(s + self.block_sz, token_imp.size(0))
+                        if hasattr(self, "_safe_item_sum_1d"):
+                            score = self._safe_item_sum_1d(token_imp, s, e)  # 建议已定义为 @staticmethod
+                        else:
+                            score = float(token_imp[s:e].sum().detach().cpu().item())
+                        block_scores.append(score)
+                    self.offloader.update_importances(self.layer_id, blocks, block_scores,
+                                                    batch_idx=locals().get("batch_idx", 0))
+                    
+                    
+        # --- 形状护栏：确保送入 wo 前为 [B, seqlen, dim] ---
 
-                self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx=batch_idx)
+        def _as_btD_take_last(_out, B, Tq, feat):
+            """把 out 统一成 [B, Tq, feat]；若含累计 T_total，则仅取最后 Tq。"""
+            ne = _out.numel()
+            if _out.dim() == 3:
+                # e.g. [B, T?, D?]：矫正最后一维，再裁剪 Tq
+                T_found = _out.size(1)
+                if _out.size(-1) != feat:
+                    # 用元素数反推 T_found
+                    T_found = ne // (B * feat)
+                    _out = _out.reshape(B, T_found, feat)
+                return _out[:, -Tq:, :]  # decode 场景：只取最后 Tq
+            elif _out.dim() == 2:
+                # e.g. [B, T_total*feat] 或 [B, feat]
+                C = _out.size(1)
+                if C == feat:
+                    return _out.view(B, 1, feat)[:, -Tq:, :]
+                if C % feat == 0:
+                    T_found = C // feat
+                    return _out.view(B, T_found, feat)[:, -Tq:, :]
+                # 兜底：按元素数反推
+                T_found = ne // (B * feat)
+                return _out.view(B, T_found, feat)[:, -Tq:, :]
+            else:
+                # 其它异常：用元素数反推
+                T_found = ne // (B * feat)
+                return _out.reshape(B, T_found, feat)[:, -Tq:, :]
 
-        # 输出投影 - 使用compute stream
+        # 如果不是期望形状/维度，做一次统一矫正
+        if out.dim() != 3 or out.size(0) != B or out.size(1) != Tq or out.size(2) != feat:
+            out = _as_btD_take_last(out, B, Tq, feat)
+        else:
+            # 标准路径：已是 [B, Tq, *]，但最后一维可能不是 feat
+            if out.size(-1) != feat:
+                # 先尝试按元素数恢复再裁剪
+                T_found = out.numel() // (B * feat)
+                out = out.reshape(B, T_found, feat)[:, -Tq:, :]
+                
+        assert out.shape == (B, Tq, feat), f"out={out.shape}, B={B}, Tq={Tq}, feat={feat}"
+        # --- 线性层稳定计算：统一 2D → Linear → 3D ---
+        # 对齐 dtype / device 到 wo.weight
+        out2d = out.reshape(-1, feat)
+        w = self.wo.weight
+        if getattr(out2d, "is_meta", False) or (hasattr(out2d, "device") and out2d.device.type == "meta"):
+            out2d = torch.zeros((B*Tq, feat), dtype=w.dtype, device=w.device)
+        else:
+            if out2d.dtype != w.dtype:
+                out2d = out2d.to(w.dtype)
+            if out2d.device != w.device:
+                out2d = out2d.to(w.device, non_blocking=True)
+
+        assert out.shape == (bsz, seqlen, feat), f"out={out.shape}, bsz={bsz}, seqlen={seqlen}, feat={feat}"
+
+        # 输出投影（可用 compute_stream）
         if compute_stream:
             with torch.cuda.stream(compute_stream):
-                result = self.wo(out)
+                res2d = self.wo(out2d)
         else:
-            result = self.wo(out)
+            res2d = self.wo(out2d)
 
-        total_time = (time.time() - start_time) * 1000000  # 转换为微秒
+        result = res2d.view(B, Tq, -1).contiguous()
+
+        # --- 统计收尾 ---
+        total_time = (time.time() - start_time) * 1e6  # μs
         PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
-        print(f"[ATTN] Layer {self.layer_id} computation done")
+        # print(f"[ATTN] Layer {self.layer_id} computation done")
         return result
 
 # ---------- Optimized FeedForward ----------
@@ -648,9 +810,12 @@ class FeedForward(nn.Module):
             hidden_dim = int(hidden_dim * args.ffn_dim_multiplier)
         hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
     
-        self.w1 = nn.Linear(args.dim, hidden_dim, bias=False, device="cpu")
-        self.w2 = nn.Linear(hidden_dim, args.dim, bias=False, device="cpu")
-        self.w3 = nn.Linear(args.dim, hidden_dim, bias=False, device="cpu")
+        _dev = getattr(args, "param_init_device", None)
+        kw = ({"device": _dev} if _dev is not None else {})
+    
+        self.w1 = nn.Linear(args.dim, hidden_dim, bias=False, **kw)
+        self.w2 = nn.Linear(hidden_dim, args.dim, bias=False, **kw)
+        self.w3 = nn.Linear(args.dim, hidden_dim, bias=False, **kw)
 
         self.device = args.device
         self.layer_id = -1
@@ -679,8 +844,55 @@ class FeedForward(nn.Module):
         if self.weight_manager:
             self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
     
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     # Check CUDA context health
+    #     if x.is_cuda:
+    #         try:
+    #             torch.cuda.current_device()
+    #         except RuntimeError as e:
+    #             logger.error(f"CUDA context error in feedforward: {e}")
+    #             raise RuntimeError("CUDA context is corrupted") from e
+
+    #     print(f"[FFN] Layer {self.layer_id} forward starting...")
+    #     self._ensure_weights_cuda()
+    #     print(f"[FFN] Layer {self.layer_id} weights ensured")
+
+    #     # 确保权重H2D传输完成后再开始计算（使用统一的事件化等待）
+    #     if self.streams and x.is_cuda:
+    #         try:
+    #             self.streams.wait_weight_ready_on_current(self.device)
+    #         except Exception as e:
+    #             logger.warning(f"Layer {self.layer_id} FeedForward: weight sync failed: {e}")
+
+    #     print(f"[FFN] Layer {self.layer_id} starting computation...")
+    #     # FFN计算 - 使用compute stream
+    #     # compute_stream = self.streams.weight_compute if self.streams else None
+    #     compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
+    #     if compute_stream:
+    #         with torch.cuda.stream(compute_stream):
+    #             with cuda_timer("ffn_us", self.layer_id):
+    #                 # SwiGLU
+    #                 gate = self.w1(x)
+    #                 up = self.w3(x)
+    #                 hidden = F.silu(gate) * up
+    #                 result = self.w2(hidden)
+    #         print(f"[FFN] Layer {self.layer_id} computation done")
+    #         return result
+    #     else:
+    #         with cuda_timer("ffn_us", self.layer_id):
+    #             # SwiGLU
+    #             gate = self.w1(x)
+    #             up = self.w3(x)
+    #             hidden = F.silu(gate) * up
+    #             result = self.w2(hidden)
+    #         print(f"[FFN] Layer {self.layer_id} computation done")
+    #         return result
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Check CUDA context health
+        import time
+        import torch
+        import torch.nn.functional as F
+
+        # ---- CUDA 上下文健康检查（保持原样）----
         if x.is_cuda:
             try:
                 torch.cuda.current_device()
@@ -692,7 +904,16 @@ class FeedForward(nn.Module):
         self._ensure_weights_cuda()
         print(f"[FFN] Layer {self.layer_id} weights ensured")
 
-        # 确保权重H2D传输完成后再开始计算（使用统一的事件化等待）
+        # ---- 统一把计时器从 meta 拉成 CPU 标量，避免 .item()/加法在 meta/dtype 冲突 ----
+        def _ensure_cpu_scalar_attr(mod, name: str):
+            t = getattr(mod, name, None)
+            if not isinstance(t, torch.Tensor) or getattr(t, "is_meta", False) \
+            or (hasattr(t, "device") and t.device.type == "meta"):
+                setattr(mod, name, torch.zeros((), dtype=torch.int64, device="cpu"))
+        _ensure_cpu_scalar_attr(self, "ffn_us")
+        _ensure_cpu_scalar_attr(self, "total_forward_us")
+
+        # ---- 等待 H2D 事件（保持原样）----
         if self.streams and x.is_cuda:
             try:
                 self.streams.wait_weight_ready_on_current(self.device)
@@ -700,28 +921,73 @@ class FeedForward(nn.Module):
                 logger.warning(f"Layer {self.layer_id} FeedForward: weight sync failed: {e}")
 
         print(f"[FFN] Layer {self.layer_id} starting computation...")
-        # FFN计算 - 使用compute stream
-        # compute_stream = self.streams.weight_compute if self.streams else None
+
+        # ---- 目标 dtype / device：以 w1 为准；w2 可能与 w1 不同，后续再对齐 ----
+        w1 = self.w1.weight
+        w2 = self.w2.weight
+        target_dev   = w1.device
+        target_dtype = w1.dtype
+
+        # ---- 处理输入 x：meta-safe + dtype/device 对齐 ----
+        if x.dim() == 2:
+            # 允许上游给 2D；推断 D，稍后还原形状时按 B=1
+            B, D = 1, x.size(-1)
+            T = x.size(0)
+            need_view_back = True
+        else:
+            assert x.dim() == 3, f"FFN expects 3D or 2D, got {x.shape}"
+            B, T, D = x.shape
+            need_view_back = False
+
+        if getattr(x, "is_meta", False) or (hasattr(x, "device") and x.device.type == "meta"):
+            x = torch.zeros((B, T, D), dtype=target_dtype, device=target_dev)
+        elif x.dtype != target_dtype or x.device != target_dev:
+            x = x.to(device=target_dev, dtype=target_dtype, non_blocking=True)
+
+        # ---- 统一用 2D 计算（稳定 matmul 语义），再还原 ----
+        x2 = x.reshape(-1, D)  # [B*T, D]
+
+        # 选择计算流
         compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
+
+        def _core_ffn(x2_: torch.Tensor) -> torch.Tensor:
+            # SwiGLU：gate(w1) * up(w3)
+            gate = self.w1(x2_)                 # [B*T, H]
+            up   = self.w3(x2_)                 # [B*T, H]
+            if up.dtype != gate.dtype:
+                up = up.to(gate.dtype)
+            act = F.silu(gate) * up
+
+            # 送入 w2 前与 w2.weight 对齐（有些实现 w2 与 w1/bf16 混精度）
+            if act.dtype != w2.dtype or act.device != w2.device:
+                act = act.to(device=w2.device, dtype=w2.dtype, non_blocking=True)
+            y2 = self.w2(act)                   # [B*T, D]
+            return y2
+
+        start_t = time.time()
         if compute_stream:
             with torch.cuda.stream(compute_stream):
                 with cuda_timer("ffn_us", self.layer_id):
-                    # SwiGLU
-                    gate = self.w1(x)
-                    up = self.w3(x)
-                    hidden = F.silu(gate) * up
-                    result = self.w2(hidden)
-            print(f"[FFN] Layer {self.layer_id} computation done")
-            return result
+                    y2 = _core_ffn(x2)
         else:
             with cuda_timer("ffn_us", self.layer_id):
-                # SwiGLU
-                gate = self.w1(x)
-                up = self.w3(x)
-                hidden = F.silu(gate) * up
-                result = self.w2(hidden)
-            print(f"[FFN] Layer {self.layer_id} computation done")
-            return result
+                y2 = _core_ffn(x2)
+
+        # 还原形状
+        if need_view_back:
+            result = y2.view(T, -1).unsqueeze(0).contiguous()  # [1, T, D]
+        else:
+            result = y2.view(B, T, -1).contiguous()
+
+        # 统计收尾（用 Python float，避免与 bf16 张量混算）
+        try:
+            us = float((time.time() - start_t) * 1e6)
+            PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", us)
+        except Exception:
+            pass
+
+        print(f"[FFN] Layer {self.layer_id} computation done")
+        return result
 
 # ---------- Optimized EncoderBlock ----------
 class EncoderBlock(nn.Module):
@@ -730,7 +996,7 @@ class EncoderBlock(nn.Module):
         self.layer_id = layer_id
         self.n_layer = args.n_layers
 
-        self.attn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
         self.attention = SelfAttention(args)
@@ -783,7 +1049,7 @@ class EncoderBlock(nn.Module):
         with cuda_timer("total_forward_us", self.layer_id):
 
             nvtx.range_push(f"layer_{self.layer_id}_attention")
-            h = x + self.attention(self.attn_norm(x), start_pos, freqs_complex)
+            h = x + self.attention(self.attention_norm(x), start_pos, freqs_complex)
             nvtx.range_pop()  # attention
 
             # 确保attention计算完成后再开始FFN (使用事件化等待)

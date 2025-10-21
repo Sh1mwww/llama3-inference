@@ -190,9 +190,9 @@ def alloc_pinned_aligned(nbytes: int, block_size: int = 4096) -> torch.Tensor:
 # ========== 权重分类规则 ==========
 RESIDENT_PATTERNS = [
     r"^embed_tokens\.",                              
-    r"^norm\.",                                      
-    r"^output\.",                                    
-    r"^layers\.\d+\.(attn_norm|ffn_norm)\.",         # attention/ffn RMSNorm
+    r"^norm\.",
+    r"^output\.",
+    r"^layers\.\d+\.(attention_norm|ffn_norm)\.",    # attention/ffn RMSNorm
     r"\.bias$",                                      
 ]
 
@@ -432,7 +432,15 @@ def load_resident_to_gpu(
         dst.view(-1).view(torch.uint8)[:p["nbytes"]].copy_(staging[:p["nbytes"]])
 
         param = name_to_param[name]
-        param.data.copy_(dst.to(device, non_blocking=True))
+        # param.data.copy_(dst.to(device, non_blocking=True))
+        dst_dev = dst.to(device, non_blocking=True)
+        # 如果参数仍在 meta 上，直接“以新张量替换”完成实体化；否则走原来的 copy_ 路径
+        is_meta = getattr(param, "is_meta", False) or getattr(getattr(param, "data", None), "is_meta", False) \
+                  or (hasattr(param, "device") and str(param.device).startswith("meta"))
+        if is_meta:
+            param.data = dst_dev
+        else:
+            param.data.copy_(dst_dev)
 
     dio.close()
     print("[RESIDENT] all resident params loaded to GPU")
