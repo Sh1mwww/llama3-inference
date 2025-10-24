@@ -46,10 +46,9 @@ class ModelArgs:
     device: str = "cuda"
     topk_blk: int = 8
     layer_infos: List[LayerInfo] = field(default_factory=list)
-    # 新增：参数初始化所用的设备（"meta" | "cpu" | "cuda"）。70B 走 "meta"
-    param_init_device: str = "cpu"
-    # 新增：权重来源（"checkpoint" | "raw-ssd"），70B 走 "raw-ssd"
+    # 权重来源（"checkpoint" | "raw-ssd"）
     weight_source: str = "checkpoint"
+    # 注意：移除了 param_init_device，统一在 CPU 上创建 stub 参数
     
     
     @staticmethod

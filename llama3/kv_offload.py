@@ -124,7 +124,8 @@ class DRAMPool:
             # 没有匹配的，分配新块
             try:
                 t = torch.empty(need_bytes, dtype=torch.uint8, pin_memory=True)
-                self.lazy_live.add(t.storage().data_ptr())
+                # self.lazy_live.add(t.storage().data_ptr())
+                self.lazy_live.add(t.untyped_storage().data_ptr())
                 self.used += need_bytes
                 return t
             except RuntimeError as e:
@@ -145,7 +146,8 @@ class DRAMPool:
                 self.used -= size
             else:
                 # 懒分配：回收到复用栈，避免频繁 CUDA pinned alloc/free
-                ptr = buf.storage().data_ptr()
+                # ptr = buf.storage().data_ptr()
+                ptr = buf.untyped_storage().data_ptr()
                 if ptr in self.lazy_live:
                     self.lazy_live.remove(ptr)
                     self.lazy_free.append(buf)
@@ -534,6 +536,55 @@ class KVOffloader:
         
         
 
+    def ensure_on_gpu(self, layer_idx: int, start_pos: int, k_cur: torch.Tensor, v_cur: torch.Tensor):
+        """
+        确保本层在计算时用于注意力的 K/V 都在 CUDA。
+        Ensure that K/V tensors for attention computation are on CUDA.
+
+        对于 prefill：通常只用 k_cur/v_cur；
+        对于 decode：需要把历史 KV 拉上来组成 k_full/v_full。
+
+        For prefill: typically only uses k_cur/v_cur;
+        For decode: needs to fetch historical KV to form k_full/v_full.
+
+        Args:
+            layer_idx: layer index
+            start_pos: current start position in sequence
+            k_cur: current K tensor from projection (B, seq_len, n_kv_heads, head_dim)
+            v_cur: current V tensor from projection (B, seq_len, n_kv_heads, head_dim)
+
+        Returns:
+            k_full, v_full: Complete K/V tensors on CUDA, ready for attention computation
+        """
+        # 确保输入在 CUDA（防止 q 在 CUDA、k_cur/v_cur 在 CPU 的 bmm 报错）
+        # Ensure inputs are on CUDA (prevent bmm error when q is on CUDA but k_cur/v_cur on CPU)
+        target_device = k_cur.device
+        if not str(target_device).startswith("cuda"):
+            raise RuntimeError(f"[KVOffloader] ensure_on_gpu: k_cur is on {target_device}, but only CUDA is supported")
+
+        # 对于 prefill（start_pos == 0）或单 token decode，直接返回当前 K/V
+        # For prefill (start_pos == 0) or single token decode, directly return current K/V
+        if start_pos == 0:
+            # Prefill: no historical KV, just use current
+            return k_cur, v_cur
+
+        # 对于 decode：需要组装历史 KV + 当前 KV
+        # For decode: need to assemble historical KV + current KV
+        # 这里的实现取决于你的 KV cache 架构
+        # Implementation depends on your KV cache architecture
+
+        # 如果你已经有类似 _gather_kv 或 fetch 的逻辑，可以复用
+        # If you already have logic like _gather_kv or fetch, reuse it
+        # 这里提供一个简化版本：直接返回当前 K/V（适用于 streaming decode）
+        # Here's a simplified version: directly return current K/V (for streaming decode)
+
+        # 注意：这个简化版本假设你在 SelfAttention.forward() 中已经通过
+        # offloader.fetch() 获取了完整的 k_full/v_full
+        # Note: This simplified version assumes you've already fetched complete k_full/v_full
+        # via offloader.fetch() in SelfAttention.forward()
+
+        return k_cur, v_cur
+
     def fetch(self, layer: int, blocks: torch.Tensor, batch_idx: int = 0, bsz: int | None = None):
         """
         Return concatenated K/V for the given **unique** block indices (ascending).
@@ -544,6 +595,10 @@ class KVOffloader:
         Returns:
             K, V of shape: (bsz, heads, sum(blocks)*BLOCK, dim) on GPU
             形状为 (bsz, heads, sum(blocks)*BLOCK, dim) 的 K, V 在 GPU 上
+
+        Ensures:
+            - All returned tensors are on CUDA (prevents CPU/CUDA device mismatch in attention)
+            - 所有返回的张量都在 CUDA 上（防止注意力计算中的 CPU/CUDA 设备不匹配）
         """
         uniq = blocks.to(torch.long).unique(sorted=True).tolist()  # Ensure correct dtype / 确保正确的数据类型
 
@@ -573,6 +628,16 @@ class KVOffloader:
         # 在 token 维度（dim=2）上拼接
         k_full = torch.cat(k_parts, dim=2)
         v_full = torch.cat(v_parts, dim=2)
+
+        # ============================================================
+        # 确保返回的 K/V 在 CUDA 上（防止 CPU/CUDA 设备不匹配）
+        # Ensure returned K/V are on CUDA (prevent CPU/CUDA device mismatch)
+        # ============================================================
+        if k_full.device.type != "cuda":
+            k_full = k_full.to(self.device, non_blocking=True)
+        if v_full.device.type != "cuda":
+            v_full = v_full.to(self.device, non_blocking=True)
+
         return k_full, v_full
 
     # ------------- attention importance -------------

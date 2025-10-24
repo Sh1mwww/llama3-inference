@@ -44,7 +44,7 @@ def _debug_build(*args, **kw):
 _gen.LLaMA.build = staticmethod(_debug_build)
 
 RAW_DEV  = "/dev/nvme0n1p4"
-MANIFEST = "/data1/llama3.1-70b.runtime_manifest.json"
+MANIFEST = "/data1/70b-fixed.runtime_manifest.json"
 CKPT_DIR = "/home/roger/.llama/checkpoints/Llama3.1-70B"
 
 # ---------- 系统/GPU 内存快照 ----------
@@ -197,10 +197,10 @@ def main():
     # 2) SSD streaming 配置（小 CPU cache + GPU 预热少量层）
     mode_config = {
         "raw_device": RAW_DEV,
-        "manifest_path": MANIFEST,
-        "prefetch_distance": 1,
-        "max_cached_layers": 2,
-        "cpu_cache_layers": 3,      # ★ 缓存 3 层（约 5-6GB），作为 SSD->GPU 的中转
+        "ssd_manifest_path": MANIFEST,
+        "prefetch_distance": 4,
+        "max_cached_layers": 4,
+        "cpu_cache_layers": 40,      
         "warmup_layers": 1,         # 仅 GPU 预热第 0 层
         "staging_mb": 64,
         "verbose": True,
@@ -216,7 +216,7 @@ def main():
         max_seq_len=8192,
         max_batch_size=1,
         topk_blk=8,
-        mode="ssd",
+        mode="mixed",
         mode_config=mode_config
     )
     probe("after LLaMA.build")

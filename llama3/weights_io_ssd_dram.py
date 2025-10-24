@@ -414,12 +414,34 @@ def load_resident_to_gpu(
 
     name_to_param = dict(model.named_parameters())
 
+    # Name mapping for compatibility
+    def _resolve_param_name(manifest_name: str) -> Optional[str]:
+        """Resolve manifest parameter name to model parameter name"""
+        # Try exact match first
+        if manifest_name in name_to_param:
+            return manifest_name
+
+        # Common mappings
+        mappings = {
+            "tok_embeddings.weight": "embed_tokens.weight",
+        }
+
+        if manifest_name in mappings:
+            mapped = mappings[manifest_name]
+            if mapped in name_to_param:
+                return mapped
+
+        return None
+
     for p in manifest["params"]:
         if p["policy"] != "resident":
             continue
-        name = p["name"]
-        if name not in name_to_param:
-            print(f"[RESIDENT] missing param in model: {name}")
+
+        manifest_name = p["name"]
+        actual_name = _resolve_param_name(manifest_name)
+
+        if actual_name is None:
+            print(f"[RESIDENT] missing param in model: {manifest_name}")
             continue
 
         stride = p["stride"]
@@ -431,13 +453,85 @@ def load_resident_to_gpu(
         dst = torch.empty(p["shape"], dtype=DTYPE_MAP[p["dtype"]], pin_memory=True)
         dst.view(-1).view(torch.uint8)[:p["nbytes"]].copy_(staging[:p["nbytes"]])
 
-        param = name_to_param[name]
+        param = name_to_param[actual_name]
+
+        # ★ 形状验证：确保加载的权重与模块参数形状一致
+        # 特别关键的对齐要求：
+        # 1. nn.Embedding(num_embeddings, embedding_dim): num_embeddings 必须等于 weight.shape[0]
+        # 2. output/lm_head: nn.Linear(dim, vocab_size): vocab_size 必须等于 weight.shape[0]
+        if tuple(p["shape"]) != tuple(param.shape):
+            # 给出更详细的错误信息，帮助定位问题
+            is_embed = "embed" in actual_name.lower()
+            is_output = "output" in actual_name.lower() or "lm_head" in actual_name.lower()
+
+            error_msg = f"形状不匹配: {actual_name}\n"
+            error_msg += f"  模块参数形状: {tuple(param.shape)}\n"
+            error_msg += f"  权重文件形状: {tuple(p['shape'])}\n\n"
+
+            # 检测是否是 vocab-parallel 分片权重（仅对 embed 和 output 层检查）
+            if (is_embed or is_output) and len(p["shape"]) >= 2:
+                weight_vocab_size = p["shape"][0]
+                param_vocab_size = param.shape[0]
+
+                # 常见的完整 vocab_size
+                common_vocab_sizes = [128256, 128000, 32000, 50257]
+
+                # 检查权重是否是分片的
+                is_sharded = False
+                detected_tp = None
+                detected_full_vocab = None
+
+                for full_vocab in common_vocab_sizes:
+                    for tp_size in [2, 4, 8, 16]:
+                        if weight_vocab_size * tp_size == full_vocab:
+                            is_sharded = True
+                            detected_tp = tp_size
+                            detected_full_vocab = full_vocab
+                            break
+                    if is_sharded:
+                        break
+
+                if is_sharded:
+                    error_msg += f"  ⚠️  检测到 vocab-parallel 分片权重！\n"
+                    error_msg += f"    - 权重 vocab 维度: {weight_vocab_size} (分片)\n"
+                    error_msg += f"    - 完整 vocab_size: {detected_full_vocab}\n"
+                    error_msg += f"    - Tensor Parallel (TP) size: {detected_tp}\n"
+                    error_msg += f"    - 当前模型期望: {param_vocab_size}\n\n"
+                    error_msg += "  ❌ 不能混用分片权重 ({weight_vocab_size}×...) 与完整 vocab_size ({param_vocab_size})！\n\n"
+                    error_msg += "  解决方案：\n"
+                    error_msg += "  1. 【推荐】合并分片权重为完整权重\n"
+                    error_msg += "     - 使用工具将 TP 分片合并为单个完整权重文件\n"
+                    error_msg += f"     - 需要收集所有 {detected_tp} 个分片并在 vocab 维度上拼接\n"
+                    error_msg += f"     - 合并后 vocab 维度应为: {param_vocab_size}\n"
+                    error_msg += "  2. 使用支持 VocabParallelEmbedding 的并行引擎\n"
+                    error_msg += "     - Megatron-LM / vLLM / DeepSpeed 等\n"
+                    error_msg += "     - 按分片模式加载，每个 rank 加载一个分片\n"
+                    error_msg += f"     - 配置 tensor_parallel_size={detected_tp}\n"
+                else:
+                    # 不是分片问题，给出常规错误信息
+                    if is_embed:
+                        error_msg += "  【embed_tokens】nn.Embedding(num_embeddings, embedding_dim)\n"
+                        error_msg += f"    - num_embeddings 必须等于 vocab_size\n"
+                        error_msg += f"    - 期望: num_embeddings={p['shape'][0]}, embedding_dim={p['shape'][1]}\n"
+                    elif is_output:
+                        error_msg += "  【output/lm_head】nn.Linear(in_features, out_features)\n"
+                        error_msg += f"    - out_features 必须等于 vocab_size\n"
+                        error_msg += f"    - 期望: in_features={p['shape'][1]}, out_features={p['shape'][0]}\n"
+                        error_msg += f"    - 注意：output 层的 vocab_size 必须与 embed_tokens 一致\n"
+
+                    error_msg += "\n  ➤ 请检查 params.json 中的 vocab_size 和 dim 是否正确。"
+            else:
+                # 非 embed/output 层的常规错误
+                error_msg += "\n  ➤ 请检查权重文件和模型定义是否匹配。"
+
+            raise RuntimeError(error_msg)
+
         # param.data.copy_(dst.to(device, non_blocking=True))
         dst_dev = dst.to(device, non_blocking=True)
-        # 如果参数仍在 meta 上，直接“以新张量替换”完成实体化；否则走原来的 copy_ 路径
+        # 如果参数仍在 meta 上，直接"以新张量替换"完成实体化；否则走原来的 copy_ 路径
         is_meta = getattr(param, "is_meta", False) or getattr(getattr(param, "data", None), "is_meta", False) \
                   or (hasattr(param, "device") and str(param.device).startswith("meta"))
-        if is_meta:
+        if is_meta or (param.device != dst_dev.device):
             param.data = dst_dev
         else:
             param.data.copy_(dst_dev)

@@ -25,6 +25,31 @@ except ImportError:
 from .config import ModelArgs
 from .kv_offload import KVOffloader, BLOCK
 from .global_state_tracker import GlobalStateTracker, get_global_tracker, init_global_tracker
+
+# ---------- Stub Parameter Helper ----------
+def make_stub_linear(in_features, out_features, bias=False, dtype=torch.bfloat16, device="cpu"):
+    """创建一个空骨架 nn.Linear，权重为 0-size stub，避免内存分配"""
+    # 先用 meta device 创建 Linear（避免初始化）
+    with torch.device("meta"):
+        linear = nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
+
+    # 替换权重为 CPU 上的 0-size stub
+    stub_weight = torch.nn.Parameter(
+        torch.empty(0, dtype=dtype, device=device),
+        requires_grad=False
+    )
+    stub_weight._shape_hint = (out_features, in_features)  # 保留形状信息
+    linear.weight = stub_weight
+
+    if bias:
+        stub_bias = torch.nn.Parameter(
+            torch.empty(0, dtype=dtype, device=device),
+            requires_grad=False
+        )
+        stub_bias._shape_hint = (out_features,)
+        linear.bias = stub_bias
+
+    return linear
 # ---------- Enhanced timing util ----------
 class PerformanceTracker:
     def __init__(self):
@@ -132,16 +157,46 @@ def get_weight_manager(device: str):
     global WEIGHT_MANAGER
     return WEIGHT_MANAGER
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
+# class RMSNorm(nn.Module):
+#     def __init__(self, dim: int, eps: float = 1e-6):
+#         super().__init__()
+#         self.weight = nn.Parameter(torch.ones(dim))
+#         self.eps = eps
     
-    def forward(self, x: torch.Tensor):
-        with cuda_timer("memory_alloc_us"):
-            norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return self.weight * (x * norm)
+#     def forward(self, x: torch.Tensor):
+#         with cuda_timer("memory_alloc_us"):
+#             norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+#         # 防呆：把權重的 device / dtype 對齊輸入
+#         w = self.weight
+#         if(w.device != x.device):
+#             w = w.to(device=x.device, dtype=x.dtype)
+#         return w * (x * norm)
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6, *, dtype=torch.bfloat16, device=None, requires_grad=False):
+        super().__init__()
+        self.eps = float(eps)
+        # 权重直接用目标 dtype/device 创建，推理默认不需要梯度
+        self.weight = nn.Parameter(torch.ones(dim, dtype=dtype, device=device), requires_grad=requires_grad)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1) 计算用 fp32 更稳定
+        y = x.to(torch.float32)
+        # 用乘法代替 pow，少一次 kernel
+        inv_rms = torch.rsqrt(y.mul(y).mean(dim=-1, keepdim=True).add_(self.eps))
+        y = y.mul(inv_rms)                 # fp32
+
+        # 2) 输出严格回到输入 dtype（例如 bfloat16）
+        out = y.to(dtype=x.dtype)          # 与下游 Linear.weight 的 dtype 一致
+
+        # 3) 仅在必要时把权重对齐到输入的 device/dtype（尽量避免每步 .to）
+        w = self.weight
+        if w.device != x.device:
+            w = w.to(device=x.device, non_blocking=True)
+        if w.dtype != x.dtype:
+            w = w.to(dtype=x.dtype)
+
+        return out * w
+
 
 def precompute_theta_pos_frequencies(head_dim: int, seq_len: int, device: str, theta: float = 10000.0):
     assert head_dim % 2 == 0
@@ -232,22 +287,27 @@ class SelfAttention(nn.Module):
         self.head_dim = args.dim // args.n_heads
         self.kv_elapsed_time = 0.0
         self.attn_time = 0.0
-        
+
         self.topk_blk = args.topk_blk
         self.device = args.device
         self.is_cuda = str(self.device).startswith("cuda") and torch.cuda.is_available()
-        
-        # Linear权重初始化在CPU
-        # self.wq = nn.Linear(args.dim, self.n_heads_q * self.head_dim, bias=False, device="cpu")
-        # self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device="cpu")
-        # self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, device="cpu")
-        # self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, device="cpu")
-        _dev = getattr(args, "param_init_device", None)
-        kw = ({"device": _dev} if _dev is not None else {})
-        self.wq = nn.Linear(args.dim, self.n_heads_q * self.head_dim, bias=False, **kw)
-        self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, **kw)
-        self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, **kw)
-        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, **kw)
+
+        # Linear权重初始化 - 使用 stub 避免大内存分配
+        use_stub = getattr(args, "use_stub_params", False)
+        if use_stub:
+            # SSD streaming 模式：使用 0-size stub
+            self.wq = make_stub_linear(args.dim, self.n_heads_q * self.head_dim, bias=False)
+            self.wk = make_stub_linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+            self.wv = make_stub_linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
+            self.wo = make_stub_linear(args.n_heads * self.head_dim, args.dim, bias=False)
+        else:
+            # 传统模式：正常初始化
+            _dev = getattr(args, "param_init_device", None)
+            kw = ({"device": _dev} if _dev is not None else {})
+            self.wq = nn.Linear(args.dim, self.n_heads_q * self.head_dim, bias=False, **kw)
+            self.wk = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, **kw)
+            self.wv = nn.Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False, **kw)
+            self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False, **kw)
         self.block_sz = BLOCK
 
         self.apply_causal_mask = True
@@ -258,11 +318,14 @@ class SelfAttention(nn.Module):
             streams = stream_mnt.get_streams(args.device)
         except Exception:
             pass  # 回退到内部流创建
-        
+
         self.streams = streams
         self.compute_stream = getattr(streams, "compute_mha", None) or getattr(streams, "weight_compute", None)
         self.weight_h2d_stream = getattr(streams, "weight_h2d_mha", None) or getattr(streams, "weight_h2d", None)
         self.weight_manager = None
+
+        # 组级预取支持标记
+        self.supports_group_prefetch = False
         
         self.offloader = None   
         self.enable_profiling = False
@@ -334,10 +397,32 @@ class SelfAttention(nn.Module):
     def _ensure_weights_cuda(self):
         wm = getattr(self, "weight_manager", None)
         if wm is None:
+            # 没有 weight_manager：权重应该已经在正确的设备上
+            # No weight_manager: weights should already be on the correct device
+            # Forward 不做设备迁移，只由 WSM 管理
+            # Forward does NOT do device migration, only managed by WSM
             return
+
+        # 组级预取模式：优先使用新的组级API
+        if getattr(wm, "grouped_mode", False) and hasattr(wm, "ensure_group_on_gpu"):
+            try:
+                # 确保attn组在GPU上（阻塞式）
+                wm.ensure_group_on_gpu(self.layer_id, "attn")
+                # 异步预取下一层的attn（与当前MHA计算重叠）
+                if hasattr(wm, "n_layers") and self.layer_id + 1 < wm.n_layers:
+                    if hasattr(wm, "prefetch_group_async"):
+                        wm.prefetch_group_async(self.layer_id + 1, "attn")
+                self.supports_group_prefetch = True
+                return
+            except (AttributeError, NotImplementedError, KeyError) as e:
+                # 组级API不可用或实现不完整，回退到层级API
+                logger.warning(f"Layer {self.layer_id} SelfAttention: group-level prefetch failed ({e}), fallback to layer-level")
+                self.supports_group_prefetch = False
+
+        # 回退到原有的层级预取
         modules = self._get_modules_dict()
         wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
-    
+
     def _allocate_buffers(self, batch_size: int, seq_len: int, max_kv_len: int):
         if (self.qkv_buffer is None or 
             self.qkv_buffer[0].size(0) < batch_size or 
@@ -403,16 +488,11 @@ class SelfAttention(nn.Module):
                 logger.error(f"CUDA context error in attention forward: {e}")
                 raise RuntimeError("CUDA context is corrupted") from e
         
-        if not self.wq.weight.is_cuda:
-            for mod in (self.wq, self.wk, self.wv, self.wo):
-                mod.to(x.device, non_blocking=True)
-                
-        
         start_time = time.time()
         assert x.dim()==3, f"x dim={x.dim()}, shape={x.shape}"
         bsz, seqlen, _ = x.shape
-        
-        
+
+
         def _ensure_cpu_scalar_attr(mod, name: str):
             if hasattr(mod, name):
                 t = getattr(mod, name)
@@ -425,38 +505,86 @@ class SelfAttention(nn.Module):
 
         _ensure_cpu_scalar_attr(self, "attn_us")
         _ensure_cpu_scalar_attr(self, "total_forward_us")
-        
-        
-        w_dtype = self.wq.weight.dtype
-        if x.dtype != w_dtype:
-            x = x.to(w_dtype)
-        
+
         print(f"[ATTN] Layer {self.layer_id} forward starting...")
-        # 确保权重在GPU上
-        self._ensure_weights_cuda()
-        print(f"[ATTN] Layer {self.layer_id} weights ensured")
+
+        # ============================================================
+        # 1) 确保 attn 组在 GPU，并等待该组 H2D 完成（在 compute_mha 流上等待）
+        # ============================================================
+        wm = getattr(self, "weight_manager", None)
+        in_use = False
+        if wm and hasattr(wm, "_make_group_in_use"):
+            wm._make_group_in_use(self.layer_id, "attn")
+            in_use = True
+        try:
+            if wm is not None:
+                # 确保 attn 组在 GPU（阻塞式，直到权重加载完成）
+                if hasattr(wm, "ensure_group_on_gpu"):
+                    wm.ensure_group_on_gpu(self.layer_id, "attn")
+                else:
+                    # 回退到层级加载
+                    modules = self._get_modules_dict()
+                    wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
+
+                # 在 compute stream 上等待 attn 组 H2D 传输完成（禁止降级到 CPU）
+                if hasattr(wm, "wait_group_ready"):
+                    wm.wait_group_ready(self.layer_id, "attn", compute_stream=self.compute_stream)
+        finally:
+            if in_use and hasattr(wm, "_unmark_group_in_use"):
+                wm._unmake_group_in_use(self.layer_id, "attn")
+
+        print(f"[ATTN] Layer {self.layer_id} weights ensured and ready")
+
+        # ============================================================
+        # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
+        # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
+        # ============================================================
+        target_device = x.device
+
+        # 确保 target_device 是 CUDA（不接受 CPU）
+        if not str(target_device).startswith("cuda"):
+            raise RuntimeError(f"Layer {self.layer_id} SelfAttention: input x is on {target_device}, but only CUDA is supported")
+
+        for mod in (self.wq, self.wk, self.wv, self.wo):
+            # 权重必须在 CUDA，不允许 meta 或 CPU
+            if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
+                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
+
+            if not str(mod.weight.device).startswith("cuda"):
+                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
+
+            # 验证设备一致性（不做迁移，只检查）
+            # Validate device consistency (no migration, only check)
+            if mod.weight.device != target_device:
+                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_device}. "
+                                 "Device mismatch must be fixed by WSM, not by forward().")
+
+        print(f"[ATTN] Layer {self.layer_id} device validation passed (all on CUDA)")
 
         # 更新全局状态跟踪器
         tracker = get_global_tracker()
-        # 獲取當前batch索引（從global tracker中讀取，而不是重新設置）
         if tracker:
-            batch_idx = tracker.current_batch  # 使用tracker中已設置的值
+            batch_idx = tracker.current_batch
         else:
-            batch_idx = 0  # 回退值
-
-        # 预取下一层权重
-        if hasattr(self, '_next_layer_modules'):
-            if self.weight_manager:
-                self.weight_manager.prefetch_weights([self.layer_id + 1], {self.layer_id + 1: self._next_layer_modules})
-
-        # 确保权重H2D传输完成后再开始计算（使用统一的事件化等待）
-        if self.streams and x.is_cuda:
-            try:
-                self.streams.wait_weight_ready_on_current(self.device)
-            except Exception as e:
-                logger.warning(f"Layer {self.layer_id} SelfAttention: weight sync failed: {e}")
+            batch_idx = 0
 
         print(f"[ATTN] Layer {self.layer_id} starting computation...")
+
+        # 预期形状
+        exp_q = (self.n_heads_q * self.head_dim, x.size(-1))
+        exp_kv = (self.n_kv_heads * self.head_dim, x.size(-1))
+
+        def _shape(t): return tuple(t.shape)
+
+        if _shape(self.wq.weight) != exp_q:
+            raise RuntimeError(f"[Q shape] { _shape(self.wq.weight) } != {exp_q} "
+                            f"(likely manifest q/k/v mapping issue)")
+        if _shape(self.wk.weight) != exp_kv:
+            raise RuntimeError(f"[K shape] { _shape(self.wk.weight) } != {exp_kv} "
+                            f"(likely manifest q/k/v mapping issue)")
+        if _shape(self.wv.weight) != exp_kv:
+            raise RuntimeError(f"[V shape] { _shape(self.wv.weight) } != {exp_kv} "
+                            f"(likely manifest q/k/v mapping issue)")    
 
         # QKV投影 - 使用专门的compute stream
         # compute_stream = self.streams.weight_compute if self.streams else None
@@ -553,7 +681,25 @@ class SelfAttention(nn.Module):
             else:
                 self.kv_elapsed_time = 0
         nvtx.range_pop()  # kv_fetch
-            
+
+        # ============================================================
+        # 3) 确保 KV Cache（历史 K/V）在 CUDA（防止 q 在 CUDA、k_full 在 CPU 的 bmm 报错）
+        # Ensure KV cache (historical K/V) is on CUDA (prevent bmm error when q is on CUDA but k_full on CPU)
+        # ============================================================
+        if k_full.device.type != "cuda":
+            raise RuntimeError(f"Layer {self.layer_id} SelfAttention: k_full is on {k_full.device}, but q is on {q.device}. "
+                             "This would cause 'mat2 is on cpu' error in bmm. KV cache must be on CUDA.")
+        if v_full.device.type != "cuda":
+            raise RuntimeError(f"Layer {self.layer_id} SelfAttention: v_full is on {v_full.device}, but q is on {q.device}. "
+                             "This would cause 'mat2 is on cpu' error in bmm. KV cache must be on CUDA.")
+
+        # 如果设备不一致（例如不同的 CUDA 设备），强制对齐到 q 的设备
+        # If devices mismatch (e.g., different CUDA devices), force align to q's device
+        if k_full.device != q.device:
+            k_full = k_full.to(q.device, non_blocking=True)
+        if v_full.device != q.device:
+            v_full = v_full.to(q.device, non_blocking=True)
+
         #  batch
         if k_full.dim() == 3:
             # (seq_len, n_heads, head_dim) -> (1, n_heads, seq_len, head_dim)
@@ -569,13 +715,13 @@ class SelfAttention(nn.Module):
                 # 假设是 (bsz, seq_len, n_heads, head_dim)，需要 transpose
                 k_full = k_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
                 v_full = v_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
-        
+
         # 确保k_full和v_full与q的batch维度一致
         if k_full.size(0) == 1 and bsz > 1:
             # 单batch的KV需要扩展到多batch
             k_full = k_full.expand(bsz, -1, -1, -1)
             v_full = v_full.expand(bsz, -1, -1, -1)
-        
+
         k_full = k_full.to(q.dtype)
         v_full = v_full.to(q.dtype)
         # 重复KV头以匹配查询头数
@@ -636,11 +782,17 @@ class SelfAttention(nn.Module):
                 if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
                     seq_len_q = q.size(2)
                     seq_len_k = k_full.size(2)
-                    mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
-                    # scores = scores.masked_fill(mask.bool(), float('-inf'))
+                    # mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
+                    # # scores = scores.masked_fill(mask.bool(), float('-inf'))
                     
-                    mask = self._get_causal_mask(scores.size(-1), device=scores.device)
+                    # mask = self._get_causal_mask(scores.size(-1), device=scores.device)
+                    seq_len_q = q.size(2)
+                    seq_len_k = k_full.size(2)
+                    delta = max(0, seq_len_k - seq_len_q)
+                    mask = torch.triu(torch.ones((seq_len_q, seq_len_k), dtype=torch.bool, device=q.device),
+                                    diagonal=1 + delta)
                     scores = scores.masked_fill(mask, float('-inf'))
+                    
 
 
                 # Softmax和输出计算
@@ -799,6 +951,8 @@ class SelfAttention(nn.Module):
         total_time = (time.time() - start_time) * 1e6  # μs
         PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
         # print(f"[ATTN] Layer {self.layer_id} computation done")
+
+        # IN_USE 标记会在下一轮evict时自动清理，这里不需要手动unmark
         return result
 
 # ---------- Optimized FeedForward ----------
@@ -809,13 +963,21 @@ class FeedForward(nn.Module):
         if args.ffn_dim_multiplier:
             hidden_dim = int(hidden_dim * args.ffn_dim_multiplier)
         hidden_dim = args.multiple_of * ((hidden_dim + args.multiple_of - 1) // args.multiple_of)
-    
-        _dev = getattr(args, "param_init_device", None)
-        kw = ({"device": _dev} if _dev is not None else {})
-    
-        self.w1 = nn.Linear(args.dim, hidden_dim, bias=False, **kw)
-        self.w2 = nn.Linear(hidden_dim, args.dim, bias=False, **kw)
-        self.w3 = nn.Linear(args.dim, hidden_dim, bias=False, **kw)
+
+        # 使用 stub 避免大内存分配
+        use_stub = getattr(args, "use_stub_params", False)
+        if use_stub:
+            # SSD streaming 模式：使用 0-size stub
+            self.w1 = make_stub_linear(args.dim, hidden_dim, bias=False)
+            self.w2 = make_stub_linear(hidden_dim, args.dim, bias=False)
+            self.w3 = make_stub_linear(args.dim, hidden_dim, bias=False)
+        else:
+            # 传统模式：正常初始化
+            _dev = getattr(args, "param_init_device", None)
+            kw = ({"device": _dev} if _dev is not None else {})
+            self.w1 = nn.Linear(args.dim, hidden_dim, bias=False, **kw)
+            self.w2 = nn.Linear(hidden_dim, args.dim, bias=False, **kw)
+            self.w3 = nn.Linear(args.dim, hidden_dim, bias=False, **kw)
 
         self.device = args.device
         self.layer_id = -1
@@ -840,10 +1002,33 @@ class FeedForward(nn.Module):
         }
     
     def _ensure_weights_cuda(self):
+        wm = self.weight_manager
         modules = self._get_modules_dict()
-        if self.weight_manager:
-            self.weight_manager.ensure_weights_cuda(self.layer_id, modules, priority=True)
-    
+
+        if wm is None:
+            # 没有 weight_manager：权重应该已经在正确的设备上
+            # No weight_manager: weights should already be on the correct device
+            # Forward 不做设备迁移，只由 WSM 管理
+            # Forward does NOT do device migration, only managed by WSM
+            return
+
+        # 组级预取模式：优先使用新的组级API
+        if getattr(wm, "grouped_mode", False) and hasattr(wm, "ensure_group_on_gpu"):
+            try:
+                # 确保ffn组在GPU上（阻塞式）
+                wm.ensure_group_on_gpu(self.layer_id, "ffn")
+                # 异步预取下一层的ffn（与当前FFN计算重叠）
+                if hasattr(wm, "n_layers") and self.layer_id + 1 < wm.n_layers:
+                    if hasattr(wm, "prefetch_group_async"):
+                        wm.prefetch_group_async(self.layer_id + 1, "ffn")
+                return
+            except (AttributeError, NotImplementedError, KeyError) as e:
+                # 组级API不可用或实现不完整，回退到层级API
+                logger.warning(f"Layer {self.layer_id} FeedForward: group-level prefetch failed ({e}), fallback to layer-level")
+
+        # 回退到原有的层级预取
+        wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
+
     # def forward(self, x: torch.Tensor) -> torch.Tensor:
     #     # Check CUDA context health
     #     if x.is_cuda:
@@ -901,8 +1086,6 @@ class FeedForward(nn.Module):
                 raise RuntimeError("CUDA context is corrupted") from e
 
         print(f"[FFN] Layer {self.layer_id} forward starting...")
-        self._ensure_weights_cuda()
-        print(f"[FFN] Layer {self.layer_id} weights ensured")
 
         # ---- 统一把计时器从 meta 拉成 CPU 标量，避免 .item()/加法在 meta/dtype 冲突 ----
         def _ensure_cpu_scalar_attr(mod, name: str):
@@ -913,22 +1096,63 @@ class FeedForward(nn.Module):
         _ensure_cpu_scalar_attr(self, "ffn_us")
         _ensure_cpu_scalar_attr(self, "total_forward_us")
 
-        # ---- 等待 H2D 事件（保持原样）----
-        if self.streams and x.is_cuda:
-            try:
-                self.streams.wait_weight_ready_on_current(self.device)
-            except Exception as e:
-                logger.warning(f"Layer {self.layer_id} FeedForward: weight sync failed: {e}")
+        # ============================================================
+        # 1) 确保 ffn 组在 GPU，并等待该组 H2D 完成（在 compute_ffn 流上等待）
+        # ============================================================
+        wm = getattr(self, "weight_manager", None)
+        in_use = False
+        compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
+        if wm and hasattr(wm, "_make_group_in_use"):
+            wm._make_group_in_use(self.layer_id, "ffn")
+            in_use = True
+        try:
+            if wm is not None:
+                # 确保 ffn 组在 GPU（阻塞式，直到权重加载完成）
+                if hasattr(wm, "ensure_group_on_gpu"):
+                    wm.ensure_group_on_gpu(self.layer_id, "ffn")
+                else:
+                    # 回退到层级加载
+                    modules = self._get_modules_dict()
+                    wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
 
+                # 在 compute stream 上等待 ffn 组 H2D 传输完成（禁止降级到 CPU）
+                if hasattr(wm, "wait_group_ready"):
+                    wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
+        finally:
+            if in_use and hasattr(wm, "_unmark_group_in_use"):
+                wm._unmake_group_in_use(self.layer_id, "ffn")
+
+        print(f"[FFN] Layer {self.layer_id} weights ensured and ready")
+
+        # ============================================================
+        # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
+        # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
+        # ============================================================
+        target_dev = x.device
+
+        # 确保 target_dev 是 CUDA（不接受 CPU）
+        if not str(target_dev).startswith("cuda"):
+            raise RuntimeError(f"Layer {self.layer_id} FeedForward: input x is on {target_dev}, but only CUDA is supported")
+
+        # 验证所有 FFN 权重在 CUDA（不做迁移，只检查）
+        for mod in (self.w1, self.w2, self.w3):
+            # 权重必须在 CUDA，不允许 meta 或 CPU
+            if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
+                raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
+
+            if not str(mod.weight.device).startswith("cuda"):
+                raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
+
+            # 验证设备一致性（不做迁移，只检查）
+            # Validate device consistency (no migration, only check)
+            if mod.weight.device != target_dev:
+                raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_dev}. "
+                                 "Device mismatch must be fixed by WSM, not by forward().")
+
+        print(f"[FFN] Layer {self.layer_id} device validation passed (all on CUDA)")
         print(f"[FFN] Layer {self.layer_id} starting computation...")
 
-        # ---- 目标 dtype / device：以 w1 为准；w2 可能与 w1 不同，后续再对齐 ----
-        w1 = self.w1.weight
-        w2 = self.w2.weight
-        target_dev   = w1.device
-        target_dtype = w1.dtype
-
-        # ---- 处理输入 x：meta-safe + dtype/device 对齐 ----
+        # ---- 处理输入 x 的维度 ----
         if x.dim() == 2:
             # 允许上游给 2D；推断 D，稍后还原形状时按 B=1
             B, D = 1, x.size(-1)
@@ -939,17 +1163,17 @@ class FeedForward(nn.Module):
             B, T, D = x.shape
             need_view_back = False
 
+        # 推断目标 dtype（从权重或输入）
+        target_dtype = self.w1.weight.dtype if hasattr(self.w1, 'weight') else torch.bfloat16
+
         if getattr(x, "is_meta", False) or (hasattr(x, "device") and x.device.type == "meta"):
             x = torch.zeros((B, T, D), dtype=target_dtype, device=target_dev)
-        elif x.dtype != target_dtype or x.device != target_dev:
-            x = x.to(device=target_dev, dtype=target_dtype, non_blocking=True)
 
         # ---- 统一用 2D 计算（稳定 matmul 语义），再还原 ----
         x2 = x.reshape(-1, D)  # [B*T, D]
 
-        # 选择计算流
-        compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
 
+        # compute_stream 已在上面等待时获取，直接使用
         def _core_ffn(x2_: torch.Tensor) -> torch.Tensor:
             # SwiGLU：gate(w1) * up(w3)
             gate = self.w1(x2_)                 # [B*T, H]
@@ -959,19 +1183,28 @@ class FeedForward(nn.Module):
             act = F.silu(gate) * up
 
             # 送入 w2 前与 w2.weight 对齐（有些实现 w2 与 w1/bf16 混精度）
-            if act.dtype != w2.dtype or act.device != w2.device:
-                act = act.to(device=w2.device, dtype=w2.dtype, non_blocking=True)
+            if act.dtype != self.w2.weight.dtype or act.device != self.w2.weight.device:
+                act = act.to(device=self.w2.weight.device, dtype=self.w2.weight.dtype, non_blocking=True)
             y2 = self.w2(act)                   # [B*T, D]
             return y2
-
-        start_t = time.time()
-        if compute_stream:
-            with torch.cuda.stream(compute_stream):
+        
+        # protect
+        in_use = False
+        try:
+            if wm is not None and hasattr(wm, "_mark_group_in_use"):
+                wm._mark_group_in_use(self.layer_id, "ffn")
+                in_use = True        
+            start_t = time.time()
+            if compute_stream:
+                with torch.cuda.stream(compute_stream):
+                    with cuda_timer("ffn_us", self.layer_id):
+                        y2 = _core_ffn(x2)
+            else:
                 with cuda_timer("ffn_us", self.layer_id):
                     y2 = _core_ffn(x2)
-        else:
-            with cuda_timer("ffn_us", self.layer_id):
-                y2 = _core_ffn(x2)
+        finally:
+            if in_use and hasattr(wm, "_unmark_group_in_use"):
+                wm._unmark_group_in_use(self.layer_id, "ffn")
 
         # 还原形状
         if need_view_back:
@@ -987,6 +1220,8 @@ class FeedForward(nn.Module):
             pass
 
         print(f"[FFN] Layer {self.layer_id} computation done")
+
+        # IN_USE 标记会在下一轮evict时自动清理，这里不需要手动unmark
         return result
 
 # ---------- Optimized EncoderBlock ----------
@@ -1035,64 +1270,150 @@ class EncoderBlock(nn.Module):
             mods.update(self.feed_forward._get_modules_dict())
         return mods
 
-    def _ensure_weights_cuda(self):
-        wm = getattr(self, "weight_manager", None)
-        if wm is None:
-            return
-        modules = self._get_modules_dict()
-        wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
-    
+    # def _ensure_weights_cuda(self):
+    #     wm = getattr(self, "weight_manager", None)
+    #     if wm is None:
+    #         # 没有 weight_manager：权重应该已经在正确的设备上
+    #         # No weight_manager: weights should already be on the correct device
+    #         # Forward 不做设备迁移，只由 WSM 管理
+    #         # Forward does NOT do device migration, only managed by WSM
+    #         return
+    #     modules = self._get_modules_dict()
+    #     wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
+
     def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
         forward_start = time.time()
+        
+        # dev   = self.device
+        dev = str(self.device)
+        if not dev.startswith("cuda"):
+            try:
+                dev = str(self.attention.wq.weight.device)
+                self.device = dev  # 缓存，避免每次判断
+            except Exception:
+                pass
+        dtype = getattr(self, "param_dtype", torch.bfloat16)
+
+        if x.device != dev or x.dtype != dtype:
+            x = x.to(device=dev, dtype=dtype, non_blocking=True)
+        if freqs_complex.device != dev or freqs_complex.dtype != dtype:
+            freqs_complex = freqs_complex.to(device=dev,  non_blocking=True)
+
+        # 告知 WSM：计算前移（驱动 CPU/SSD 滑窗）
+        wm = getattr(self, "weight_manager", None)
+        if wm is not None and hasattr(wm, "note_compute_advance"):
+            wm.note_compute_advance(self.layer_id)
+
+        # 入口防呆：输入与归一化权重必须在 CUDA
+        if x.device.type != "cuda":
+            raise RuntimeError(f"Layer {self.layer_id} EncoderBlock: input x is on {x.device}, but only CUDA is supported")
+        if self.attention_norm.weight.device.type != "cuda":
+            raise RuntimeError(f"Layer {self.layer_id} EncoderBlock: attention_norm on {self.attention_norm.weight.device}, must be on CUDA")
+        if self.ffn_norm.weight.device.type != "cuda":
+            raise RuntimeError(f"Layer {self.layer_id} EncoderBlock: ffn_norm on {self.ffn_norm.weight.device}, must be on CUDA")
+
+        dev = x.device
+        streams = self.streams
 
         nvtx.range_push(f"layer_{self.layer_id}_forward")
         with cuda_timer("total_forward_us", self.layer_id):
 
+            # -------- MHA 阶段：在 compute_mha 流上排队，先等组就绪事件 --------
+            if wm is not None:
+                wm.ensure_group_on_gpu(self.layer_id, "attn")
+                # 让 compute_mha 流等待“attn 组 H2D 完成”的事件
+                if streams and streams.compute_mha and hasattr(wm, "wait_group_ready"):
+                    wm.wait_group_ready(self.layer_id, "attn", compute_stream=streams.compute_mha)
+                elif hasattr(wm, "wait_group_ready"):
+                    wm.wait_group_ready(self.layer_id, "attn", compute_stream=None)
+
             nvtx.range_push(f"layer_{self.layer_id}_attention")
-            h = x + self.attention(self.attention_norm(x), start_pos, freqs_complex)
+            if streams and streams.compute_mha:
+                torch.cuda.current_stream(dev).wait_stream(streams.compute_mha)  # default 等 MHA 流（安全）
+                with torch.cuda.stream(streams.compute_mha):
+                    attn_in  = self.attention_norm(x)
+                    attn_out = self.attention(attn_in, start_pos, freqs_complex)  # 在 compute_mha 上排队
+                # 在 MHA 流记录一个事件，供 FFN 流等待
+                mha_eid, mha_evt = None, None
+                try:
+                    from llama3 import stream_mnt
+                    mha_eid, mha_evt = stream_mnt.record_event_on(streams.compute_mha, device=dev)
+                except Exception:
+                    mha_evt = torch.cuda.Event()
+                    mha_evt.record(streams.compute_mha)
+            else:
+                # 回退到默认流（不推荐，但保证可运行）
+                attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
+
+            # 在 MHA 完成之前不要在默认流上消费 attn_out；先做残差也放到 MHA 流里
+            if streams and streams.compute_mha:
+                with torch.cuda.stream(streams.compute_mha):
+                    h = x + attn_out
+            else:
+                h = x + attn_out
             nvtx.range_pop()  # attention
 
-            # 确保attention计算完成后再开始FFN (使用事件化等待)
-            if self.streams and self.streams.compute_mha:
-                try:
-                    from llama3 import stream_mnt
-                    eid, evt = stream_mnt.record_event_on(self.streams.compute_mha, device=self.device)
-                    stream_mnt.wait_event_on(torch.cuda.current_stream(self.device), evt)
-                    stream_mnt.release_event(eid, device=self.device)
-                except Exception as e:
-                    logger.warning(f"Layer {self.layer_id}: MHA event sync failed ({e}), fallback to wait_stream")
-                    torch.cuda.current_stream(self.device).wait_stream(self.streams.compute_mha)
+            # -------- FFN 阶段：在 compute_ffn 流上排队，并等待 MHA 事件 --------
+            if wm is not None:
+                wm.ensure_group_on_gpu(self.layer_id, "ffn")
+                if streams and streams.compute_ffn and hasattr(wm, "wait_group_ready"):
+                    wm.wait_group_ready(self.layer_id, "ffn", compute_stream=streams.compute_ffn)
+                elif hasattr(wm, "wait_group_ready"):
+                    wm.wait_group_ready(self.layer_id, "ffn", compute_stream=None)
+
+            if streams and streams.compute_ffn:
+                # 让 FFN 流等待 MHA 结束（用上面记录的事件）
+                if 'mha_evt' in locals() and mha_evt is not None:
+                    streams.compute_ffn.wait_event(mha_evt)
+                else:
+                    # 最坏情况：FFN 流直接等 MHA 流
+                    streams.compute_ffn.wait_stream(streams.compute_mha)
 
             nvtx.range_push(f"layer_{self.layer_id}_ffn")
-            out = h + self.feed_forward(self.ffn_norm(h))
-            nvtx.range_pop()  # ffn
-
-            # 确保FFN计算完成后再返回 (使用事件化等待)
-            if self.streams and self.streams.compute_ffn:
+            if streams and streams.compute_ffn:
+                with torch.cuda.stream(streams.compute_ffn):
+                    ffn_in  = self.ffn_norm(h)
+                    ffn_out = self.feed_forward(ffn_in)   # 在 compute_ffn 上排队
+                    out     = h + ffn_out
+                # 记录 FFN 完成事件，便于上层/下一层需要
                 try:
                     from llama3 import stream_mnt
-                    eid, evt = stream_mnt.record_event_on(self.streams.compute_ffn, device=self.device)
-                    stream_mnt.wait_event_on(torch.cuda.current_stream(self.device), evt)
-                    stream_mnt.release_event(eid, device=self.device)
-                except Exception as e:
-                    logger.warning(f"Layer {self.layer_id}: FFN event sync failed ({e}), fallback to wait_stream")
-                    torch.cuda.current_stream(self.device).wait_stream(self.streams.compute_ffn)
+                    ffn_eid, ffn_evt = stream_mnt.record_event_on(streams.compute_ffn, device=dev)
+                    # 返回前让默认流等待 FFN 事件（保证 out 可安全被默认流使用）
+                    stream_mnt.wait_event_on(torch.cuda.current_stream(dev), ffn_evt)
+                    stream_mnt.release_event(ffn_eid, device=dev)
+                except Exception:
+                    ffn_evt = torch.cuda.Event()
+                    ffn_evt.record(streams.compute_ffn)
+                    torch.cuda.current_stream(dev).wait_event(ffn_evt)
+            else:
+                out = h + self.feed_forward(self.ffn_norm(h))
+            nvtx.range_pop()  # ffn
+
+            # 清理 MHA 事件
+            if streams and streams.compute_mha and 'mha_eid' in locals() and mha_eid is not None:
+                try:
+                    from llama3 import stream_mnt
+                    stream_mnt.release_event(mha_eid, device=dev)
+                except Exception:
+                    pass
 
         nvtx.range_pop()  # layer_forward
 
         self.forward_count += 1
         self.total_forward_time += time.time() - forward_start
 
-        # 定期触发事件池 GC，避免事件积累
+        # 周期性 GC 事件池
         self._gc_counter += 1
         if self._gc_counter % 10 == 0:
             try:
                 from llama3 import stream_mnt
-                stream_mnt.gc_event_pool(device=self.device, force=False)
+                stream_mnt.gc_event_pool(device=dev, force=False)
             except Exception:
                 pass
 
         return out
+
     
     def get_performance_stats(self) -> Dict:
         avg_time = self.total_forward_time / max(self.forward_count, 1) * 1000  # ms
