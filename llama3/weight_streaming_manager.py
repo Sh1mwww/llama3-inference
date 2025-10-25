@@ -281,6 +281,7 @@ class WeightStreamingManager:
 
         self._gpu_group_lru = []    # [(layer_idx, 'attn'/'ffn'), ...] 维护在卡上的组
         self._gpu_groups_in_use = set()  # 正在计算的组，防止被踢掉
+        self._group_lock = threading.RLock()
 
         # ★ 修复 5: 去重 - 防止重复加载同一层/组
         self._inflight_cpu_layers = set()       # 正在加载到 CPU 的层
@@ -1489,7 +1490,7 @@ class WeightStreamingManager:
 
             # 异步预取后续层到 GPU（与当前层计算重叠，提升 GPU 利用率）
             # aggressive_gpu_prefetch 控制预取的层数（默认 2 层）
-            if self.aggressive_gpu_prefetch > 0:
+            if self.aggressive_gpu_prefetch > 0 :
                 prefetch_targets = []
                 for offset in range(1, self.aggressive_gpu_prefetch + 1):
                     next_idx = idx + offset
@@ -1611,17 +1612,90 @@ class WeightStreamingManager:
                     torch.uint8:1, torch.int32:4, torch.int64:8, torch.float64:8}.get(t.dtype, 2)
         return t.numel() * itemsize
 
+    # ---------------- Group residency introspection & printing ----------------
+    def _snapshot_gpu_groups(self):
+        """
+        返回当前在 GPU 的组快照：[(layer, 'attn'/'ffn', in_use_bool), ...]
+        以 LRU 顺序（最老在前）返回。
+        """
+        lst = []
+        for (lyr, grp) in list(self._gpu_group_lru):  # 复制一份，避免遍历时被修改
+            lst.append((int(lyr), str(grp), (lyr, grp) in self._gpu_groups_in_use))
+        return lst
+
+    def _snapshot_cpu_groups(self):
+        """
+        返回当前在 CPU cache 中的组快照：
+        [(layer, 'attn'/'ffn', present_cnt, total_cnt), ...]
+        只要该组至少有一个参数在 CPU cache 中就会展示；便于观察“部分命中”。
+        """
+        summary = []
+        cache_keys = list(getattr(self, "cpu_cache", {}).keys())
+        for lyr in sorted(cache_keys):
+            layer_dict = self.cpu_cache.get(lyr, {})
+            if not isinstance(layer_dict, dict):
+                continue
+            for grp_name, suffixes in GROUPS.items():
+                tot = len(suffixes)
+                hit = 0
+                for suf in suffixes:
+                    if f"layers.{lyr}.{suf}" in layer_dict:
+                        hit += 1
+                if hit > 0:
+                    summary.append((int(lyr), grp_name, hit, tot))
+        return summary
+
+    def print_group_residency(self, current: tuple[int, str] | None = None, header: str | None = None):
+        """
+        打印“当前 GPU/CPU 上有哪些组”的一行摘要。
+        - current: 可选，用来高亮当前正在计算的 (layer, group)
+        - header:  可选，自定义前缀；默认 '[WSM][groups]'
+        """
+        try:
+            gpu = self._snapshot_gpu_groups()
+            cpu = self._snapshot_cpu_groups()
+        except Exception as e:
+            print(f"[WSM][groups] snapshot failed: {e}")
+            return
+
+        def _fmt_gpu(item):
+            L, G, in_use = item
+            star = "*" if in_use else ""
+            cur  = "⚑" if (current is not None and (L, G) == current) else ""
+            return f"L{L}.{G}{star}{cur}"
+
+        def _fmt_cpu(item):
+            L, G, hit, tot = item
+            cur  = "⚑" if (current is not None and (L, G) == current) else ""
+            suffix = "" if hit == tot else f"({hit}/{tot})"
+            return f"L{L}.{G}{suffix}{cur}"
+
+        gpu_txt = ", ".join(_fmt_gpu(x) for x in gpu) if gpu else "—"
+        cpu_txt = ", ".join(_fmt_cpu(x) for x in cpu) if cpu else "—"
+        pfx = header or "[WSM][groups]"
+        print(f"{pfx} GPU: {gpu_txt} | CPU: {cpu_txt}")
+
     def _mark_group_in_use(self, layer_idx: int, group: str):
         """标记组为正在使用，防止在计算期间被踢掉"""
         key = (layer_idx, group)
-        self._gpu_groups_in_use.add(key)
+        # self._gpu_groups_in_use.add(key)
+        with self._group_lock:
+            self._gpu_groups_in_use.add(key)
         if self.verbose:
             print(f"[WSM] Marked group {key} as IN_USE")
+            
+        try:
+           if os.getenv("WSM_PRINT_GROUPS", "1") == "1":
+                self.print_group_residency(current=key)
+        except Exception:
+            pass
 
     def _unmark_group_in_use(self, layer_idx: int, group: str):
         """取消组的使用标记"""
         key = (layer_idx, group)
-        self._gpu_groups_in_use.discard(key)
+        # self._gpu_groups_in_use.discard(key)
+        with self._group_lock:
+            self._gpu_groups_in_use.discard(key)
         if self.verbose:
             print(f"[WSM] Unmarked group {key} from IN_USE")
 
@@ -1630,33 +1704,34 @@ class WeightStreamingManager:
         LRU 淘汰一个组，避开 exclude 和 in_use（当前正在用的组）
         修复：防止踢掉正在计算的组，否则会导致 meta device 错误
         """
-        for i, (lyr, grp) in enumerate(self._gpu_group_lru):
-            key = (lyr, grp)
-            # 跳过 exclude 列表中的组
-            if key in exclude:
-                continue
-            # 跳过正在使用的组（关键修复！）
-            if key in self._gpu_groups_in_use:
-                if self.verbose:
-                    print(f"[WSM] Skipping eviction of IN_USE group {key}")
-                continue
-            if self._should_retain(lyr):
-                continue
-            # 释放该组的显存占用
-            for suf in GROUPS[grp]:
-                name = f"layers.{lyr}.{suf}"
-                p = self.name_to_param.get(name)
-                if p is None:
+        with self._group_lock:
+            for i, (lyr, grp) in enumerate(list(self._gpu_group_lru)):        
+                key = (lyr, grp)
+                # 跳过 exclude 列表中的组
+                if key in exclude:
                     continue
-                # 判定是否在GPU：device 是 cuda 且 numel > 0（非 stub）
-                if p.is_cuda and p.numel() > 0:
-                    # 驱逐到 CPU（替换为 0-size stub）
-                    self._evict_param_to_cpu(p)
-            self._gpu_group_lru.pop(i)
-            torch.cuda.empty_cache()
-            if self.verbose:
-                print(f"[WSM] Evicted group {key} from GPU")
-            return True
+                # 跳过正在使用的组（关键修复！）
+                if key in self._gpu_groups_in_use:
+                    if self.verbose:
+                        print(f"[WSM] Skipping eviction of IN_USE group {key}")
+                    continue
+                if self._should_retain(lyr):
+                    continue
+                # 释放该组的显存占用
+                for suf in GROUPS[grp]:
+                    name = f"layers.{lyr}.{suf}"
+                    p = self.name_to_param.get(name)
+                    if p is None:
+                        continue
+                    # 判定是否在GPU：device 是 cuda 且 numel > 0（非 stub）
+                    if p.is_cuda and p.numel() > 0:
+                        # 驱逐到 CPU（替换为 0-size stub）
+                        self._evict_param_to_cpu(p)
+                self._gpu_group_lru.pop(i)
+                torch.cuda.empty_cache()
+                if self.verbose:
+                    print(f"[WSM] Evicted group {key} from GPU")
+                return True
         if self.verbose:
             print(f"[WSM] No groups available for eviction (all in_use or excluded)")
         return False
@@ -1792,11 +1867,18 @@ class WeightStreamingManager:
         self._record_layer_ready_event(layer_idx)
 
         # 更新组 LRU
-        if key in self._gpu_group_lru:
-            self._gpu_group_lru.remove(key)
-        self._gpu_group_lru.append(key)
-        while len(self._gpu_group_lru) > self.gpu_max_groups:
-            self._evict_one_group_from_gpu(exclude={key})
+        # if key in self._gpu_group_lru:
+        #     self._gpu_group_lru.remove(key)
+        # self._gpu_group_lru.append(key)
+        # while len(self._gpu_group_lru) > self.gpu_max_groups:
+        #     self._evict_one_group_from_gpu(exclude={key})
+
+        with self._group_lock:
+            if key in self._gpu_group_lru:
+                self._gpu_group_lru.remove(key)
+            self._gpu_group_lru.append(key)
+            while len(self._gpu_group_lru) > self.gpu_max_groups:
+                self._evict_one_group_from_gpu(exclude={key})
 
     # --- inside class WeightStreamingManager ---
     def _read_layer_from_ssd(self, layer_idx: int) -> Dict[str, torch.Tensor]:

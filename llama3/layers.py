@@ -513,10 +513,10 @@ class SelfAttention(nn.Module):
         # ============================================================
         wm = getattr(self, "weight_manager", None)
         in_use = False
-        if wm and hasattr(wm, "_make_group_in_use"):
-            wm._make_group_in_use(self.layer_id, "attn")
-            in_use = True
         try:
+            if wm and hasattr(wm, "_mark_group_in_use"):
+                wm._mark_group_in_use(self.layer_id, "attn")
+                in_use = True
             if wm is not None:
                 # 确保 attn 组在 GPU（阻塞式，直到权重加载完成）
                 if hasattr(wm, "ensure_group_on_gpu"):
@@ -529,68 +529,79 @@ class SelfAttention(nn.Module):
                 # 在 compute stream 上等待 attn 组 H2D 传输完成（禁止降级到 CPU）
                 if hasattr(wm, "wait_group_ready"):
                     wm.wait_group_ready(self.layer_id, "attn", compute_stream=self.compute_stream)
-        finally:
-            if in_use and hasattr(wm, "_unmark_group_in_use"):
-                wm._unmake_group_in_use(self.layer_id, "attn")
 
-        print(f"[ATTN] Layer {self.layer_id} weights ensured and ready")
+            print(f"[ATTN] Layer {self.layer_id} weights ensured and ready")
 
-        # ============================================================
-        # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
-        # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
-        # ============================================================
-        target_device = x.device
+            # ============================================================
+            # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
+            # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
+            # ============================================================
+            target_device = x.device
 
-        # 确保 target_device 是 CUDA（不接受 CPU）
-        if not str(target_device).startswith("cuda"):
-            raise RuntimeError(f"Layer {self.layer_id} SelfAttention: input x is on {target_device}, but only CUDA is supported")
+            # 确保 target_device 是 CUDA（不接受 CPU）
+            if not str(target_device).startswith("cuda"):
+                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: input x is on {target_device}, but only CUDA is supported")
 
-        for mod in (self.wq, self.wk, self.wv, self.wo):
-            # 权重必须在 CUDA，不允许 meta 或 CPU
-            if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
-                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
+            for mod in (self.wq, self.wk, self.wv, self.wo):
+                # 权重必须在 CUDA，不允许 meta 或 CPU
+                if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
+                    raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
 
-            if not str(mod.weight.device).startswith("cuda"):
-                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
+                if not str(mod.weight.device).startswith("cuda"):
+                    raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
 
-            # 验证设备一致性（不做迁移，只检查）
-            # Validate device consistency (no migration, only check)
-            if mod.weight.device != target_device:
-                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_device}. "
-                                 "Device mismatch must be fixed by WSM, not by forward().")
+                # 验证设备一致性（不做迁移，只检查）
+                # Validate device consistency (no migration, only check)
+                if mod.weight.device != target_device:
+                    raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_device}. "
+                                     "Device mismatch must be fixed by WSM, not by forward().")
 
-        print(f"[ATTN] Layer {self.layer_id} device validation passed (all on CUDA)")
+            print(f"[ATTN] Layer {self.layer_id} device validation passed (all on CUDA)")
 
-        # 更新全局状态跟踪器
-        tracker = get_global_tracker()
-        if tracker:
-            batch_idx = tracker.current_batch
-        else:
-            batch_idx = 0
+            # 更新全局状态跟踪器
+            tracker = get_global_tracker()
+            if tracker:
+                batch_idx = tracker.current_batch
+            else:
+                batch_idx = 0
 
-        print(f"[ATTN] Layer {self.layer_id} starting computation...")
+            print(f"[ATTN] Layer {self.layer_id} starting computation...")
 
-        # 预期形状
-        exp_q = (self.n_heads_q * self.head_dim, x.size(-1))
-        exp_kv = (self.n_kv_heads * self.head_dim, x.size(-1))
+            # 预期形状
+            exp_q = (self.n_heads_q * self.head_dim, x.size(-1))
+            exp_kv = (self.n_kv_heads * self.head_dim, x.size(-1))
 
-        def _shape(t): return tuple(t.shape)
+            def _shape(t): return tuple(t.shape)
 
-        if _shape(self.wq.weight) != exp_q:
-            raise RuntimeError(f"[Q shape] { _shape(self.wq.weight) } != {exp_q} "
-                            f"(likely manifest q/k/v mapping issue)")
-        if _shape(self.wk.weight) != exp_kv:
-            raise RuntimeError(f"[K shape] { _shape(self.wk.weight) } != {exp_kv} "
-                            f"(likely manifest q/k/v mapping issue)")
-        if _shape(self.wv.weight) != exp_kv:
-            raise RuntimeError(f"[V shape] { _shape(self.wv.weight) } != {exp_kv} "
-                            f"(likely manifest q/k/v mapping issue)")    
+            if _shape(self.wq.weight) != exp_q:
+                raise RuntimeError(f"[Q shape] { _shape(self.wq.weight) } != {exp_q} "
+                                f"(likely manifest q/k/v mapping issue)")
+            if _shape(self.wk.weight) != exp_kv:
+                raise RuntimeError(f"[K shape] { _shape(self.wk.weight) } != {exp_kv} "
+                                f"(likely manifest q/k/v mapping issue)")
+            if _shape(self.wv.weight) != exp_kv:
+                raise RuntimeError(f"[V shape] { _shape(self.wv.weight) } != {exp_kv} "
+                                f"(likely manifest q/k/v mapping issue)")    
 
-        # QKV投影 - 使用专门的compute stream
-        # compute_stream = self.streams.weight_compute if self.streams else None
-        compute_stream = self.compute_stream
-        if compute_stream:
-            with torch.cuda.stream(compute_stream):
+            # QKV投影 - 使用专门的compute stream
+            # compute_stream = self.streams.weight_compute if self.streams else None
+            compute_stream = self.compute_stream
+            if compute_stream:
+                with torch.cuda.stream(compute_stream):
+                    with cuda_timer("attn_us", self.layer_id):
+                        # print("wq.weight.device =", self.wq.weight.device)
+                        q = self.wq(x).view(bsz, seqlen, self.n_heads_q, self.head_dim)
+                        k = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+                        v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+
+                        # 应用旋转位置编码
+                        # q = apply_rotary_embeddings(q, freqs_complex)
+                        # k = apply_rotary_embeddings(k, freqs_complex)
+                        q = apply_rotary_embeddings(q, freqs_complex, start_pos=start_pos)
+                        k = apply_rotary_embeddings(k, freqs_complex, start_pos=start_pos)
+
+            else:
+                # 回退到默认stream
                 with cuda_timer("attn_us", self.layer_id):
                     # print("wq.weight.device =", self.wq.weight.device)
                     q = self.wq(x).view(bsz, seqlen, self.n_heads_q, self.head_dim)
@@ -602,142 +613,158 @@ class SelfAttention(nn.Module):
                     # k = apply_rotary_embeddings(k, freqs_complex)
                     q = apply_rotary_embeddings(q, freqs_complex, start_pos=start_pos)
                     k = apply_rotary_embeddings(k, freqs_complex, start_pos=start_pos)
-
-        else:
-            # 回退到默认stream
-            with cuda_timer("attn_us", self.layer_id):
-                # print("wq.weight.device =", self.wq.weight.device)
-                q = self.wq(x).view(bsz, seqlen, self.n_heads_q, self.head_dim)
-                k = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-                v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
-
-                # 应用旋转位置编码
-                # q = apply_rotary_embeddings(q, freqs_complex)
-                # k = apply_rotary_embeddings(k, freqs_complex)
-                q = apply_rotary_embeddings(q, freqs_complex, start_pos=start_pos)
-                k = apply_rotary_embeddings(k, freqs_complex, start_pos=start_pos)
         
-        # ------------------------- (A) 推入 KV 到 offloader -------------------------
-        bsz, seqlen, n_heads, head_dim = k.shape
+            # ------------------------- (A) 推入 KV 到 offloader -------------------------
+            bsz, seqlen, n_heads, head_dim = k.shape
 
-        # 对于每个token位置, 计算对应的block并push
-        if getattr(self, "offloader", None) is not None:
-            for seq_idx in range(seqlen):
-                blk_idx   = (start_pos + seq_idx) // self.block_sz
-                token_idx =  start_pos + seq_idx
-
-                # 保持 (bsz, heads, dim) —— 切勿 squeeze，否则 heads 会被误当 batch
-                k_curr = k[:, seq_idx, :, :]    # (bsz, n_kv_heads, head_dim)
-                v_curr = v[:, seq_idx, :, :]
-
-                # 将该 token 写入所属 block 的正确 token 槽位
-                self.offloader.push(
-                    layer=self.layer_id,
-                    blk=blk_idx,
-                    k=k_curr,
-                    v=v_curr,
-                    token_idx=token_idx,
-                    batch_idx=batch_idx,
-                )
-
-        # ------------------------- (B) 选择并取回需要的 blocks -------------------------
-        blk_idx = start_pos // self.block_sz 
-        
-        # 获取Top-K blocks (如果有 offloader)
-        nvtx.range_push(f"layer_{self.layer_id}_kv_fetch")
-        with cuda_timer("kv_fetch_us", self.layer_id):
-            do_profile_gpu = bool(self.enable_profiling and x.is_cuda)
-            if do_profile_gpu:
-                fetch_evt_start = torch.cuda.Event(enable_timing=True)
-                fetch_evt_end = torch.cuda.Event(enable_timing=True)
-                fetch_evt_start.record()
-
+            # 对于每个token位置, 计算对应的block并push
             if getattr(self, "offloader", None) is not None:
-                blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk, batch_idx=batch_idx)
-                # 保证当前 block 在列表内
-                if blk_idx not in blocks:
-                    blocks = sorted(set(blocks + [blk_idx]))
-                    # 简单截断到 topk，避免过度复杂的距离计算
-                    if len(blocks) > self.topk_blk:
-                        blocks = blocks[:self.topk_blk]
-                else:
-                    blocks = sorted(blocks)
-                needed = torch.tensor(blocks, device=x.device, dtype=torch.long)
-                k_full, v_full = self.offloader.fetch(
-                    self.layer_id, needed, batch_idx=batch_idx, bsz=bsz
-                )
-            else:
-                # 无 offloader：直接使用当前序列窗口（转为 (B,H,T,D)）
-                k_full = k.transpose(1, 2).contiguous()
-                v_full = v.transpose(1, 2).contiguous()
-                blocks = [blk_idx]  # 为后续 update_importances 提供 blocks 列表
+                for seq_idx in range(seqlen):
+                    blk_idx   = (start_pos + seq_idx) // self.block_sz
+                    token_idx =  start_pos + seq_idx
 
-            if do_profile_gpu:
-                fetch_evt_end.record()
-                if not fetch_evt_end.query():
-                    fetch_evt_end.synchronize()
-                self.kv_elapsed_time = fetch_evt_start.elapsed_time(fetch_evt_end) * 1000
-                PERF_TRACKER.add_layer_stat(self.layer_id, "kv_fetch_us", self.kv_elapsed_time)
-            else:
-                self.kv_elapsed_time = 0
-        nvtx.range_pop()  # kv_fetch
+                    # 保持 (bsz, heads, dim) —— 切勿 squeeze，否则 heads 会被误当 batch
+                    k_curr = k[:, seq_idx, :, :]    # (bsz, n_kv_heads, head_dim)
+                    v_curr = v[:, seq_idx, :, :]
 
-        # ============================================================
-        # 3) 确保 KV Cache（历史 K/V）在 CUDA（防止 q 在 CUDA、k_full 在 CPU 的 bmm 报错）
-        # Ensure KV cache (historical K/V) is on CUDA (prevent bmm error when q is on CUDA but k_full on CPU)
-        # ============================================================
-        if k_full.device.type != "cuda":
-            raise RuntimeError(f"Layer {self.layer_id} SelfAttention: k_full is on {k_full.device}, but q is on {q.device}. "
-                             "This would cause 'mat2 is on cpu' error in bmm. KV cache must be on CUDA.")
-        if v_full.device.type != "cuda":
-            raise RuntimeError(f"Layer {self.layer_id} SelfAttention: v_full is on {v_full.device}, but q is on {q.device}. "
-                             "This would cause 'mat2 is on cpu' error in bmm. KV cache must be on CUDA.")
+                    # 将该 token 写入所属 block 的正确 token 槽位
+                    self.offloader.push(
+                        layer=self.layer_id,
+                        blk=blk_idx,
+                        k=k_curr,
+                        v=v_curr,
+                        token_idx=token_idx,
+                        batch_idx=batch_idx,
+                    )
 
-        # 如果设备不一致（例如不同的 CUDA 设备），强制对齐到 q 的设备
-        # If devices mismatch (e.g., different CUDA devices), force align to q's device
-        if k_full.device != q.device:
-            k_full = k_full.to(q.device, non_blocking=True)
-        if v_full.device != q.device:
-            v_full = v_full.to(q.device, non_blocking=True)
-
-        #  batch
-        if k_full.dim() == 3:
-            # (seq_len, n_heads, head_dim) -> (1, n_heads, seq_len, head_dim)
-            k_full = k_full.permute(1, 0, 2).unsqueeze(0)
-            v_full = v_full.permute(1, 0, 2).unsqueeze(0)
-        elif k_full.dim() == 4:
-            # 检查是否已经是正确的格式 (bsz, n_heads, seq_len, head_dim)
-            # 通过比较 dimension sizes：heads 应该比 head_dim 小
-            if k_full.size(1) == self.n_kv_heads:
-                # 已经是 (bsz, n_heads, seq_len, head_dim)，不需要 transpose
-                pass
-            else:
-                # 假设是 (bsz, seq_len, n_heads, head_dim)，需要 transpose
-                k_full = k_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
-                v_full = v_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
-
-        # 确保k_full和v_full与q的batch维度一致
-        if k_full.size(0) == 1 and bsz > 1:
-            # 单batch的KV需要扩展到多batch
-            k_full = k_full.expand(bsz, -1, -1, -1)
-            v_full = v_full.expand(bsz, -1, -1, -1)
-
-        k_full = k_full.to(q.dtype)
-        v_full = v_full.to(q.dtype)
-        # 重复KV头以匹配查询头数
-        # if self.n_heads_q != self.n_kv_heads:
-        if (self.n_heads_q != self.n_kv_heads) and (k_full.size(1) != self.n_heads_q):
-            k_full = k_full.repeat_interleave(self.n_rep, dim=1)
-            v_full = v_full.repeat_interleave(self.n_rep, dim=1)
+            # ------------------------- (B) 选择并取回需要的 blocks -------------------------
+            blk_idx = start_pos // self.block_sz 
         
-        # 确保缓冲区足够大
-        q = q.transpose(1, 2)  # (B, H, Tq, D)
+            # 获取Top-K blocks (如果有 offloader)
+            nvtx.range_push(f"layer_{self.layer_id}_kv_fetch")
+            with cuda_timer("kv_fetch_us", self.layer_id):
+                do_profile_gpu = bool(self.enable_profiling and x.is_cuda)
+                if do_profile_gpu:
+                    fetch_evt_start = torch.cuda.Event(enable_timing=True)
+                    fetch_evt_end = torch.cuda.Event(enable_timing=True)
+                    fetch_evt_start.record()
 
-        # Attention计算 - 使用compute stream
-        nvtx.range_push(f"layer_{self.layer_id}_attention_compute")
-        do_profile_gpu = bool(self.enable_profiling and x.is_cuda)
-        if compute_stream:
-            with torch.cuda.stream(compute_stream):
+                if getattr(self, "offloader", None) is not None:
+                    blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk, batch_idx=batch_idx)
+                    # 保证当前 block 在列表内
+                    if blk_idx not in blocks:
+                        blocks = sorted(set(blocks + [blk_idx]))
+                        # 简单截断到 topk，避免过度复杂的距离计算
+                        if len(blocks) > self.topk_blk:
+                            blocks = blocks[:self.topk_blk]
+                    else:
+                        blocks = sorted(blocks)
+                    needed = torch.tensor(blocks, device=x.device, dtype=torch.long)
+                    k_full, v_full = self.offloader.fetch(
+                        self.layer_id, needed, batch_idx=batch_idx, bsz=bsz
+                    )
+                else:
+                    # 无 offloader：直接使用当前序列窗口（转为 (B,H,T,D)）
+                    k_full = k.transpose(1, 2).contiguous()
+                    v_full = v.transpose(1, 2).contiguous()
+                    blocks = [blk_idx]  # 为后续 update_importances 提供 blocks 列表
+
+                if do_profile_gpu:
+                    fetch_evt_end.record()
+                    if not fetch_evt_end.query():
+                        fetch_evt_end.synchronize()
+                    self.kv_elapsed_time = fetch_evt_start.elapsed_time(fetch_evt_end) * 1000
+                    PERF_TRACKER.add_layer_stat(self.layer_id, "kv_fetch_us", self.kv_elapsed_time)
+                else:
+                    self.kv_elapsed_time = 0
+            nvtx.range_pop()  # kv_fetch
+
+            # ============================================================
+            # 3) 确保 KV Cache（历史 K/V）在 CUDA（防止 q 在 CUDA、k_full 在 CPU 的 bmm 报错）
+            # Ensure KV cache (historical K/V) is on CUDA (prevent bmm error when q is on CUDA but k_full on CPU)
+            # ============================================================
+            if k_full.device.type != "cuda":
+                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: k_full is on {k_full.device}, but q is on {q.device}. "
+                                 "This would cause 'mat2 is on cpu' error in bmm. KV cache must be on CUDA.")
+            if v_full.device.type != "cuda":
+                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: v_full is on {v_full.device}, but q is on {q.device}. "
+                                 "This would cause 'mat2 is on cpu' error in bmm. KV cache must be on CUDA.")
+
+            # 如果设备不一致（例如不同的 CUDA 设备），强制对齐到 q 的设备
+            # If devices mismatch (e.g., different CUDA devices), force align to q's device
+            if k_full.device != q.device:
+                k_full = k_full.to(q.device, non_blocking=True)
+            if v_full.device != q.device:
+                v_full = v_full.to(q.device, non_blocking=True)
+
+            #  batch
+            if k_full.dim() == 3:
+                # (seq_len, n_heads, head_dim) -> (1, n_heads, seq_len, head_dim)
+                k_full = k_full.permute(1, 0, 2).unsqueeze(0)
+                v_full = v_full.permute(1, 0, 2).unsqueeze(0)
+            elif k_full.dim() == 4:
+                # 检查是否已经是正确的格式 (bsz, n_heads, seq_len, head_dim)
+                # 通过比较 dimension sizes：heads 应该比 head_dim 小
+                if k_full.size(1) == self.n_kv_heads:
+                    # 已经是 (bsz, n_heads, seq_len, head_dim)，不需要 transpose
+                    pass
+                else:
+                    # 假设是 (bsz, seq_len, n_heads, head_dim)，需要 transpose
+                    k_full = k_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
+                    v_full = v_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
+
+            # 确保k_full和v_full与q的batch维度一致
+            if k_full.size(0) == 1 and bsz > 1:
+                # 单batch的KV需要扩展到多batch
+                k_full = k_full.expand(bsz, -1, -1, -1)
+                v_full = v_full.expand(bsz, -1, -1, -1)
+
+            k_full = k_full.to(q.dtype)
+            v_full = v_full.to(q.dtype)
+            # 重复KV头以匹配查询头数
+            # if self.n_heads_q != self.n_kv_heads:
+            if (self.n_heads_q != self.n_kv_heads) and (k_full.size(1) != self.n_heads_q):
+                k_full = k_full.repeat_interleave(self.n_rep, dim=1)
+                v_full = v_full.repeat_interleave(self.n_rep, dim=1)
+        
+            # 确保缓冲区足够大
+            q = q.transpose(1, 2)  # (B, H, Tq, D)
+
+            # Attention计算 - 使用compute stream
+            nvtx.range_push(f"layer_{self.layer_id}_attention_compute")
+            do_profile_gpu = bool(self.enable_profiling and x.is_cuda)
+            if compute_stream:
+                with torch.cuda.stream(compute_stream):
+                    with cuda_timer("attn_us", self.layer_id):
+                        # mha
+                        if do_profile_gpu:
+                            attn_evt_start = torch.cuda.Event(enable_timing=True)
+                            attn_evt_end = torch.cuda.Event(enable_timing=True)
+                            attn_evt_start.record()
+
+                        scores = torch.matmul(q, k_full.transpose(2, 3))
+                        scores = scores / math.sqrt(self.head_dim)
+
+                        # causal mask
+                        if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
+                            seq_len_q = q.size(2)
+                            seq_len_k = k_full.size(2)
+                            mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
+                            scores = scores.masked_fill(mask.bool(), float('-inf'))
+
+                        # Softmax和输出计算
+                        attn_weights = torch.softmax(scores, dim=-1)
+                        out = torch.matmul(attn_weights, v_full)
+
+                        if do_profile_gpu:
+                            attn_evt_end.record()
+                            if not attn_evt_end.query():
+                                attn_evt_end.synchronize()
+                            self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
+                            PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
+                        else:
+                            self.attn_time = 0
+            else:
                 with cuda_timer("attn_us", self.layer_id):
                     # mha
                     if do_profile_gpu:
@@ -752,8 +779,18 @@ class SelfAttention(nn.Module):
                     if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
                         seq_len_q = q.size(2)
                         seq_len_k = k_full.size(2)
-                        mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
-                        scores = scores.masked_fill(mask.bool(), float('-inf'))
+                        # mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
+                        # # scores = scores.masked_fill(mask.bool(), float('-inf'))
+                    
+                        # mask = self._get_causal_mask(scores.size(-1), device=scores.device)
+                        seq_len_q = q.size(2)
+                        seq_len_k = k_full.size(2)
+                        delta = max(0, seq_len_k - seq_len_q)
+                        mask = torch.triu(torch.ones((seq_len_q, seq_len_k), dtype=torch.bool, device=q.device),
+                                        diagonal=1 + delta)
+                        scores = scores.masked_fill(mask, float('-inf'))
+                    
+
 
                     # Softmax和输出计算
                     attn_weights = torch.softmax(scores, dim=-1)
@@ -767,193 +804,155 @@ class SelfAttention(nn.Module):
                         PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
                     else:
                         self.attn_time = 0
-        else:
-            with cuda_timer("attn_us", self.layer_id):
-                # mha
-                if do_profile_gpu:
-                    attn_evt_start = torch.cuda.Event(enable_timing=True)
-                    attn_evt_end = torch.cuda.Event(enable_timing=True)
-                    attn_evt_start.record()
-
-                scores = torch.matmul(q, k_full.transpose(2, 3))
-                scores = scores / math.sqrt(self.head_dim)
-
-                # causal mask
-                if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
-                    seq_len_q = q.size(2)
-                    seq_len_k = k_full.size(2)
-                    # mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
-                    # # scores = scores.masked_fill(mask.bool(), float('-inf'))
-                    
-                    # mask = self._get_causal_mask(scores.size(-1), device=scores.device)
-                    seq_len_q = q.size(2)
-                    seq_len_k = k_full.size(2)
-                    delta = max(0, seq_len_k - seq_len_q)
-                    mask = torch.triu(torch.ones((seq_len_q, seq_len_k), dtype=torch.bool, device=q.device),
-                                    diagonal=1 + delta)
-                    scores = scores.masked_fill(mask, float('-inf'))
-                    
-
-
-                # Softmax和输出计算
-                attn_weights = torch.softmax(scores, dim=-1)
-                out = torch.matmul(attn_weights, v_full)
-
-                if do_profile_gpu:
-                    attn_evt_end.record()
-                    if not attn_evt_end.query():
-                        attn_evt_end.synchronize()
-                    self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
-                    PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
-                else:
-                    self.attn_time = 0
-        nvtx.range_pop()  # attention_compute
-        # out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
+            nvtx.range_pop()  # attention_compute
+            # out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
         
-        # stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
-        # self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
-        # self.attn_time       = stats.get("attn_us",     0)
+            # stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
+            # self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
+            # self.attn_time       = stats.get("attn_us",     0)
         
-        # # Update block importances (only if offloader exists)
-        # if getattr(self, "offloader", None) is not None:
-        #     with torch.no_grad():
-        #         token_imp = attn_weights.mean(dim=(0, 1, 2))  # (Tkv,)
-        #         block_scores = []
-        #         for i, _ in enumerate(blocks):
-        #             s = i * self.block_sz
-        #             e = min(s + self.block_sz, token_imp.size(0))
-        #             score = self._safe_item_sum_1d(token_imp, s, e)
-        #             block_scores.append(score)
+            # # Update block importances (only if offloader exists)
+            # if getattr(self, "offloader", None) is not None:
+            #     with torch.no_grad():
+            #         token_imp = attn_weights.mean(dim=(0, 1, 2))  # (Tkv,)
+            #         block_scores = []
+            #         for i, _ in enumerate(blocks):
+            #             s = i * self.block_sz
+            #             e = min(s + self.block_sz, token_imp.size(0))
+            #             score = self._safe_item_sum_1d(token_imp, s, e)
+            #             block_scores.append(score)
 
-        #         self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx=batch_idx)
+            #         self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx=batch_idx)
 
-        # feat = self.n_heads_q * self.head_dim  # = dim
-        # if out.dim() == 2:
-        #     # 误展平成 [B, seqlen*dim] 的情形：还原成 [B, seqlen, dim]
-        #     out = out.view(bsz, seqlen, self.n_heads_q, self.head_dim).reshape(bsz, seqlen, feat)
-        # elif out.dim() == 3 and out.size(-1) != feat:
-        #     # 例如被写成 view(bsz, -1) 合并了最后两维
-        #     out = out.reshape(bsz, seqlen, feat)
+            # feat = self.n_heads_q * self.head_dim  # = dim
+            # if out.dim() == 2:
+            #     # 误展平成 [B, seqlen*dim] 的情形：还原成 [B, seqlen, dim]
+            #     out = out.view(bsz, seqlen, self.n_heads_q, self.head_dim).reshape(bsz, seqlen, feat)
+            # elif out.dim() == 3 and out.size(-1) != feat:
+            #     # 例如被写成 view(bsz, -1) 合并了最后两维
+            #     out = out.reshape(bsz, seqlen, feat)
 
-        # # 输出投影 - 使用compute stream
-        # if compute_stream:
-        #     with torch.cuda.stream(compute_stream):
-        #         result = self.wo(out)
-        # else:
-        #     result = self.wo(out)
+            # # 输出投影 - 使用compute stream
+            # if compute_stream:
+            #     with torch.cuda.stream(compute_stream):
+            #         result = self.wo(out)
+            # else:
+            #     result = self.wo(out)
 
-        # total_time = (time.time() - start_time) * 1000000  # 转换为微秒
-        # PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
-        # print(f"[ATTN] Layer {self.layer_id} computation done")
-        # return result
+            # total_time = (time.time() - start_time) * 1000000  # 转换为微秒
+            # PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
+            # print(f"[ATTN] Layer {self.layer_id} computation done")
+            # return result
         
-        out = out.transpose(1, 2).contiguous()
+            out = out.transpose(1, 2).contiguous()
 
-        # --- 统计信息（若有） ---
-        stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
-        self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
-        self.attn_time       = stats.get("attn_us",     0)
+            # --- 统计信息（若有） ---
+            stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
+            self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
+            self.attn_time       = stats.get("attn_us",     0)
 
 
-        feat = self.n_heads_q * self.head_dim  # = dim
-        B, Tq = bsz, seqlen
-        w = self.wo.weight
+            feat = self.n_heads_q * self.head_dim  # = dim
+            B, Tq = bsz, seqlen
+            w = self.wo.weight
         
-        # 重要度（attn_weights 已实体化时才计算；blocks 缺失则按 block_sz 推导）
-        if getattr(self, "offloader", None) is not None:
-            with torch.no_grad():
-                if ('attn_weights' in locals()
-                    and attn_weights is not None
-                    and not getattr(attn_weights, "is_meta", False)):
-                    # [B, Hq, Tq, Tkv] -> (Tkv,)
-                    token_imp = attn_weights.detach().mean(dim=(0, 1, 2))
-                    if 'blocks' not in locals() or blocks is None:
-                        Tkv = int(token_imp.size(0))
-                        nblk = (Tkv + self.block_sz - 1) // self.block_sz
-                        blocks = [(i*self.block_sz, min((i+1)*self.block_sz, Tkv)) for i in range(nblk)]
-                    block_scores = []
-                    for i, _ in enumerate(blocks):
-                        s = i * self.block_sz
-                        e = min(s + self.block_sz, token_imp.size(0))
-                        if hasattr(self, "_safe_item_sum_1d"):
-                            score = self._safe_item_sum_1d(token_imp, s, e)  # 建议已定义为 @staticmethod
-                        else:
-                            score = float(token_imp[s:e].sum().detach().cpu().item())
-                        block_scores.append(score)
-                    self.offloader.update_importances(self.layer_id, blocks, block_scores,
-                                                    batch_idx=locals().get("batch_idx", 0))
+            # 重要度（attn_weights 已实体化时才计算；blocks 缺失则按 block_sz 推导）
+            if getattr(self, "offloader", None) is not None:
+                with torch.no_grad():
+                    if ('attn_weights' in locals()
+                        and attn_weights is not None
+                        and not getattr(attn_weights, "is_meta", False)):
+                        # [B, Hq, Tq, Tkv] -> (Tkv,)
+                        token_imp = attn_weights.detach().mean(dim=(0, 1, 2))
+                        if 'blocks' not in locals() or blocks is None:
+                            Tkv = int(token_imp.size(0))
+                            nblk = (Tkv + self.block_sz - 1) // self.block_sz
+                            blocks = [(i*self.block_sz, min((i+1)*self.block_sz, Tkv)) for i in range(nblk)]
+                        block_scores = []
+                        for i, _ in enumerate(blocks):
+                            s = i * self.block_sz
+                            e = min(s + self.block_sz, token_imp.size(0))
+                            if hasattr(self, "_safe_item_sum_1d"):
+                                score = self._safe_item_sum_1d(token_imp, s, e)  # 建议已定义为 @staticmethod
+                            else:
+                                score = float(token_imp[s:e].sum().detach().cpu().item())
+                            block_scores.append(score)
+                        self.offloader.update_importances(self.layer_id, blocks, block_scores,
+                                                        batch_idx=locals().get("batch_idx", 0))
                     
                     
-        # --- 形状护栏：确保送入 wo 前为 [B, seqlen, dim] ---
+            # --- 形状护栏：确保送入 wo 前为 [B, seqlen, dim] ---
 
-        def _as_btD_take_last(_out, B, Tq, feat):
-            """把 out 统一成 [B, Tq, feat]；若含累计 T_total，则仅取最后 Tq。"""
-            ne = _out.numel()
-            if _out.dim() == 3:
-                # e.g. [B, T?, D?]：矫正最后一维，再裁剪 Tq
-                T_found = _out.size(1)
-                if _out.size(-1) != feat:
-                    # 用元素数反推 T_found
+            def _as_btD_take_last(_out, B, Tq, feat):
+                """把 out 统一成 [B, Tq, feat]；若含累计 T_total，则仅取最后 Tq。"""
+                ne = _out.numel()
+                if _out.dim() == 3:
+                    # e.g. [B, T?, D?]：矫正最后一维，再裁剪 Tq
+                    T_found = _out.size(1)
+                    if _out.size(-1) != feat:
+                        # 用元素数反推 T_found
+                        T_found = ne // (B * feat)
+                        _out = _out.reshape(B, T_found, feat)
+                    return _out[:, -Tq:, :]  # decode 场景：只取最后 Tq
+                elif _out.dim() == 2:
+                    # e.g. [B, T_total*feat] 或 [B, feat]
+                    C = _out.size(1)
+                    if C == feat:
+                        return _out.view(B, 1, feat)[:, -Tq:, :]
+                    if C % feat == 0:
+                        T_found = C // feat
+                        return _out.view(B, T_found, feat)[:, -Tq:, :]
+                    # 兜底：按元素数反推
                     T_found = ne // (B * feat)
-                    _out = _out.reshape(B, T_found, feat)
-                return _out[:, -Tq:, :]  # decode 场景：只取最后 Tq
-            elif _out.dim() == 2:
-                # e.g. [B, T_total*feat] 或 [B, feat]
-                C = _out.size(1)
-                if C == feat:
-                    return _out.view(B, 1, feat)[:, -Tq:, :]
-                if C % feat == 0:
-                    T_found = C // feat
                     return _out.view(B, T_found, feat)[:, -Tq:, :]
-                # 兜底：按元素数反推
-                T_found = ne // (B * feat)
-                return _out.view(B, T_found, feat)[:, -Tq:, :]
+                else:
+                    # 其它异常：用元素数反推
+                    T_found = ne // (B * feat)
+                    return _out.reshape(B, T_found, feat)[:, -Tq:, :]
+
+            # 如果不是期望形状/维度，做一次统一矫正
+            if out.dim() != 3 or out.size(0) != B or out.size(1) != Tq or out.size(2) != feat:
+                out = _as_btD_take_last(out, B, Tq, feat)
             else:
-                # 其它异常：用元素数反推
-                T_found = ne // (B * feat)
-                return _out.reshape(B, T_found, feat)[:, -Tq:, :]
-
-        # 如果不是期望形状/维度，做一次统一矫正
-        if out.dim() != 3 or out.size(0) != B or out.size(1) != Tq or out.size(2) != feat:
-            out = _as_btD_take_last(out, B, Tq, feat)
-        else:
-            # 标准路径：已是 [B, Tq, *]，但最后一维可能不是 feat
-            if out.size(-1) != feat:
-                # 先尝试按元素数恢复再裁剪
-                T_found = out.numel() // (B * feat)
-                out = out.reshape(B, T_found, feat)[:, -Tq:, :]
+                # 标准路径：已是 [B, Tq, *]，但最后一维可能不是 feat
+                if out.size(-1) != feat:
+                    # 先尝试按元素数恢复再裁剪
+                    T_found = out.numel() // (B * feat)
+                    out = out.reshape(B, T_found, feat)[:, -Tq:, :]
                 
-        assert out.shape == (B, Tq, feat), f"out={out.shape}, B={B}, Tq={Tq}, feat={feat}"
-        # --- 线性层稳定计算：统一 2D → Linear → 3D ---
-        # 对齐 dtype / device 到 wo.weight
-        out2d = out.reshape(-1, feat)
-        w = self.wo.weight
-        if getattr(out2d, "is_meta", False) or (hasattr(out2d, "device") and out2d.device.type == "meta"):
-            out2d = torch.zeros((B*Tq, feat), dtype=w.dtype, device=w.device)
-        else:
-            if out2d.dtype != w.dtype:
-                out2d = out2d.to(w.dtype)
-            if out2d.device != w.device:
-                out2d = out2d.to(w.device, non_blocking=True)
+            assert out.shape == (B, Tq, feat), f"out={out.shape}, B={B}, Tq={Tq}, feat={feat}"
+            # --- 线性层稳定计算：统一 2D → Linear → 3D ---
+            # 对齐 dtype / device 到 wo.weight
+            out2d = out.reshape(-1, feat)
+            w = self.wo.weight
+            if getattr(out2d, "is_meta", False) or (hasattr(out2d, "device") and out2d.device.type == "meta"):
+                out2d = torch.zeros((B*Tq, feat), dtype=w.dtype, device=w.device)
+            else:
+                if out2d.dtype != w.dtype:
+                    out2d = out2d.to(w.dtype)
+                if out2d.device != w.device:
+                    out2d = out2d.to(w.device, non_blocking=True)
 
-        assert out.shape == (bsz, seqlen, feat), f"out={out.shape}, bsz={bsz}, seqlen={seqlen}, feat={feat}"
+            assert out.shape == (bsz, seqlen, feat), f"out={out.shape}, bsz={bsz}, seqlen={seqlen}, feat={feat}"
 
-        # 输出投影（可用 compute_stream）
-        if compute_stream:
-            with torch.cuda.stream(compute_stream):
+            # 输出投影（可用 compute_stream）
+            if compute_stream:
+                with torch.cuda.stream(compute_stream):
+                    res2d = self.wo(out2d)
+            else:
                 res2d = self.wo(out2d)
-        else:
-            res2d = self.wo(out2d)
 
-        result = res2d.view(B, Tq, -1).contiguous()
+            result = res2d.view(B, Tq, -1).contiguous()
 
-        # --- 统计收尾 ---
-        total_time = (time.time() - start_time) * 1e6  # μs
-        PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
-        # print(f"[ATTN] Layer {self.layer_id} computation done")
+            # --- 统计收尾 ---
+            total_time = (time.time() - start_time) * 1e6  # μs
+            PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
+            # print(f"[ATTN] Layer {self.layer_id} computation done")
 
-        # IN_USE 标记会在下一轮evict时自动清理，这里不需要手动unmark
-        return result
+            return result
+        finally:
+            if in_use and hasattr(wm, "_unmark_group_in_use"):
+                wm._unmark_group_in_use(self.layer_id, "attn")
 
 # ---------- Optimized FeedForward ----------
 class FeedForward(nn.Module):
@@ -1102,10 +1101,10 @@ class FeedForward(nn.Module):
         wm = getattr(self, "weight_manager", None)
         in_use = False
         compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
-        if wm and hasattr(wm, "_make_group_in_use"):
-            wm._make_group_in_use(self.layer_id, "ffn")
-            in_use = True
         try:
+            if wm and hasattr(wm, "_mark_group_in_use"):
+                wm._mark_group_in_use(self.layer_id, "ffn")
+                in_use = True
             if wm is not None:
                 # 确保 ffn 组在 GPU（阻塞式，直到权重加载完成）
                 if hasattr(wm, "ensure_group_on_gpu"):
@@ -1118,82 +1117,73 @@ class FeedForward(nn.Module):
                 # 在 compute stream 上等待 ffn 组 H2D 传输完成（禁止降级到 CPU）
                 if hasattr(wm, "wait_group_ready"):
                     wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
-        finally:
-            if in_use and hasattr(wm, "_unmark_group_in_use"):
-                wm._unmake_group_in_use(self.layer_id, "ffn")
 
-        print(f"[FFN] Layer {self.layer_id} weights ensured and ready")
+            print(f"[FFN] Layer {self.layer_id} weights ensured and ready")
 
-        # ============================================================
-        # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
-        # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
-        # ============================================================
-        target_dev = x.device
+            # ============================================================
+            # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
+            # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
+            # ============================================================
+            target_dev = x.device
 
-        # 确保 target_dev 是 CUDA（不接受 CPU）
-        if not str(target_dev).startswith("cuda"):
-            raise RuntimeError(f"Layer {self.layer_id} FeedForward: input x is on {target_dev}, but only CUDA is supported")
+            # 确保 target_dev 是 CUDA（不接受 CPU）
+            if not str(target_dev).startswith("cuda"):
+                raise RuntimeError(f"Layer {self.layer_id} FeedForward: input x is on {target_dev}, but only CUDA is supported")
 
-        # 验证所有 FFN 权重在 CUDA（不做迁移，只检查）
-        for mod in (self.w1, self.w2, self.w3):
-            # 权重必须在 CUDA，不允许 meta 或 CPU
-            if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
-                raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
+            # 验证所有 FFN 权重在 CUDA（不做迁移，只检查）
+            for mod in (self.w1, self.w2, self.w3):
+                # 权重必须在 CUDA，不允许 meta 或 CPU
+                if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
+                    raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
 
-            if not str(mod.weight.device).startswith("cuda"):
-                raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
+                if not str(mod.weight.device).startswith("cuda"):
+                    raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
 
-            # 验证设备一致性（不做迁移，只检查）
-            # Validate device consistency (no migration, only check)
-            if mod.weight.device != target_dev:
-                raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_dev}. "
-                                 "Device mismatch must be fixed by WSM, not by forward().")
+                # 验证设备一致性（不做迁移，只检查）
+                # Validate device consistency (no migration, only check)
+                if mod.weight.device != target_dev:
+                    raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_dev}. "
+                                     "Device mismatch must be fixed by WSM, not by forward().")
 
-        print(f"[FFN] Layer {self.layer_id} device validation passed (all on CUDA)")
-        print(f"[FFN] Layer {self.layer_id} starting computation...")
+            print(f"[FFN] Layer {self.layer_id} device validation passed (all on CUDA)")
+            print(f"[FFN] Layer {self.layer_id} starting computation...")
 
-        # ---- 处理输入 x 的维度 ----
-        if x.dim() == 2:
-            # 允许上游给 2D；推断 D，稍后还原形状时按 B=1
-            B, D = 1, x.size(-1)
-            T = x.size(0)
-            need_view_back = True
-        else:
-            assert x.dim() == 3, f"FFN expects 3D or 2D, got {x.shape}"
-            B, T, D = x.shape
-            need_view_back = False
+            # ---- 处理输入 x 的维度 ----
+            if x.dim() == 2:
+                # 允许上游给 2D；推断 D，稍后还原形状时按 B=1
+                B, D = 1, x.size(-1)
+                T = x.size(0)
+                need_view_back = True
+            else:
+                assert x.dim() == 3, f"FFN expects 3D or 2D, got {x.shape}"
+                B, T, D = x.shape
+                need_view_back = False
 
-        # 推断目标 dtype（从权重或输入）
-        target_dtype = self.w1.weight.dtype if hasattr(self.w1, 'weight') else torch.bfloat16
+            # 推断目标 dtype（从权重或输入）
+            target_dtype = self.w1.weight.dtype if hasattr(self.w1, 'weight') else torch.bfloat16
 
-        if getattr(x, "is_meta", False) or (hasattr(x, "device") and x.device.type == "meta"):
-            x = torch.zeros((B, T, D), dtype=target_dtype, device=target_dev)
+            if getattr(x, "is_meta", False) or (hasattr(x, "device") and x.device.type == "meta"):
+                x = torch.zeros((B, T, D), dtype=target_dtype, device=target_dev)
 
-        # ---- 统一用 2D 计算（稳定 matmul 语义），再还原 ----
-        x2 = x.reshape(-1, D)  # [B*T, D]
+            # ---- 统一用 2D 计算（稳定 matmul 语义），再还原 ----
+            x2 = x.reshape(-1, D)  # [B*T, D]
 
 
-        # compute_stream 已在上面等待时获取，直接使用
-        def _core_ffn(x2_: torch.Tensor) -> torch.Tensor:
-            # SwiGLU：gate(w1) * up(w3)
-            gate = self.w1(x2_)                 # [B*T, H]
-            up   = self.w3(x2_)                 # [B*T, H]
-            if up.dtype != gate.dtype:
-                up = up.to(gate.dtype)
-            act = F.silu(gate) * up
+            # compute_stream 已在上面等待时获取，直接使用
+            def _core_ffn(x2_: torch.Tensor) -> torch.Tensor:
+                # SwiGLU：gate(w1) * up(w3)
+                gate = self.w1(x2_)                 # [B*T, H]
+                up   = self.w3(x2_)                 # [B*T, H]
+                if up.dtype != gate.dtype:
+                    up = up.to(gate.dtype)
+                act = F.silu(gate) * up
 
-            # 送入 w2 前与 w2.weight 对齐（有些实现 w2 与 w1/bf16 混精度）
-            if act.dtype != self.w2.weight.dtype or act.device != self.w2.weight.device:
-                act = act.to(device=self.w2.weight.device, dtype=self.w2.weight.dtype, non_blocking=True)
-            y2 = self.w2(act)                   # [B*T, D]
-            return y2
-        
-        # protect
-        in_use = False
-        try:
-            if wm is not None and hasattr(wm, "_mark_group_in_use"):
-                wm._mark_group_in_use(self.layer_id, "ffn")
-                in_use = True        
+                # 送入 w2 前与 w2.weight 对齐（有些实现 w2 与 w1/bf16 混精度）
+                if act.dtype != self.w2.weight.dtype or act.device != self.w2.weight.device:
+                    act = act.to(device=self.w2.weight.device, dtype=self.w2.weight.dtype, non_blocking=True)
+                y2 = self.w2(act)                   # [B*T, D]
+                return y2
+
             start_t = time.time()
             if compute_stream:
                 with torch.cuda.stream(compute_stream):
@@ -1202,27 +1192,26 @@ class FeedForward(nn.Module):
             else:
                 with cuda_timer("ffn_us", self.layer_id):
                     y2 = _core_ffn(x2)
+
+            # 还原形状
+            if need_view_back:
+                result = y2.view(T, -1).unsqueeze(0).contiguous()  # [1, T, D]
+            else:
+                result = y2.view(B, T, -1).contiguous()
+
+            # 统计收尾（用 Python float，避免与 bf16 张量混算）
+            try:
+                us = float((time.time() - start_t) * 1e6)
+                PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", us)
+            except Exception:
+                pass
+
+            print(f"[FFN] Layer {self.layer_id} computation done")
+
+            return result
         finally:
             if in_use and hasattr(wm, "_unmark_group_in_use"):
                 wm._unmark_group_in_use(self.layer_id, "ffn")
-
-        # 还原形状
-        if need_view_back:
-            result = y2.view(T, -1).unsqueeze(0).contiguous()  # [1, T, D]
-        else:
-            result = y2.view(B, T, -1).contiguous()
-
-        # 统计收尾（用 Python float，避免与 bf16 张量混算）
-        try:
-            us = float((time.time() - start_t) * 1e6)
-            PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", us)
-        except Exception:
-            pass
-
-        print(f"[FFN] Layer {self.layer_id} computation done")
-
-        # IN_USE 标记会在下一轮evict时自动清理，这里不需要手动unmark
-        return result
 
 # ---------- Optimized EncoderBlock ----------
 class EncoderBlock(nn.Module):
