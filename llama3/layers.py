@@ -1322,6 +1322,12 @@ class EncoderBlock(nn.Module):
                 with torch.cuda.stream(streams.compute_mha):
                     attn_in  = self.attention_norm(x)
                     attn_out = self.attention(attn_in, start_pos, freqs_complex)  # 在 compute_mha 上排队
+                    
+                 # [NEW] 立刻异步预取“下一层”的 ATTN（与当前层 MHA 计算重叠）
+                if wm is not None and hasattr(wm, "prefetch_group_async"):
+                    nxt = self.layer_id + 1
+                    if nxt < self.n_layer:
+                        wm.prefetch_group_async(nxt, "attn")
                 # 在 MHA 流记录一个事件，供 FFN 流等待
                 mha_eid, mha_evt = None, None
                 try:
@@ -1333,6 +1339,11 @@ class EncoderBlock(nn.Module):
             else:
                 # 回退到默认流（不推荐，但保证可运行）
                 attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
+                # [NEW] 默认流路径也做一次
+                if wm is not None and hasattr(wm, "prefetch_group_async"):
+                    nxt = self.layer_id + 1
+                    if nxt < self.n_layer:
+                        wm.prefetch_group_async(nxt, "attn")
 
             # 在 MHA 完成之前不要在默认流上消费 attn_out；先做残差也放到 MHA 流里
             if streams and streams.compute_mha:

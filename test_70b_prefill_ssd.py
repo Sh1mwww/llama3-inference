@@ -199,7 +199,7 @@ def main():
     os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",       "1")  # 不卡在预热等待
     
     os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",       "8")
-    os.environ.setdefault("WSM_KV_THROTTLE_MS",       "5")
+    os.environ.setdefault("WSM_KV_THROTTLE_MS",       "16")
     
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -218,8 +218,8 @@ def main():
         "ssd_manifest_path": MANIFEST,
         "prefetch_distance": 4,
         "max_cached_layers": 4,
-        "cpu_cache_layers": 40,      
-        "warmup_layers": 1,         # 仅 GPU 预热第 0 层
+        "cpu_cache_layers": 50,      
+        "warmup_layers": 4,         # 仅 GPU 预热第 0 层
         "staging_mb": 64,
         "verbose": True,
     }
