@@ -189,13 +189,17 @@ def main():
 
     # （2）WSM 行为开关（滑窗 + 回环 + 组上限等）
     os.environ.setdefault("WSM_CPU_ROLLING_MODE",  "1")  # 滚动滑窗
+    os.environ.setdefault("WSM_CPU_RING_OFFSET",  "0")  
     os.environ.setdefault("WSM_CPU_WRAP_AROUND",   "1")  # 窗口末尾后回环到 L0
     os.environ.setdefault("WSM_CPU_ROLL_STRIDE",   "1")
     os.environ.setdefault("WSM_CPU_ROLL_SYNC",     "1")  # 计算线程同步推进
     os.environ.setdefault("WSM_AGGRESSIVE_GPU_PREFETCH", "2")  # 当前层 ffn + 下一层 attn
     os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX",   "1")
-    os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "3")
+    os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "6")
     os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",       "1")  # 不卡在预热等待
+    
+    os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",       "8")
+    os.environ.setdefault("WSM_KV_THROTTLE_MS",       "5")
     
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
