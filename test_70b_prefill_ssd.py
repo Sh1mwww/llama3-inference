@@ -13,6 +13,8 @@ from llama3 import generator as _gen
 # 取到原始 build 函数（类方法/静态方法都能用这个包装方式）
 _orig_build = _gen.LLaMA.build
 
+PROMPT_TXT = Path("/home/roger/llama3-inference/prompts/prompts_batch512_len2048.txt")
+
 def _debug_build(*args, **kw):
     mode       = kw.get("mode", None)
     load_model = kw.get("load_model", None)
@@ -216,7 +218,7 @@ def main():
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
-        "prefetch_distance": 4,
+        "prefetch_distance": 10,
         "max_cached_layers": 4,
         "cpu_cache_layers": 50,      
         "warmup_layers": 4,         # 仅 GPU 预热第 0 层
@@ -244,7 +246,25 @@ def main():
     dump_param_inventory(llama.model, f"after build ({mode})")
 
     # 4) 仅 prefill（不真正 decode）
-    prompt = "You are a helpful assistant.\n" + ("Lorem ipsum " * 2000)
+    # prompt = "You are a helpful assistant.\n" + ("Lorem ipsum " * 2000)
+    try:
+        prompt_path = PROMPT_TXT
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        raise RuntimeError(f"无法读取 {prompt_path}: {e}")
+    
+    # （可选但强烈推荐）安全裁剪：避免 prompt 过长导致 shape mismatch
+    # 生成器内部会按 total_len = min(max_seq_len, max_gen_len + max_prompt) 规划张量；
+    # 若 prompt token 数 > (max_seq_len - max_gen_len)，原始实现会在写入时触发尺寸不匹配。
+    # 我们在进入 text_completion 前先按 tokenizer 做 token 级裁剪。
+    max_gen_len = 1
+    max_prompt_tokens = llama.args.max_seq_len - max_gen_len
+    tok = llama.tokenizer.encode(prompt, add_special_tokens=False)
+    if len(tok) > max_prompt_tokens:
+        # 保留结尾 max_prompt_tokens 个 token（也可改成保留开头）
+        tok = tok[-max_prompt_tokens:]
+        prompt = llama.tokenizer.decode(tok)
+    
     probe("before prefill")
     tokens, texts = llama.text_completion(
         prompts=[prompt],

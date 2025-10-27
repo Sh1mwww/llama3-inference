@@ -328,7 +328,7 @@ class LLaMA:
         config = {
             'prefetch_distance': 4,
             'max_cached_layers': 4,
-            'warmup_layers': 1,
+            'warmup_layers': 0,
             'verbose': False,
         }
         config.update(streaming_config)
@@ -401,7 +401,7 @@ class LLaMA:
             'max_cached_layers': 4,
             'cpu_cache_layers': 50,
             'staging_mb': 64,
-            'warmup_layers': 5,
+            'warmup_layers': 0,
             'verbose': True,
             'check_dram_capacity': True,
         }

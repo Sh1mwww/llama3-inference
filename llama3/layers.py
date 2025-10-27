@@ -410,8 +410,9 @@ class SelfAttention(nn.Module):
                 wm.ensure_group_on_gpu(self.layer_id, "attn")
                 # 异步预取下一层的attn（与当前MHA计算重叠）
                 if hasattr(wm, "n_layers") and self.layer_id + 1 < wm.n_layers:
+                    wm.prefetch_group_async(self.layer_id, "ffn") 
                     if hasattr(wm, "prefetch_group_async"):
-                        wm.prefetch_group_async(self.layer_id + 1, "attn")
+                        wm.prefetch_group_async(self.layer_id+1 , "attn")
                 self.supports_group_prefetch = True
                 return
             except (AttributeError, NotImplementedError, KeyError) as e:
@@ -528,6 +529,7 @@ class SelfAttention(nn.Module):
 
                 # 在 compute stream 上等待 attn 组 H2D 传输完成（禁止降级到 CPU）
                 if hasattr(wm, "wait_group_ready"):
+                    wm.ensure_group_on_gpu(self.layer_id, "attn")
                     wm.wait_group_ready(self.layer_id, "attn", compute_stream=self.compute_stream)
 
             print(f"[ATTN] Layer {self.layer_id} weights ensured and ready")
@@ -948,7 +950,12 @@ class SelfAttention(nn.Module):
             total_time = (time.time() - start_time) * 1e6  # μs
             PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
             # print(f"[ATTN] Layer {self.layer_id} computation done")
-
+            
+            if wm and hasattr(wm, "notify_group_compute_done"):
+                evt = torch.cuda.Event()
+                evt.record(self.compute_stream if self.compute_stream is not None else torch.cuda.current_stream())
+                wm.notify_group_compute_done(self.layer_id, "attn", evt)
+                
             return result
         finally:
             if in_use and hasattr(wm, "_unmark_group_in_use"):
@@ -1018,6 +1025,7 @@ class FeedForward(nn.Module):
                 wm.ensure_group_on_gpu(self.layer_id, "ffn")
                 # 异步预取下一层的ffn（与当前FFN计算重叠）
                 if hasattr(wm, "n_layers") and self.layer_id + 1 < wm.n_layers:
+                    # wm.prefetch_group_async(self.layer_id + 1, "attn") 
                     if hasattr(wm, "prefetch_group_async"):
                         wm.prefetch_group_async(self.layer_id + 1, "ffn")
                 return
@@ -1116,6 +1124,7 @@ class FeedForward(nn.Module):
 
                 # 在 compute stream 上等待 ffn 组 H2D 传输完成（禁止降级到 CPU）
                 if hasattr(wm, "wait_group_ready"):
+                    wm.ensure_group_on_gpu(self.layer_id, "ffn")
                     wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
 
             print(f"[FFN] Layer {self.layer_id} weights ensured and ready")
@@ -1324,10 +1333,16 @@ class EncoderBlock(nn.Module):
                     attn_out = self.attention(attn_in, start_pos, freqs_complex)  # 在 compute_mha 上排队
                     
                  # [NEW] 立刻异步预取“下一层”的 ATTN（与当前层 MHA 计算重叠）
+                # if wm is not None and hasattr(wm, "prefetch_group_async"):
+                #     nxt = self.layer_id + 1
+                #     if nxt < self.n_layer:
+                #         wm.prefetch_group_async(nxt, "attn")
                 if wm is not None and hasattr(wm, "prefetch_group_async"):
-                    nxt = self.layer_id + 1
-                    if nxt < self.n_layer:
-                        wm.prefetch_group_async(nxt, "attn")
+                    D = int(getattr(wm, "group_prefetch_depth", 1))
+                    for off in range(1, D+1):
+                        nxt = self.layer_id + off
+                        if nxt < self.n_layer:
+                            wm.prefetch_group_async(nxt, "attn")
                 # 在 MHA 流记录一个事件，供 FFN 流等待
                 mha_eid, mha_evt = None, None
                 try:
@@ -1340,10 +1355,16 @@ class EncoderBlock(nn.Module):
                 # 回退到默认流（不推荐，但保证可运行）
                 attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
                 # [NEW] 默认流路径也做一次
+                # if wm is not None and hasattr(wm, "prefetch_group_async"):
+                #     nxt = self.layer_id + 1
+                #     if nxt < self.n_layer:
+                #         wm.prefetch_group_async(nxt, "attn")
                 if wm is not None and hasattr(wm, "prefetch_group_async"):
-                    nxt = self.layer_id + 1
-                    if nxt < self.n_layer:
-                        wm.prefetch_group_async(nxt, "attn")
+                    D = int(getattr(wm, "group_prefetch_depth", 1))
+                    for off in range(1, D+1):
+                        nxt = self.layer_id + off
+                        if nxt < self.n_layer:
+                            wm.prefetch_group_async(nxt, "attn")
 
             # 在 MHA 完成之前不要在默认流上消费 attn_out；先做残差也放到 MHA 流里
             if streams and streams.compute_mha:

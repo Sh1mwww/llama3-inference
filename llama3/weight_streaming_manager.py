@@ -248,6 +248,9 @@ class WeightStreamingManager:
         # 组预算计算：当前层(attn=1) + 当前层预取(ffn=1) + 下一层预取(attn=1) + 安全余量(1) + 弹性缓冲(1~2) = 5~7
         # 对于 SSD 模式或更激进的并发预取，建议 6~9；显存充足时可以设更高
         self.gpu_max_groups = int(os.getenv("WSM_GPU_MAX_GROUPS", "6"))  # 默认 6，建议范围 6~9
+        
+        self.group_prefetch_depth = int(os.getenv("WSM_GROUP_PREFETCH_DEPTH", "4"))
+        
         self.cpu_prefetch_distance = int(os.getenv("WSM_CPU_PREFETCH_DISTANCE", "50"))  # CPU 端预取窗口
         self.cpu_cache_cap_layers  = int(os.getenv("WSM_CPU_CACHE_CAP_LAYERS",  "50"))  # 硬上限
         self.cpu_cache_hwm_layers  = int(os.getenv("WSM_CPU_CACHE_HWM_LAYERS",  "55"))  # 高水位
@@ -310,6 +313,8 @@ class WeightStreamingManager:
         self._h2d_pending_count = 0  # weight_h2d stream 待处理事件数
         self._last_kv_throttle_time = 0  # 上次 throttle KV 的时间
         
+        # 在 __init__ 里新增一个开关（默认 False；由环境变量控制）
+        self.evict_finished_group = (os.getenv("WSM_EVICT_FINISHED", "1") == "1")
         
         # 在 __init__ 结尾附近、其它配置旁边加：
         # self.cpu_rolling_mode   = (os.getenv("WSM_CPU_ROLLING_MODE",  "1") == "1")   # 开启“层层滚动”
@@ -350,6 +355,7 @@ class WeightStreamingManager:
         self._grp_last_touch: dict[tuple[int, str], float] = {}
         self._grp_retain_ms: int = int(os.getenv("WSM_GRP_RETAIN_MS", "3"))  # 默认 3ms 的超短窗
 
+        
         
         
         # 独立 H2D stream（仅在CUDA设备上创建）
@@ -423,12 +429,26 @@ class WeightStreamingManager:
         if self.ssd_enabled:
             self._initialize_ssd_backend(ssd_manifest_path, staging_mb)
 
-        # (Optional) Warm up target GPU layers to reduce initial latency
+        # # (Optional) Warm up target GPU layers to reduce initial latency
+        # if self.target_gpu_layers > 0:
+        #     warm = list(range(min(self.target_gpu_layers, len(self.blocks))))
+        #     self.prefetch(warm)
+        #     if self.verbose:
+        #         print(f"[WSM] GPU warmup prefetch: {warm} (target: {self.target_gpu_layers} layers)")
+        
+        # (Optional) Warm up at start
         if self.target_gpu_layers > 0:
-            warm = list(range(min(self.target_gpu_layers, len(self.blocks))))
-            self.prefetch(warm)
-            if self.verbose:
-                print(f"[WSM] GPU warmup prefetch: {warm} (target: {self.target_gpu_layers} layers)")
+            if getattr(self, "grouped_mode", False):
+                # 组级 warmup（默认 doublet：0.attn,0.ffn,1.attn,1.ffn,...）
+                scheme = os.getenv("WSM_WARMUP_GROUP_SCHEME", "doublet")
+                self.warmup_groups_prefetch(layers=self.target_gpu_layers, scheme=scheme)
+            else:
+                # 旧的整层 warmup 路径
+                warm = list(range(min(self.target_gpu_layers, len(self.blocks))))
+                self.prefetch(warm)
+                if self.verbose:
+                    print(f"[WSM] GPU warmup prefetch: {warm} (target: {self.target_gpu_layers} layers)")
+
 
     # ---- Retention helpers --------------------------------------------------
     def _refresh_retain_window(self, current_idx: int):
@@ -1209,6 +1229,14 @@ class WeightStreamingManager:
 
         while time.time() - start_time < timeout:
             gpu_ready = len(self.gpu_cache) >= self.target_gpu_layers
+            
+            if getattr(self, "grouped_mode", False):
+                # 目标组数：每层 2 组（attn+ffn），受组预算上限约束；至少需要 1 组即可开跑
+                group_target = min(max(1, 2 * max(1, self.target_gpu_layers)), self.gpu_max_groups)
+                group_ready  = len(self._gpu_group_lru) >= group_target or ((0, "attn") in self._gpu_group_lru)
+                gpu_ready = gpu_ready or group_ready
+            
+            
             cpu_ready = len(self.cpu_cache) >= self.target_cpu_layers if self.ssd_enabled else True
 
             if gpu_ready and cpu_ready:
@@ -1666,64 +1694,49 @@ class WeightStreamingManager:
         n = self.n_layers
         return [ (start + k) % n for k in range(count) ]
 
-
-
+    
     # def _pre_hook_factory(self, idx: int):
     #     def _pre_hook(_module, _inputs):
-    #         # 标记当前层被使用（更新 CPU LRU）
+    #         # 1) CPU 滑窗触达（SSD→DRAM），原样保留
     #         self._touch_cpu_layer(idx)
+    #         if self.ssd_enabled:
+    #             self._schedule_cpu_prefetch(idx)
 
-    #         # Schedule CPU prefetch for upcoming layers (滚动窗口)
-    #         self._schedule_cpu_prefetch(idx)
+    #         # 2) 若没开组级模式，退回层级 ensure（不建议）
+    #         if not self.grouped_mode:
+    #             self.ensure_on_gpu(idx, wait=True)
+    #             return
 
-    #         # 异步预取后续层到 GPU（与当前层计算重叠，提升 GPU 利用率）
-    #         # aggressive_gpu_prefetch 控制预取的层数（默认 2 层）
-    #         if self.aggressive_gpu_prefetch > 0 :
-    #             prefetch_targets = []
-    #             for offset in range(1, self.aggressive_gpu_prefetch + 1):
-    #                 next_idx = idx + offset
-    #                 if next_idx < self.n_layers:
-    #                     prefetch_targets.append(next_idx)
+    #         # 3) 组级预算感知的预取计划
+    #         #    - 必做：当前层 FFN（与当前 ATTN 计算重叠）
+    #         #    - 远距离：下一层起，连续 K 个 ATTN（环回取模）
+    #         K = max(0, int(getattr(self, "group_prefetch_depth", 0)))
+    #         plan: list[tuple[int, str]] = []
 
-    #             if prefetch_targets:
-    #                 try:
-    #                     self.prefetch(prefetch_targets)  # 异步，不等待
-    #                     if self.verbose:
-    #                         print(f"[WSM] Async GPU prefetch: layers {prefetch_targets}")
-    #                 except Exception as e:
-    #                     if self.verbose:
-    #                         print(f"[WSM] Async prefetch failed for layers {prefetch_targets}: {e}")
+    #         # 3.1 当前层 FFN
+    #         plan.append((idx % self.n_layers, "ffn"))
 
-    #         if self.grouped_mode:
-    #             # 组级预取模式
-    #             # 注意：当前层的attn已在forward前由layer调用ensure_group_on_gpu确保
-    #             # 这里主要负责预取当前层的ffn和下一层的attn
+    #         # 3.2 未来 K 个 ATTN（i+1 .. i+K）
+    #         for k in range(1, K + 1):
+    #             nxt = (idx + k) % self.n_layers
+    #             plan.append((nxt, "attn"))
+
+    #         # 4) 结合 gpu_max_groups 做个轻量裁剪：预留 1 个安全名额
+    #         used = len(self._gpu_group_lru)
+    #         budget = max(0, self.gpu_max_groups - used - 1)
+    #         if budget < len(plan):
+    #             plan = plan[:budget]
+
+    #         # 5) 异步预取（不阻塞），失败不抛
+    #         for lid, grp in plan:
     #             try:
-    #                 # 异步预取当前层的ffn（与attn计算重叠）
-    #                 if hasattr(self, "prefetch_group_async"):
-    #                     self.prefetch_group_async(idx, "ffn")
-    #                     # 异步预取下一层的attn
-    #                     if idx + 1 < self.n_layers:
-    #                         self.prefetch_group_async(idx + 1, "attn")
-    #                 else:
-    #                     # 回退到同步加载
-    #                     if self.verbose:
-    #                         print(f"[WSM] prefetch_group_async not available, using synchronous load")
-    #                     if hasattr(self, "ensure_group_on_gpu"):
-    #                         self.ensure_group_on_gpu(idx, "ffn")
+    #                 self.prefetch_group_async(lid, grp)
     #             except Exception as e:
     #                 if self.verbose:
-    #                     print(f"[WSM] Group prefetch failed in hook for layer {idx}: {e}")
-    #                 # 回退到层级预取
-    #                 self.ensure_on_gpu(idx, wait=True)
-    #         else:
-    #             # 原有的层级预取逻辑
-    #             self.ensure_on_gpu(idx, wait=True)
-    #             if self._layer_prefetch_distance > 0:
-    #                 nxt = [j for j in range(idx + 1, min(idx + 1 + self._layer_prefetch_distance, len(self.blocks)))]
-    #                 self.prefetch(nxt)
+    #                     print(f"[WSM] Group prefetch failed in hook for L{lid}.{grp}: {e}")
+
     #     return _pre_hook
-    
+
     def _pre_hook_factory(self, idx: int):
         def _pre_hook(_module, _inputs):
             # 1) CPU：LRU 触达 + 滑窗
@@ -1746,28 +1759,19 @@ class WeightStreamingManager:
                     except Exception as e:
                         if self.verbose:
                             print(f"[WSM] Async layer-prefetch failed for {prefetch_targets}: {e}")
-
-            # 3) 组级（attn/ffn）容量感知 + 环回 的**保守预取**
             if self.grouped_mode and hasattr(self, "prefetch_group_async"):
-                # 计算可用名额：总上限 - 目前在卡上的组数
-                used = len(self._gpu_group_lru)
-                budget = max(0, self.gpu_max_groups - used)
-
-                # 预留 1 个安全余量，避免和 ensure_group_on_gpu/事件记录踩踏
-                if budget > 0:
-                    budget -= 1
-
-                # 计划表（最多 2 个条目；不会超过很小的 budget）
-                plan: list[tuple[int, str]] = []
-
-                # (a) 当前层的 FFN，与 MHA 计算重叠，收益最大
+                used   = len(self._gpu_group_lru)
+                budget = max(0, self.gpu_max_groups - used - 1)  # 预留 1 组
+                plan: list[tuple[int,str]] = []
+                # 当前层 FFN 与 MHA 重叠，收益最大
                 if budget > 0:
                     plan.append((idx % self.n_layers, "ffn"))
                     budget -= 1
-
-                # (b) 下一层的 ATTN（环回）
-                if budget > 0:
-                    nxt = (idx + 1) % self.n_layers
+                # ☆ 把 ATTN 的预取范围从 “+1 层” 扩到 “+D 层”
+                D = max(1, int(getattr(self, "group_prefetch_depth", 1)))
+                for off in range(1, D+1):
+                    if budget <= 0: break
+                    nxt = (idx + off) % self.n_layers
                     plan.append((nxt, "attn"))
                     budget -= 1
 
@@ -1869,9 +1873,17 @@ class WeightStreamingManager:
         以 LRU 顺序（最老在前）返回。
         """
         lst = []
-        for (lyr, grp) in list(self._gpu_group_lru):  # 复制一份，避免遍历时被修改
-            lst.append((int(lyr), str(grp), (lyr, grp) in self._gpu_groups_in_use))
+        # for (lyr, grp) in list(self._gpu_group_lru):  # 复制一份，避免遍历时被修改
+        #     lst.append((int(lyr), str(grp), (lyr, grp) in self._gpu_groups_in_use))
+        # return lst
+        inflight_keys = set(self._gpu_group_inflight.keys())
+        for (lyr, grp) in list(self._gpu_group_lru):  # 复制，避免遍历中修改
+            key = (int(lyr), str(grp))
+            in_use = key in self._gpu_groups_in_use
+            inflight = key in inflight_keys
+            lst.append((key[0], key[1], in_use, inflight))
         return lst
+
 
     def _snapshot_cpu_groups(self):
         """
@@ -1909,10 +1921,20 @@ class WeightStreamingManager:
             return
 
         def _fmt_gpu(item):
-            L, G, in_use = item
+            # L, G, in_use = item
+            # star = "*" if in_use else ""
+            # cur  = "⚑" if (current is not None and (L, G) == current) else ""
+            # return f"L{L}.{G}{star}{cur}"
+            
+            if len(item) == 3:
+                L, G, in_use = item
+                inflight = ((L, G) in self._gpu_group_inflight)
+            else:
+                L, G, in_use, inflight = item
             star = "*" if in_use else ""
+            dot  = "…" if (not in_use and inflight) else ""
             cur  = "⚑" if (current is not None and (L, G) == current) else ""
-            return f"L{L}.{G}{star}{cur}"
+            return f"L{L}.{G}{star}{cur}{dot}"
 
         def _fmt_cpu(item):
             L, G, hit, tot = item
@@ -1948,25 +1970,123 @@ class WeightStreamingManager:
         if self.verbose:
             print(f"[WSM] Unmarked group {key} from IN_USE")
         # —— 收敛阀门：把 _gpu_group_lru 收回预算（必要时忽略 retain）——
-        self._shrink_gpu_groups_now(exclude={key})
-
-    def wait_group_ready(self, layer_idx: int, group: str, compute_stream=None):
-        """
-        在 compute_stream 上等待该层权重的 H2D 事件。
-        我们用“层级” ready 事件作为组的 barrier（该层最近一次 H2D 入队后记录）。
-        """
-        evt = self.layer_events.get(layer_idx)
-        if evt is None:
-            # 回退：等待 weight_h2d 流 drain
-            try:
-                self.streams.wait_weight_ready_on_current(self.device)
-            except Exception:
-                pass
-            return
-        if compute_stream is None:
-            torch.cuda.current_stream(self.device).wait_event(evt)
+        # self._shrink_gpu_groups_now(exclude={key})
+        
+        if getattr(self, "evict_finished_group", False):
+            # 直接踢刚结束的组
+            self._evict_group_immediately(layer_idx, group)
+            # 再按上限做一次收缩（防御性）
+            self._shrink_gpu_groups_now()
         else:
-            compute_stream.wait_event(evt)
+            # 保持原行为：把刚结束的组排除掉，只收缩“其它组”到上限
+            self._shrink_gpu_groups_now(exclude={key})
+
+
+    def _evict_group_immediately(self, layer_idx: int, group: str):
+        key = (layer_idx, group)
+        for suf in GROUPS[group]:  # 例如 'attn' -> wq, wk, wv, wo
+            name = f"layers.{layer_idx}.{suf}"
+            p = self.name_to_param.get(name)
+            if p is not None and p.is_cuda and p.numel() > 0:
+                self._evict_param_to_cpu(p)
+        with self._group_lock:
+            if key in self._gpu_group_lru:
+                self._gpu_group_lru.remove(key)
+            
+    def _group_is_resident(self, layer_idx: int, group: str) -> bool:
+        """
+        该组(attn/ffn)的所有参数是否已在 GPU 且为非空张量。
+        """
+        suffixes = GROUPS.get(group)
+        if suffixes is None:
+            raise ValueError(f"unknown group '{group}', expected one of {tuple(GROUPS.keys())}")
+        for suf in suffixes:
+            pname = f"layers.{layer_idx}.{suf}"
+            p = self.name_to_param.get(pname)
+            if (p is None) or (not p.is_cuda) or (p.numel() == 0):
+                return False
+        return True
+
+
+    def _record_group_ready_event(self, layer_idx: int, group: str) -> None:
+        """
+        在权重 H2D 流上记录**组级** ready 事件。
+        需在把本组所有参数的 H2D 入队后调用（见 ensure_group_on_gpu/prefetch_group_async）。
+        """
+        if not torch.cuda.is_available():
+            return
+        h2d = getattr(self.streams, "weight_h2d", None)
+        if h2d is None:
+            return
+
+        key = (layer_idx, group)
+        evt = self._group_ready_events.get(key)
+        if evt is None:
+            evt = torch.cuda.Event(blocking=False)
+            self._group_ready_events[key] = evt
+        evt.record(h2d)
+
+        # 与层级事件一样，做一次 KV 流量仲裁的轻量检查
+        try:
+            self._check_and_throttle_kv()
+        except Exception:
+            pass
+
+
+    def wait_group_ready(
+        self,
+        layer_idx: int,
+        group: str,
+        compute_stream: "torch.cuda.Stream | None" = None,
+    ) -> None:
+        """
+        只等待 (layer_idx, group) 这组权重在 H2D 流上的完成事件。
+        - 快路径：该组已驻留于 GPU -> 直接返回；
+        - 否则若存在组级事件 -> 将 compute_stream（或当前流）挂到该事件上；
+        - 否则（无事件）直接返回，不去等待整个 H2D 流，避免误等别组传输。
+        """
+        # 1) 快路径：该组已在 GPU
+        try:
+            if self._group_is_resident(layer_idx, group):
+                return
+        except KeyError as e:
+            raise ValueError(f"unknown group '{group}': {e}")
+
+        # 2) 取该组的事件
+        evt = self._group_ready_events.get((layer_idx, group))
+        if evt is None:
+            # 没有组级事件：说明该组的 H2D 可能尚未入队/记录。为了不误等其它组，直接返回。
+            return
+
+        # 3) 在目标 compute stream 上等待
+        try:
+            # 兼容 self.device 为 str（如 "cuda:0"）或 torch.device
+            dev_obj = torch.device(self.device) if isinstance(self.device, str) else self.device
+            s = compute_stream or torch.cuda.current_stream(dev_obj)
+            s.wait_event(evt)
+        except Exception:
+            # 极端情况下的兜底：不抛异常，避免把前向卡死
+            pass
+
+
+    
+    # def wait_group_ready(self, layer_idx: int, group: str, compute_stream=None):
+    #     """
+    #     在 compute_stream 上等待该层权重的 H2D 事件。
+    #     我们用“层级” ready 事件作为组的 barrier（该层最近一次 H2D 入队后记录）。
+    #     """
+    #     evt = self.layer_events.get(layer_idx)
+    #     if evt is None:
+    #         # 回退：等待 weight_h2d 流 drain
+    #         try:
+    #             self.streams.wait_weight_ready_on_current(self.device)
+    #         except Exception:
+    #             pass
+    #         return
+    #     if compute_stream is None:
+    #         torch.cuda.current_stream(self.device).wait_event(evt)
+    #     else:
+    #         compute_stream.wait_event(evt)
 
     def _touch_group(self, layer_idx: int, group: str):
         self._grp_last_touch[(layer_idx, group)] = time.monotonic()
@@ -2004,6 +2124,7 @@ class WeightStreamingManager:
         cand_idx = None
         cand_key = None
         cand_is_ffn = False
+        inflight_keys = set(self._gpu_group_inflight.keys())
 
         with self._group_lock:
             for i, (lyr, grp) in enumerate(list(self._gpu_group_lru)):
@@ -2013,6 +2134,8 @@ class WeightStreamingManager:
                 if key in self._gpu_groups_in_use:
                     if self.verbose:
                         print(f"[WSM] Skipping eviction of IN_USE group {key}")
+                    continue
+                if key in inflight_keys:             # 正在加载
                     continue
                 if (not ignore_retain) and self._should_retain_group(lyr, grp):
                     continue
@@ -2151,6 +2274,7 @@ class WeightStreamingManager:
             if not inflight_evt.wait(timeout=3.0):
                 if self.verbose:
                     print(f"[WSM] Group {key} inflight timeout; will fallback to sync load")
+        
 
         # 确保 CPU 层已经在缓存（后台没完成就立刻兜底，但这在确保函数里，接受阻塞）
         try:
@@ -2176,7 +2300,7 @@ class WeightStreamingManager:
 
         # 记录 ready 事件
         self._record_layer_ready_event(layer_idx)
-
+        self._record_group_ready_event(layer_idx, group) 
         # 更新组 LRU
         # if key in self._gpu_group_lru:
         #     self._gpu_group_lru.remove(key)
@@ -2351,7 +2475,7 @@ class WeightStreamingManager:
 
                 # 记层级 ready 事件（所有 H2D 入队之后）
                 self._record_layer_ready_event(layer_idx)
-
+                self._record_group_ready_event(layer_idx, group) 
                 # 更新组 LRU，并按上限逐出（保护当前 key）
                 # 允许短暂超额；若确实要收缩，尝试一次驱逐即可
                 with self._group_lock:
@@ -2370,6 +2494,10 @@ class WeightStreamingManager:
                 self._gpu_group_inflight.pop(key, None)
 
         self._touch_group(layer_idx, group)
+        
+        if os.getenv("WSM_PRINT_GROUPS", "1") == "1":
+            self.print_group_residency(current=(layer_idx, group),
+                header="[WSM][groups][prefetch]")
 
         # 后台执行
         t = threading.Thread(target=_task, name=f"wsm_gpf_{layer_idx}_{group}", daemon=True)
@@ -2579,6 +2707,68 @@ class WeightStreamingManager:
                 if self.verbose:
                     print(f"[WSM] Evicted CPU cache layer {L}")
 
+    def warmup_groups_prefetch(self, layers: Optional[int] = None,
+                            scheme: str = "doublet",
+                            blocking_first: bool = True) -> None:
+        """
+        Warmup on GPU at *group* granularity (attn/ffn).
+
+        Args:
+            layers: 计划热身的前若干层（默认使用 warmup_layers）
+            scheme: "doublet" => 0.attn,0.ffn,1.attn,1.ffn,...
+                    "attn-first" => 先铺一列 attn，再铺 ffn
+            blocking_first: 第一个组用阻塞式 ensure，确保至少一组就绪
+        """
+        if layers is None:
+            layers = max(1, int(getattr(self, "warmup_layers", 1)))
+        layers = min(layers, self.n_layers)
+
+        # SSD 模式先把 CPU 窗口暖起来，避免首次组装载 miss
+        if self.ssd_enabled:
+            try:
+                self.warmup_cpu_cache()
+            except Exception:
+                self._ensure_cpu_window()
+
+        # 生成 warmup 计划（受 GPU 组预算约束）
+        plan: list[tuple[int, str]] = []
+        if scheme == "attn-first":
+            for i in range(layers):
+                if len(plan) >= self.gpu_max_groups: break
+                plan.append((i, "attn"))
+            for i in range(layers):
+                if len(plan) >= self.gpu_max_groups: break
+                plan.append((i, "ffn"))
+        else:  # "doublet"
+            for i in range(layers):
+                if len(plan) >= self.gpu_max_groups: break
+                plan.append((i, "attn"))
+                if len(plan) >= self.gpu_max_groups: break
+                plan.append((i, "ffn"))
+
+        # 去重（理论上不应重复，这里稳妥处理一下）
+        uniq, seen = [], set()
+        for item in plan:
+            if item not in seen:
+                seen.add(item)
+                uniq.append(item)
+        plan = uniq
+
+        # 执行：首组阻塞确保就绪，其余异步
+        for k, (lid, grp) in enumerate(plan):
+            if blocking_first and k == 0:
+                self.ensure_group_on_gpu(lid, grp)     # 阻塞式
+            else:
+                self.prefetch_group_async(lid, grp)    # 异步式
+
+        if self.verbose:
+            msg = ", ".join(f"L{l}.{g}" for (l, g) in plan)
+            print(f"[WSM] Warmup group prefetch: {msg} | cap={self.gpu_max_groups}")
+            try:
+                self.print_group_residency(current=plan[0] if plan else None,
+                                        header="[WSM][groups][warmup]")
+            except Exception:
+                pass
     
 
     def warmup_cpu_cache(self):
