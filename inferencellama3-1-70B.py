@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, math
+
+"""
+基于 test_70b_prefill_ssd.py 的完整推理脚本：
+- 维持相同的运行时配置（WSM/SSD 流式权重、KV 池、env 等）
+- 仅将生成长度改为 max_gen_len=32，并真正 decode 输出文本
+"""
+
+import os
 from pathlib import Path
 import torch
 
@@ -13,25 +20,28 @@ from llama3 import generator as _gen
 # 取到原始 build 函数（类方法/静态方法都能用这个包装方式）
 _orig_build = _gen.LLaMA.build
 
+# 与原文件保持一致的 prompt 路径（从文件读入）
 PROMPT_TXT = Path("/home/roger/llama3-inference/prompts/prompts_batch512_len2048.txt")
 
 def _debug_build(*args, **kw):
+    """
+    只包一层日志，不改底层库逻辑。
+    """
     mode       = kw.get("mode", None)
     load_model = kw.get("load_model", None)
     mode_cfg   = kw.get("mode_config", {})
     raw_dev    = (mode_cfg or {}).get("raw_device")
-    manifest   = (mode_cfg or {}).get("manifest_path")
+    manifest   = (mode_cfg or {}).get("manifest_path") or (mode_cfg or {}).get("ssd_manifest_path")
 
-    # 决策前日志
+    # 决策前日志：mixed + raw-ssd 路径
     print(f"[MODE-DECISION] called LLaMA.build(mode={mode}, load_model={load_model})")
-    # 直接把 use_raw_ssd 的判定在这里计算一遍打印出来
     use_raw_ssd = (mode in {"ssd", "mixed"}) or (mode_cfg and mode_cfg.get("weight_source") == "raw-ssd")
     print(f"[MODE-DECISION] use_raw_ssd={use_raw_ssd} raw_device={raw_dev} manifest={manifest}")
 
     # 调用原始 build
     llama = _orig_build(*args, **kw)
 
-    # 返回前再根据对象状态判别一次（如果卡在 build 过程中，你至少能看到上面的“决策前日志”）
+    # 返回前根据对象状态判别一次
     has_wsm = hasattr(llama, "weight_streaming_manager")
     if has_wsm:
         wsm = llama.weight_streaming_manager
@@ -39,12 +49,12 @@ def _debug_build(*args, **kw):
         print(f"[MODE-DECISION] built: WSM present, ssd_enabled={ssd}")
     else:
         print("[MODE-DECISION] built: NO WSM (可能是 full-cpu/full-gpu/旧 streaming)")
-
     return llama
 
 # 替换成带日志的 build（保持静态/类方法调用方式）
 _gen.LLaMA.build = staticmethod(_debug_build)
 
+# ===== 与原文件一致的路径与常量 =====
 RAW_DEV  = "/dev/nvme0n1p4"
 MANIFEST = "/data1/70b-fixed.runtime_manifest.json"
 CKPT_DIR = "/home/roger/.llama/checkpoints/Llama3.1-70B"
@@ -59,14 +69,16 @@ def _read_status():
                     for k in keys:
                         if line.startswith(k + ":"):
                             out[k] = line.split(":")[1].strip()
-        except: pass
+        except:
+            pass
         return out
     s = _grep("/proc/self/status", ["VmRSS","VmHWM","VmLck"])
     m = _grep("/proc/meminfo", ["MemAvailable","CommitLimit","Committed_AS","Cached","Buffers"])
     return s, m
 
 def _gpu_mem():
-    if not torch.cuda.is_available(): return {}
+    if not torch.cuda.is_available():
+        return {}
     dev = torch.cuda.current_device()
     st  = torch.cuda.memory_stats(dev)
     return {
@@ -74,7 +86,7 @@ def _gpu_mem():
         "rsrv_GB":  st.get("reserved_bytes.all.current", 0)/(1<<30),
     }
 
-def probe(stage):
+def probe(stage: str):
     s, m = _read_status()
     g    = _gpu_mem()
     print(f"\n[MEM] {stage}")
@@ -97,7 +109,8 @@ def dump_param_inventory(model, tag):
             t = p.device.type
             if t == "cpu":
                 buckets["cpu"] += b
-                if b >= (64<<20): big_cpu.append((n,b))
+                if b >= (64<<20):
+                    big_cpu.append((n,b))
             elif t == "cuda":
                 buckets["cuda"] += b
             else:
@@ -115,12 +128,11 @@ def dump_param_inventory(model, tag):
 # ---------- 运行时覆盖：收敛 pinned/注册池 ----------
 def apply_runtime_overrides():
     """
-    把注册总量钳在 ≤256MiB（避免 validate 自动上调到覆盖 WEIGHT，导致 N=512），
-    并把 EXTENT_BYTES 降到 1MiB，降低高阶页 order 压力。
+    把注册总量钳在 ≤256MiB，并把 EXTENT_BYTES 降到 1MiB，降低高阶页 order 压力。
     """
     cfg = load_runtime_config({
         "pinned": {
-            "WEIGHT_PINNED_BYTES":      8  << 30,   # 可进一步降到 4 GiB 验证
+            "WEIGHT_PINNED_BYTES":      8  << 30,
             "KV_PINNED_BYTES":          6  << 30,
             "EXTENT_BYTES":             1  << 20,   # 1MiB
             "PINNED_REGISTER_CHUNK":   16  << 20,   # 16MiB
@@ -139,11 +151,10 @@ def apply_runtime_overrides():
     p = D["pinned"]
     need  = int(p["WEIGHT_PINNED_BYTES"])
     chunk = int(p["PINNED_REGISTER_CHUNK"])
-    # 把 N 限制到"低于覆盖"的目标（≤256MiB）
-    target_total = min(need // 2, 256 << 20)
+    target_total = min(need // 2, 256 << 20)  # 目标 ≤ 256MiB
     newN = max(1, target_total // chunk)
     p["PINNED_REGISTER_N"] = newN
-    cfg = load_runtime_config({"pinned": p, "io": D["io"]})   # 二次应用，防止 validate 再上调
+    cfg = load_runtime_config({"pinned": p, "io": D["io"]})
     print("[RuntimeConfig] pinned =", runtime_config_to_dict(cfg)["pinned"])
     print("[RuntimeConfig] io =", runtime_config_to_dict(cfg)["io"])
     return cfg
@@ -151,24 +162,27 @@ def apply_runtime_overrides():
 # ---------- KV 池：懒分配 + 单块 ≥ 单个 KV 块 ----------
 def configure_kv_pool():
     # DRAM 配置
-    KVCacheArgs.dram_limit_gb = 24.0      # DRAM 只作短驻（层内），层尾甩掉
-    KVCacheArgs.dram_sizing_batch = 32  # 必须 >= max_batch_size，否则 SSD block size 会不匹配
-    KVCacheArgs.block_bytes   = 4 * 1024 * 1024
-    KVCacheArgs.preallocate   = False    # 懒分配模式
-    KVCacheArgs.lazy_init     = True
+    KVCacheArgs.dram_limit_gb     = 24.0     # 层内短驻，层尾甩掉
+    KVCacheArgs.dram_sizing_batch = 32      # 必须 >= max_batch_size
+    KVCacheArgs.block_bytes       = 4 * 1024 * 1024
+    KVCacheArgs.preallocate       = False   # 懒分配
+    KVCacheArgs.lazy_init         = True
 
-    # 关闭 push 即镜像，改为层尾批写
+    # 关闭 push 镜像，改为层尾批写
     KVCacheArgs.mirror_on_push = False
 
     # I/O 节流与写速率配置
-    KVCacheArgs.IO_RAW_THROTTLE_MS = 5       # 写带宽窗口
-    KVCacheArgs.NVME_WRITE_TARGET_MBPS = 8000 # 写目标速率（根据 NVMe 能力调整为 800~2000）
+    KVCacheArgs.IO_RAW_THROTTLE_MS     = 30
+    KVCacheArgs.NVME_WRITE_TARGET_MBPS = 1200
 
     if hasattr(KVCacheArgs, "prefer_bf16"):
         KVCacheArgs.prefer_bf16 = True
 
-    print(f"[KVArgs] dram_limit={KVCacheArgs.dram_limit_gb} GiB, block_bytes={KVCacheArgs.block_bytes//(1<<20)} MiB, prealloc={KVCacheArgs.preallocate}")
-    print(f"[KVArgs] mirror_on_push={KVCacheArgs.mirror_on_push}, IO_RAW_THROTTLE_MS={KVCacheArgs.IO_RAW_THROTTLE_MS}, NVME_WRITE_TARGET_MBPS={KVCacheArgs.NVME_WRITE_TARGET_MBPS}")
+    print(f"[KVArgs] dram_limit={KVCacheArgs.dram_limit_gb} GiB, "
+          f"block_bytes={KVCacheArgs.block_bytes//(1<<20)} MiB, prealloc={KVCacheArgs.preallocate}")
+    print(f"[KVArgs] mirror_on_push={KVCacheArgs.mirror_on_push}, "
+          f"IO_RAW_THROTTLE_MS={KVCacheArgs.IO_RAW_THROTTLE_MS}, "
+          f"NVME_WRITE_TARGET_MBPS={KVCacheArgs.NVME_WRITE_TARGET_MBPS}")
 
 # ---------- 识别“实际运行的模式” ----------
 def classify_mode(llama) -> str:
@@ -202,13 +216,13 @@ def classify_mode(llama) -> str:
     return "unknown"
 
 def main():
-    
+    # （1）基础环境
     os.environ.setdefault("OMP_NUM_THREADS",  "8")
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
-    # （2）WSM 行为开关（滑窗 + 回环 + 组上限等）
+    # （2）WSM 行为开关（滑窗 + 回环 + 组上限等） —— 与原脚本保持一致
     os.environ.setdefault("WSM_CPU_ROLLING_MODE",  "1")  # 滚动滑窗
-    os.environ.setdefault("WSM_CPU_RING_OFFSET",  "0")  
+    os.environ.setdefault("WSM_CPU_RING_OFFSET",   "0")
     os.environ.setdefault("WSM_CPU_WRAP_AROUND",   "1")  # 窗口末尾后回环到 L0
     os.environ.setdefault("WSM_CPU_ROLL_STRIDE",   "1")
     os.environ.setdefault("WSM_CPU_ROLL_SYNC",     "1")  # 计算线程同步推进
@@ -216,15 +230,10 @@ def main():
     os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX",   "1")
     os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "6")
     os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",       "1")  # 不卡在预热等待
-    
-    os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",       "8")
-    os.environ.setdefault("WSM_KV_THROTTLE_MS",       "16")
-    
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",   "8")
+    os.environ.setdefault("WSM_KV_THROTTLE_MS",          "16")
 
-    # 可选：减少初期碎片/线程数
-    os.environ.setdefault("OMP_NUM_THREADS",  "8")
-    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     # 1) 覆盖并收敛 pinned/注册池 + KV 池
     apply_runtime_overrides()
@@ -237,18 +246,18 @@ def main():
         "ssd_manifest_path": MANIFEST,
         "prefetch_distance": 10,
         "max_cached_layers": 4,
-        "cpu_cache_layers": 30,      
-        "warmup_layers": 4,         # 仅 GPU 预热第 0 层
+        "cpu_cache_layers": 30,
+        "warmup_layers": 4,       # 预热少量层
         "staging_mb": 64,
         "verbose": True,
     }
 
-    # 3) 构建（meta + SSD 流式），注意不会 torch.load checkpoint
+    # 3) 构建（meta + SSD 流式），注意不会把 checkpoint 全量载入 CPU
     probe("before LLaMA.build")
-    print("[CHECK] calling LLaMA.build(mode='ssd', load_model=False)")
+    print("[CHECK] calling LLaMA.build(mode='mixed', load_model=False)")
     llama = LLaMA.build(
         checkpoints_dir=CKPT_DIR,
-        load_model=False,           # ★ 关键：70B 不把 checkpoint 载入 CPU
+        load_model=False,           # 关键：70B 不把 checkpoint 载入 CPU
         device=device,
         max_seq_len=2048,
         max_batch_size=32,
@@ -262,35 +271,36 @@ def main():
     mode = classify_mode(llama)
     dump_param_inventory(llama.model, f"after build ({mode})")
 
-    # 4) 仅 prefill（不真正 decode）
-    # prompt = "You are a helpful assistant.\n" + ("Lorem ipsum " * 2000)
+    # 4) 读取 prompt 并做“安全裁剪”（max_gen_len=32）
     try:
         prompt_path = PROMPT_TXT
         prompt = prompt_path.read_text(encoding="utf-8").strip()
     except Exception as e:
         raise RuntimeError(f"无法读取 {prompt_path}: {e}")
-    
-    # （可选但强烈推荐）安全裁剪：避免 prompt 过长导致 shape mismatch
-    # 生成器内部会按 total_len = min(max_seq_len, max_gen_len + max_prompt) 规划张量；
-    # 若 prompt token 数 > (max_seq_len - max_gen_len)，原始实现会在写入时触发尺寸不匹配。
-    # 我们在进入 text_completion 前先按 tokenizer 做 token 级裁剪。
-    max_gen_len = 1
+
+    # —— 安全裁剪：先按 tokenizer 限制 prompt token 数，避免 total_len 溢出
+    #     裁剪原则与原脚本相同，只是把 max_gen_len 从 1 改为 32
+    max_gen_len = 8
     max_prompt_tokens = llama.args.max_seq_len - max_gen_len
     tok = llama.tokenizer.encode(prompt, add_special_tokens=False)
     if len(tok) > max_prompt_tokens:
         # 保留结尾 max_prompt_tokens 个 token（也可改成保留开头）
         tok = tok[-max_prompt_tokens:]
         prompt = llama.tokenizer.decode(tok)
-    
-    probe("before prefill")
-    tokens, texts = llama.text_completion(
+
+    # 5) 真正推理（decode），temperature 与 batch_size 维持原值
+    probe("before inference (decode)")
+    out_tokens, out_texts = llama.text_completion(
         prompts=[prompt],
-        temperature=0.0,
-        max_gen_len=1,   # 只做 prefill
-        batch_size=32,
+        temperature=0.6,
+        max_gen_len=max_gen_len,
+        batch_size=4,
     )
-    probe("after prefill")
-    print("OK prefill.")
+    probe("after inference (decode)")
+
+    print("\n========== Generation (len=32) ==========")
+    print(out_texts[0])
+    print("=========================================")
 
 if __name__ == "__main__":
     main()

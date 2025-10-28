@@ -573,13 +573,6 @@ class LLaMA:
             from . import stream_mnt  # local import intentionally kept
             streams = stream_mnt.get_streams(self.args.device)
 
-            # if hasattr(self.model, "layers"):
-            #     for layer in self.model.layers:
-            #         if hasattr(layer, "attention"):
-            #             off = getattr(layer.attention, "offloader", None)
-            #             if off is not None:
-            #                 off.h2d_stream = streams.kv_h2d
-            #                 off.d2h_stream = streams.kv_d2h
             if hasattr(self.model, "layers"):
                 first_off = None
                 for layer in self.model.layers:

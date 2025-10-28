@@ -358,6 +358,8 @@ class KVOffloader:
         else:
             self._writer_thread = None
             
+            
+        mirror_on_push: bool = True
         
     # 公开给 WSM 的写暂停 API（例如 PCIE 忙或 pinned 低水位时调用）
     
@@ -519,7 +521,7 @@ class KVOffloader:
 
         # Optional SSD mirror: pack whole block (max_batch, heads, BLOCK, 2*dim) and queue for async write
         # 可选 SSD 镜像：打包整个块 (max_batch, heads, BLOCK, 2*dim) 并排队异步写入
-        if self.ssd is not None:
+        if self.ssd is not None and getattr(KVCacheArgs, "mirror_on_push", True):
             # Wait for D2H transfer to complete before packing
             # 在打包前等待 D2H 传输完成
             if self.d2h_stream is not None:
@@ -533,7 +535,57 @@ class KVOffloader:
             except Full:
                 print(f"[KV][WARN] write queue full for 1.0s, drop mirror @L{layer} B{blk}")
         
-        
+    # kv_offload.py 内（类 KVOffloader）
+    def eager_spill_layer(self, layer: int, upto_token: int, async_write: bool = True, include_partial: bool = True):
+        """
+        在 prefill 层尾调用：把 [0 .. upto_token) 覆盖到的块下放到 SSD，并释放对应 DRAM。
+        async_write=True → 用 SSD.write_batch_async；False → 逐块 _spill_to_ssd 同步写。
+        """
+        end_blk = (int(upto_token) - 1) // BLOCK if upto_token > 0 else -1
+        if end_blk < 0:
+            return
+
+        # 需处理的块：0..end_blk；include_partial=True 表示末尾半块也一并写
+        blocks = list(range(0, end_blk + 1))
+
+        if self.ssd is None or not async_write:
+            # 最简单：同步逐块写 + 释放
+            for B in blocks:
+                if self.k_cpu[layer][B] is not None:
+                    self._spill_to_ssd(layer, B)   # 已有方法：写→释放→on_ssd=True
+            return
+
+        # 异步批写：组装批次
+        batch_blks, batch_tensors = [], []
+        for B in blocks:
+            if self.k_cpu[layer][B] is None:
+                continue
+            # 等待 D2H 完成，确保拼包一致
+            if self.d2h_stream is not None:
+                self.d2h_stream.synchronize()
+            kv_pack = torch.cat([self.k_cpu[layer][B], self.v_cpu[layer][B]], dim=-1).contiguous()
+            batch_blks.append(B)
+            batch_tensors.append(kv_pack)
+
+        if not batch_blks:
+            return
+
+        fut = self.ssd.write_batch_async(layer, batch_blks, batch_tensors)  # SSD 后端已提供
+        # 完成回调：释放 pinned DRAM，置 on_ssd 标志
+        def _on_done(_):
+            for B in batch_blks:
+                if self._k_raw_buf[layer][B] is not None:
+                    self.pool.free_block(self._k_raw_buf[layer][B]); self._k_raw_buf[layer][B] = None
+                if self._v_raw_buf[layer][B] is not None:
+                    self.pool.free_block(self._v_raw_buf[layer][B]); self._v_raw_buf[layer][B] = None
+                self.k_cpu[layer][B] = self.v_cpu[layer][B] = None
+                self.on_ssd[layer][B] = True
+        try:
+            fut.add_done_callback(_on_done)
+        except Exception:
+            # 容错：如果不支持回调，就同步等待一下避免泄露
+            fut.result(timeout=None); _on_done(None)
+
         
 
     def ensure_on_gpu(self, layer_idx: int, start_pos: int, k_cur: torch.Tensor, v_cur: torch.Tensor):
@@ -922,7 +974,7 @@ class KVOffloader:
 
         # Reuse GPU buffer to avoid churn / 重用 GPU 缓冲区以避免频繁分配
         if not hasattr(self, "_ssd_buffer") or self._ssd_buffer is None or tuple(self._ssd_buffer.shape) != shape:
-            self._ssd_buffer = torch.empty(shape, dtype=torch.float16, device=self.device, non_blocking=True)
+            self._ssd_buffer = torch.empty(shape, dtype=torch.float16, device=self.device)
 
         if self.ssd is None:
             # DRAM-only mode: data is lost → allocate empty block

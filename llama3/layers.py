@@ -560,6 +560,22 @@ class SelfAttention(nn.Module):
 
             print(f"[ATTN] Layer {self.layer_id} device validation passed (all on CUDA)")
 
+            # ============================================================
+            # 2.1) 强制同步：确保权重真正可访问（消除首次访问延迟）
+            # Force synchronization: ensure weights are truly accessible (eliminate first-access latency)
+            # ============================================================
+            if self.compute_stream is not None:
+                # 在 compute_mha 流上等待所有之前的操作（包括 H2D）
+                # Wait for all previous operations (including H2D) on compute_mha stream
+                self.compute_stream.synchronize()
+
+            # 预热 GEMM kernel（可选）：访问权重第一个元素触发 page fault
+            # Warm-up GEMM kernel (optional): access first element to trigger page fault
+            warmup_start = time.time()
+            _ = self.wq.weight[0, 0].item()
+            warmup_ms = (time.time() - warmup_start) * 1000
+            print(f"[ATTN] Layer {self.layer_id} weight warmup took {warmup_ms:.2f}ms")
+
             # 更新全局状态跟踪器
             tracker = get_global_tracker()
             if tracker:
@@ -588,19 +604,24 @@ class SelfAttention(nn.Module):
             # QKV投影 - 使用专门的compute stream
             # compute_stream = self.streams.weight_compute if self.streams else None
             compute_stream = self.compute_stream
+            qkv_start = time.time()
             if compute_stream:
                 with torch.cuda.stream(compute_stream):
                     with cuda_timer("attn_us", self.layer_id):
                         # print("wq.weight.device =", self.wq.weight.device)
                         q = self.wq(x).view(bsz, seqlen, self.n_heads_q, self.head_dim)
+                        print(f"[ATTN] Layer {self.layer_id} Q projection done ({(time.time()-qkv_start)*1000:.2f}ms)")
                         k = self.wk(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+                        print(f"[ATTN] Layer {self.layer_id} K projection done ({(time.time()-qkv_start)*1000:.2f}ms)")
                         v = self.wv(x).view(bsz, seqlen, self.n_kv_heads, self.head_dim)
+                        print(f"[ATTN] Layer {self.layer_id} V projection done ({(time.time()-qkv_start)*1000:.2f}ms)")
 
                         # 应用旋转位置编码
                         # q = apply_rotary_embeddings(q, freqs_complex)
                         # k = apply_rotary_embeddings(k, freqs_complex)
                         q = apply_rotary_embeddings(q, freqs_complex, start_pos=start_pos)
                         k = apply_rotary_embeddings(k, freqs_complex, start_pos=start_pos)
+                        print(f"[ATTN] Layer {self.layer_id} RoPE done ({(time.time()-qkv_start)*1000:.2f}ms)")
 
             else:
                 # 回退到默认stream
@@ -950,12 +971,25 @@ class SelfAttention(nn.Module):
             total_time = (time.time() - start_time) * 1e6  # μs
             PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
             # print(f"[ATTN] Layer {self.layer_id} computation done")
-            
+
             if wm and hasattr(wm, "notify_group_compute_done"):
                 evt = torch.cuda.Event()
                 evt.record(self.compute_stream if self.compute_stream is not None else torch.cuda.current_stream())
                 wm.notify_group_compute_done(self.layer_id, "attn", evt)
-                
+
+            # ============================================================
+            # 3.2) Eager KV Spill: 在 prefill 分支结束前，将本层生成的 KV 异步写入 SSD
+            # 在 prefill 阶段（start_pos==0），本层的 KV 已用于注意力计算，可立即下放到 SSD
+            # ============================================================
+            if start_pos == 0 and getattr(self, "offloader", None) is not None:
+                # 把本层刚生成的 KV 覆盖到的 token 全部甩到 SSD
+                # upto_token = start_pos + seqlen 表示当前层已处理到的 token 位置
+                self.offloader.eager_spill_layer(
+                    self.layer_id,
+                    upto_token=start_pos + seqlen,
+                    async_write=True
+                )
+
             return result
         finally:
             if in_use and hasattr(wm, "_unmark_group_in_use"):
