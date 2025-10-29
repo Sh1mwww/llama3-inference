@@ -583,13 +583,19 @@ class LLaMA:
                             off.d2h_stream = streams.kv_d2h
                             if first_off is None:
                                 first_off = off
-                # 将 KV Offloader 注入 WSM，启用“忙态暂停写”
-                if first_off is not None and hasattr(self, "weight_streaming_manager"):
-                    try:
-                        self.weight_streaming_manager.kv_offloader = first_off
-                    except Exception:
-                        pass
-
+                # # 将 KV Offloader 注入 WSM，启用“忙态暂停写”
+                # if first_off is not None and hasattr(self, "weight_streaming_manager"):
+                #     try:
+                #         self.weight_streaming_manager.kv_offloader = first_off
+                #     except Exception:
+                #         pass
+                # ★ 新增：统一为单例（跨层共享一个 KVOffloader 实例）
+                
+                if first_off is not None:
+                    for blk in getattr(self.model, "layers", []):
+                        if getattr(blk.attention, "offloader", None) is not first_off:
+                            blk.attention.offloader = first_off
+                print("✅ KV offloader unified across layers; KV streams configured.")
         except Exception as e:
             print(f"[WARN] failed to configure KV streams: {e}")
 

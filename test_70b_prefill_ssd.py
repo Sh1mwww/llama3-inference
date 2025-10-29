@@ -214,12 +214,17 @@ def main():
     os.environ.setdefault("WSM_CPU_ROLL_SYNC",     "1")  # 计算线程同步推进
     os.environ.setdefault("WSM_AGGRESSIVE_GPU_PREFETCH", "2")  # 当前层 ffn + 下一层 attn
     os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX",   "1")
-    os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "6")
+    os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "8")
     os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",       "1")  # 不卡在预热等待
+    os.environ.setdefault("WSM_EVICT_FINISHED",        "1")   # 组算完即踢（释放预算）
     
     os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",       "8")
     os.environ.setdefault("WSM_KV_THROTTLE_MS",       "16")
     
+    os.environ.setdefault("WSM_BALANCE_PREFETCH", "1")
+    os.environ.setdefault("WSM_BALANCE_TOL",      "1")   # attn/ffn 允许相差 ≤1
+    os.environ.setdefault("WSM_PAIR_AHEAD",       "2")   # 就近择层范围：同层→i+1→i+2
+    os.environ.setdefault("WSM_KIND_AHEAD_CAP",   "2")   # 单一类型最大前瞻距离
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     # 可选：减少初期碎片/线程数
@@ -235,7 +240,9 @@ def main():
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
-        "prefetch_distance": 10,
+        "prefetch_distance": 6,
+        "group_prefetch_depth": 4,       # 与下游层内预取循环匹配
+        "prefetch_distance_layers": 6,   # 给 WSM 内部 cfg
         "max_cached_layers": 4,
         "cpu_cache_layers": 30,      
         "warmup_layers": 4,         # 仅 GPU 预热第 0 层

@@ -1,4 +1,4 @@
-import math
+import math, os
 from typing import Optional, List, Dict
 import torch, torch.nn as nn, torch.nn.functional as F
 import threading
@@ -584,6 +584,36 @@ class SelfAttention(nn.Module):
                 batch_idx = 0
 
             print(f"[ATTN] Layer {self.layer_id} starting computation...")
+            
+            # ⭐⭐⭐ Background prefetch (compute-overlapped)
+            try:
+                wm = getattr(self, "weight_manager", None)
+
+                # --- 组级权重预取：本层 FFN + 后续 D 层 ATTn ---
+                # 说明：prefetch_group_async 幂等；若该组已在 GPU 或正在 H2D，会被 WSM 跳过
+                if wm is not None and hasattr(wm, "prefetch_group_async"):
+                    # 1) ⭐ 先把"本层 FFN"挂起并 PIN（防止在 MHA→FFN 缝隙中被淘汰）
+                    wm.prefetch_group_async(self.layer_id, "ffn", pin=True, reason="pair")
+
+                    # 2) 让调度器把窗口填满、并保持 attn/ffn 均衡
+                    if hasattr(wm, "rebalance_and_topoff"):
+                        wm.rebalance_and_topoff(self.layer_id)
+
+                # --- KV：为“下一层注意力”预拉最近窗口的历史 KV 到 HBM（仅 decode 阶段） ---
+                # 注意：start_pos==0 为 prefill，此时下一层当前块可能尚不存在，故跳过
+                if (start_pos > 0) and getattr(self, "offloader", None) is not None:
+                    # 该方法会：必要时先 SSD->DRAM，再在 kv_h2d 流发起 DRAM->HBM；并记录事件，fetch() 将命中
+                    self.offloader.prefetch_for_next_layer(
+                        current_layer=self.layer_id,
+                        start_pos=int(start_pos),
+                        seqlen=int(seqlen),
+                        bsz=int(bsz),
+                        window_tokens=BLOCK,
+                    )
+            except Exception as e:
+                # 非致命：任何预取异常都不影响主计算路径
+                if getattr(wm, "verbose", False):
+                    print(f"[ATTN][L{self.layer_id}] background prefetch skipped: {e}")
 
             # 预期形状
             exp_q = (self.n_heads_q * self.head_dim, x.size(-1))
@@ -1071,7 +1101,11 @@ class FeedForward(nn.Module):
         wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
 
     # def forward(self, x: torch.Tensor) -> torch.Tensor:
-    #     # Check CUDA context health
+    #     import time
+    #     import torch
+    #     import torch.nn.functional as F
+
+    #     # ---- CUDA 上下文健康检查（保持原样）----
     #     if x.is_cuda:
     #         try:
     #             torch.cuda.current_device()
@@ -1080,181 +1114,221 @@ class FeedForward(nn.Module):
     #             raise RuntimeError("CUDA context is corrupted") from e
 
     #     print(f"[FFN] Layer {self.layer_id} forward starting...")
-    #     self._ensure_weights_cuda()
-    #     print(f"[FFN] Layer {self.layer_id} weights ensured")
 
-    #     # 确保权重H2D传输完成后再开始计算（使用统一的事件化等待）
-    #     if self.streams and x.is_cuda:
-    #         try:
-    #             self.streams.wait_weight_ready_on_current(self.device)
-    #         except Exception as e:
-    #             logger.warning(f"Layer {self.layer_id} FeedForward: weight sync failed: {e}")
+    #     # ---- 统一把计时器从 meta 拉成 CPU 标量，避免 .item()/加法在 meta/dtype 冲突 ----
+    #     def _ensure_cpu_scalar_attr(mod, name: str):
+    #         t = getattr(mod, name, None)
+    #         if not isinstance(t, torch.Tensor) or getattr(t, "is_meta", False) \
+    #         or (hasattr(t, "device") and t.device.type == "meta"):
+    #             setattr(mod, name, torch.zeros((), dtype=torch.int64, device="cpu"))
+    #     _ensure_cpu_scalar_attr(self, "ffn_us")
+    #     _ensure_cpu_scalar_attr(self, "total_forward_us")
 
-    #     print(f"[FFN] Layer {self.layer_id} starting computation...")
-    #     # FFN计算 - 使用compute stream
-    #     # compute_stream = self.streams.weight_compute if self.streams else None
+    #     # ============================================================
+    #     # 1) 确保 ffn 组在 GPU，并等待该组 H2D 完成（在 compute_ffn 流上等待）
+    #     # ============================================================
+    #     wm = getattr(self, "weight_manager", None)
+    #     in_use = False
     #     compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
-    #     if compute_stream:
-    #         with torch.cuda.stream(compute_stream):
-    #             with cuda_timer("ffn_us", self.layer_id):
-    #                 # SwiGLU
-    #                 gate = self.w1(x)
-    #                 up = self.w3(x)
-    #                 hidden = F.silu(gate) * up
-    #                 result = self.w2(hidden)
-    #         print(f"[FFN] Layer {self.layer_id} computation done")
-    #         return result
-    #     else:
-    #         with cuda_timer("ffn_us", self.layer_id):
-    #             # SwiGLU
-    #             gate = self.w1(x)
-    #             up = self.w3(x)
-    #             hidden = F.silu(gate) * up
-    #             result = self.w2(hidden)
-    #         print(f"[FFN] Layer {self.layer_id} computation done")
-    #         return result
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        import time
-        import torch
-        import torch.nn.functional as F
+    #     try:
+    #         if wm and hasattr(wm, "_mark_group_in_use"):
+    #             wm._mark_group_in_use(self.layer_id, "ffn")
+    #             in_use = True
+    #         if wm is not None:
+    #             # 确保 ffn 组在 GPU（阻塞式，直到权重加载完成）
+    #             if hasattr(wm, "ensure_group_on_gpu"):
+    #                 wm.ensure_group_on_gpu(self.layer_id, "ffn")
+    #             else:
+    #                 # 回退到层级加载
+    #                 modules = self._get_modules_dict()
+    #                 wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
 
-        # ---- CUDA 上下文健康检查（保持原样）----
+    #             # 在 compute stream 上等待 ffn 组 H2D 传输完成（禁止降级到 CPU）
+    #             if hasattr(wm, "wait_group_ready"):
+    #                 wm.ensure_group_on_gpu(self.layer_id, "ffn")
+    #                 wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
+
+    #         print(f"[FFN] Layer {self.layer_id} weights ensured and ready")
+
+    #         # ============================================================
+    #         # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
+    #         # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
+    #         # ============================================================
+    #         target_dev = x.device
+
+    #         # 确保 target_dev 是 CUDA（不接受 CPU）
+    #         if not str(target_dev).startswith("cuda"):
+    #             raise RuntimeError(f"Layer {self.layer_id} FeedForward: input x is on {target_dev}, but only CUDA is supported")
+
+    #         # 验证所有 FFN 权重在 CUDA（不做迁移，只检查）
+    #         for mod in (self.w1, self.w2, self.w3):
+    #             # 权重必须在 CUDA，不允许 meta 或 CPU
+    #             if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
+    #                 raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
+
+    #             if not str(mod.weight.device).startswith("cuda"):
+    #                 raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
+
+    #             # 验证设备一致性（不做迁移，只检查）
+    #             # Validate device consistency (no migration, only check)
+    #             if mod.weight.device != target_dev:
+    #                 raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_dev}. "
+    #                                  "Device mismatch must be fixed by WSM, not by forward().")
+
+    #         print(f"[FFN] Layer {self.layer_id} device validation passed (all on CUDA)")
+    #         print(f"[FFN] Layer {self.layer_id} starting computation...")
+
+    #         # ---- 处理输入 x 的维度 ----
+    #         if x.dim() == 2:
+    #             # 允许上游给 2D；推断 D，稍后还原形状时按 B=1
+    #             B, D = 1, x.size(-1)
+    #             T = x.size(0)
+    #             need_view_back = True
+    #         else:
+    #             assert x.dim() == 3, f"FFN expects 3D or 2D, got {x.shape}"
+    #             B, T, D = x.shape
+    #             need_view_back = False
+
+    #         # 推断目标 dtype（从权重或输入）
+    #         target_dtype = self.w1.weight.dtype if hasattr(self.w1, 'weight') else torch.bfloat16
+
+    #         if getattr(x, "is_meta", False) or (hasattr(x, "device") and x.device.type == "meta"):
+    #             x = torch.zeros((B, T, D), dtype=target_dtype, device=target_dev)
+
+    #         # ---- 统一用 2D 计算（稳定 matmul 语义），再还原 ----
+    #         x2 = x.reshape(-1, D)  # [B*T, D]
+
+
+    #         # compute_stream 已在上面等待时获取，直接使用
+    #         def _core_ffn(x2_: torch.Tensor) -> torch.Tensor:
+    #             # SwiGLU：gate(w1) * up(w3)
+    #             gate = self.w1(x2_)                 # [B*T, H]
+    #             up   = self.w3(x2_)                 # [B*T, H]
+    #             if up.dtype != gate.dtype:
+    #                 up = up.to(gate.dtype)
+    #             act = F.silu(gate) * up
+
+    #             # 送入 w2 前与 w2.weight 对齐（有些实现 w2 与 w1/bf16 混精度）
+    #             if act.dtype != self.w2.weight.dtype or act.device != self.w2.weight.device:
+    #                 act = act.to(device=self.w2.weight.device, dtype=self.w2.weight.dtype, non_blocking=True)
+    #             y2 = self.w2(act)                   # [B*T, D]
+    #             return y2
+
+    #         start_t = time.time()
+    #         if compute_stream:
+    #             with torch.cuda.stream(compute_stream):
+    #                 with cuda_timer("ffn_us", self.layer_id):
+    #                     y2 = _core_ffn(x2)
+    #         else:
+    #             with cuda_timer("ffn_us", self.layer_id):
+    #                 y2 = _core_ffn(x2)
+
+    #         # 还原形状
+    #         if need_view_back:
+    #             result = y2.view(T, -1).unsqueeze(0).contiguous()  # [1, T, D]
+    #         else:
+    #             result = y2.view(B, T, -1).contiguous()
+
+    #         # 统计收尾（用 Python float，避免与 bf16 张量混算）
+    #         try:
+    #             us = float((time.time() - start_t) * 1e6)
+    #             PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", us)
+    #         except Exception:
+    #             pass
+
+    #         print(f"[FFN] Layer {self.layer_id} computation done")
+
+    #         return result
+    #     finally:
+    #         if in_use and hasattr(wm, "_unmark_group_in_use"):
+    #             wm._unmark_group_in_use(self.layer_id, "ffn")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # --- 设备健康检查（与 SelfAttention 一致） ---
         if x.is_cuda:
             try:
                 torch.cuda.current_device()
             except RuntimeError as e:
-                logger.error(f"CUDA context error in feedforward: {e}")
                 raise RuntimeError("CUDA context is corrupted") from e
 
         print(f"[FFN] Layer {self.layer_id} forward starting...")
 
-        # ---- 统一把计时器从 meta 拉成 CPU 标量，避免 .item()/加法在 meta/dtype 冲突 ----
-        def _ensure_cpu_scalar_attr(mod, name: str):
-            t = getattr(mod, name, None)
-            if not isinstance(t, torch.Tensor) or getattr(t, "is_meta", False) \
-            or (hasattr(t, "device") and t.device.type == "meta"):
-                setattr(mod, name, torch.zeros((), dtype=torch.int64, device="cpu"))
-        _ensure_cpu_scalar_attr(self, "ffn_us")
-        _ensure_cpu_scalar_attr(self, "total_forward_us")
-
-        # ============================================================
-        # 1) 确保 ffn 组在 GPU，并等待该组 H2D 完成（在 compute_ffn 流上等待）
-        # ============================================================
         wm = getattr(self, "weight_manager", None)
         in_use = False
-        compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
         try:
+            # 标记并确保 FFN 组权重在 GPU
             if wm and hasattr(wm, "_mark_group_in_use"):
                 wm._mark_group_in_use(self.layer_id, "ffn")
                 in_use = True
+
             if wm is not None:
-                # 确保 ffn 组在 GPU（阻塞式，直到权重加载完成）
                 if hasattr(wm, "ensure_group_on_gpu"):
                     wm.ensure_group_on_gpu(self.layer_id, "ffn")
+                    # 在 FFN 计算流上等待“组 ready”事件（避免误等别组）
+                    compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
+                    if hasattr(wm, "wait_group_ready"):
+                        wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
                 else:
-                    # 回退到层级加载
-                    modules = self._get_modules_dict()
-                    wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
+                    # 回退：层级 API（不建议，但保底）
+                    mods = self._get_modules_dict()
+                    wm.ensure_weights_cuda(self.layer_id, mods, priority=True)
 
-                # 在 compute stream 上等待 ffn 组 H2D 传输完成（禁止降级到 CPU）
-                if hasattr(wm, "wait_group_ready"):
-                    wm.ensure_group_on_gpu(self.layer_id, "ffn")
-                    wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
+            print(f"[FFN] Layer {self.layer_id} weights ensured")
 
-            print(f"[FFN] Layer {self.layer_id} weights ensured and ready")
+            # ⭐⭐⭐ Background prefetch during FFN compute（后续 D 层 ATTn）
+            try:
+                if wm is not None and hasattr(wm, "prefetch_group_async"):
+                    D = max(1, int(os.getenv("WSM_GROUP_PREFETCH_DEPTH", "2")))
+                    nL = getattr(wm, "n_layers", 0)
+                    used = getattr(wm, "_gpu_group_lru", [])  # 仅做轻量预算估计
+                    budget = max(0, int(os.getenv("WSM_GPU_MAX_GROUPS", "6")) - len(used) - 1)
+                    # 只在有预算时推进预取队列
+                    depth = min(D, budget) if budget > 0 else 0
+                    for off in range(1, depth + 1):
+                        nxt = self.layer_id + off
+                        if nxt < nL:
+                            wm.prefetch_group_async(nxt, "attn")
+            except Exception as e:
+                if getattr(wm, "verbose", False):
+                    print(f"[FFN][L{self.layer_id}] background prefetch skipped: {e}")
 
-            # ============================================================
-            # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
-            # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
-            # ============================================================
-            target_dev = x.device
-
-            # 确保 target_dev 是 CUDA（不接受 CPU）
-            if not str(target_dev).startswith("cuda"):
-                raise RuntimeError(f"Layer {self.layer_id} FeedForward: input x is on {target_dev}, but only CUDA is supported")
-
-            # 验证所有 FFN 权重在 CUDA（不做迁移，只检查）
-            for mod in (self.w1, self.w2, self.w3):
-                # 权重必须在 CUDA，不允许 meta 或 CPU
-                if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
-                    raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
-
-                if not str(mod.weight.device).startswith("cuda"):
-                    raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
-
-                # 验证设备一致性（不做迁移，只检查）
-                # Validate device consistency (no migration, only check)
-                if mod.weight.device != target_dev:
-                    raise RuntimeError(f"Layer {self.layer_id} FeedForward: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_dev}. "
-                                     "Device mismatch must be fixed by WSM, not by forward().")
-
-            print(f"[FFN] Layer {self.layer_id} device validation passed (all on CUDA)")
-            print(f"[FFN] Layer {self.layer_id} starting computation...")
-
-            # ---- 处理输入 x 的维度 ----
-            if x.dim() == 2:
-                # 允许上游给 2D；推断 D，稍后还原形状时按 B=1
-                B, D = 1, x.size(-1)
-                T = x.size(0)
-                need_view_back = True
-            else:
-                assert x.dim() == 3, f"FFN expects 3D or 2D, got {x.shape}"
-                B, T, D = x.shape
-                need_view_back = False
-
-            # 推断目标 dtype（从权重或输入）
-            target_dtype = self.w1.weight.dtype if hasattr(self.w1, 'weight') else torch.bfloat16
-
-            if getattr(x, "is_meta", False) or (hasattr(x, "device") and x.device.type == "meta"):
-                x = torch.zeros((B, T, D), dtype=target_dtype, device=target_dev)
-
-            # ---- 统一用 2D 计算（稳定 matmul 语义），再还原 ----
-            x2 = x.reshape(-1, D)  # [B*T, D]
-
-
-            # compute_stream 已在上面等待时获取，直接使用
-            def _core_ffn(x2_: torch.Tensor) -> torch.Tensor:
-                # SwiGLU：gate(w1) * up(w3)
-                gate = self.w1(x2_)                 # [B*T, H]
-                up   = self.w3(x2_)                 # [B*T, H]
-                if up.dtype != gate.dtype:
-                    up = up.to(gate.dtype)
-                act = F.silu(gate) * up
-
-                # 送入 w2 前与 w2.weight 对齐（有些实现 w2 与 w1/bf16 混精度）
-                if act.dtype != self.w2.weight.dtype or act.device != self.w2.weight.device:
-                    act = act.to(device=self.w2.weight.device, dtype=self.w2.weight.dtype, non_blocking=True)
-                y2 = self.w2(act)                   # [B*T, D]
-                return y2
-
-            start_t = time.time()
+            # --- FFN 计算 ---
+            compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
             if compute_stream:
                 with torch.cuda.stream(compute_stream):
                     with cuda_timer("ffn_us", self.layer_id):
-                        y2 = _core_ffn(x2)
+                        gate = self.w1(x)
+                        up   = self.w3(x)
+                        hidden = F.silu(gate) * up
+                        result = self.w2(hidden)
             else:
                 with cuda_timer("ffn_us", self.layer_id):
-                    y2 = _core_ffn(x2)
+                    gate = self.w1(x)
+                    up   = self.w3(x)
+                    hidden = F.silu(gate) * up
+                    result = self.w2(hidden)
 
-            # 还原形状
-            if need_view_back:
-                result = y2.view(T, -1).unsqueeze(0).contiguous()  # [1, T, D]
-            else:
-                result = y2.view(B, T, -1).contiguous()
-
-            # 统计收尾（用 Python float，避免与 bf16 张量混算）
-            try:
-                us = float((time.time() - start_t) * 1e6)
-                PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", us)
-            except Exception:
-                pass
+            # 通知：FFN 组计算完成（便于组级 LRU 收缩/回收）
+            if wm and hasattr(wm, "notify_group_compute_done"):
+                evt = torch.cuda.Event()
+                evt.record(compute_stream if compute_stream is not None else torch.cuda.current_stream())
+                wm.notify_group_compute_done(self.layer_id, "ffn", evt)
 
             print(f"[FFN] Layer {self.layer_id} computation done")
-
             return result
+
         finally:
+            # ⭐ 计算收尾：解除 FFN 组的 pin（在 finally 中确保执行）
+            if wm is not None and hasattr(wm, "unpin_group"):
+                wm.unpin_group(self.layer_id, "ffn")
+
+            # 再做一次顶补，把窗口重新补齐
+            if wm is not None and hasattr(wm, "rebalance_and_topoff"):
+                wm.rebalance_and_topoff(self.layer_id)
+
+            # 解除 in_use 标记
             if in_use and hasattr(wm, "_unmark_group_in_use"):
                 wm._unmark_group_in_use(self.layer_id, "ffn")
+
 
 # ---------- Optimized EncoderBlock ----------
 class EncoderBlock(nn.Module):
@@ -1362,21 +1436,26 @@ class EncoderBlock(nn.Module):
             nvtx.range_push(f"layer_{self.layer_id}_attention")
             if streams and streams.compute_mha:
                 torch.cuda.current_stream(dev).wait_stream(streams.compute_mha)  # default 等 MHA 流（安全）
+
+                # ⭐⭐⭐ 关键修复：在计算流中启动后台预取（真正的异步重叠）
                 with torch.cuda.stream(streams.compute_mha):
+                    # 优化1: 预取当前层 FFN（与当前 MHA 计算重叠）
+                    # if wm is not None and hasattr(wm, "prefetch_group_async"):
+                    #     wm.prefetch_group_async(self.layer_id, "ffn")
+
+                    # 优化2: 预取未来层 ATTN（考虑 warmup 已加载的层）
+                    if wm is not None and hasattr(wm, "prefetch_group_async"):
+                        warmup = int(getattr(wm, "warmup_layers", 0))
+                        D = int(getattr(wm, "group_prefetch_depth", 1))
+                        # 从 warmup 边界之后开始预取，避免重复加载已有层
+                        start_offset = max(1, warmup - self.layer_id) if self.layer_id < warmup else 1
+                        for off in range(start_offset, start_offset + D):
+                            nxt = self.layer_id + off
+                            if nxt < self.n_layer:
+                                wm.prefetch_group_async(nxt, "attn")
+
                     attn_in  = self.attention_norm(x)
                     attn_out = self.attention(attn_in, start_pos, freqs_complex)  # 在 compute_mha 上排队
-                    
-                 # [NEW] 立刻异步预取“下一层”的 ATTN（与当前层 MHA 计算重叠）
-                # if wm is not None and hasattr(wm, "prefetch_group_async"):
-                #     nxt = self.layer_id + 1
-                #     if nxt < self.n_layer:
-                #         wm.prefetch_group_async(nxt, "attn")
-                if wm is not None and hasattr(wm, "prefetch_group_async"):
-                    D = int(getattr(wm, "group_prefetch_depth", 1))
-                    for off in range(1, D+1):
-                        nxt = self.layer_id + off
-                        if nxt < self.n_layer:
-                            wm.prefetch_group_async(nxt, "attn")
                 # 在 MHA 流记录一个事件，供 FFN 流等待
                 mha_eid, mha_evt = None, None
                 try:
@@ -1387,18 +1466,22 @@ class EncoderBlock(nn.Module):
                     mha_evt.record(streams.compute_mha)
             else:
                 # 回退到默认流（不推荐，但保证可运行）
-                attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
-                # [NEW] 默认流路径也做一次
+                # 优化1: 预取当前层 FFN
                 # if wm is not None and hasattr(wm, "prefetch_group_async"):
-                #     nxt = self.layer_id + 1
-                #     if nxt < self.n_layer:
-                #         wm.prefetch_group_async(nxt, "attn")
+                #     wm.prefetch_group_async(self.layer_id, "ffn")
+
+                # 优化2: 预取未来层 ATTN（考虑 warmup）
                 if wm is not None and hasattr(wm, "prefetch_group_async"):
+                    warmup = int(getattr(wm, "warmup_layers", 0))
                     D = int(getattr(wm, "group_prefetch_depth", 1))
-                    for off in range(1, D+1):
+                    start_offset = max(1, warmup - self.layer_id) if self.layer_id < warmup else 1
+                    for off in range(start_offset, start_offset + D):
                         nxt = self.layer_id + off
                         if nxt < self.n_layer:
                             wm.prefetch_group_async(nxt, "attn")
+
+                # 然后才开始计算
+                attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
 
             # 在 MHA 完成之前不要在默认流上消费 attn_out；先做残差也放到 MHA 流里
             if streams and streams.compute_mha:
@@ -1426,7 +1509,19 @@ class EncoderBlock(nn.Module):
 
             nvtx.range_push(f"layer_{self.layer_id}_ffn")
             if streams and streams.compute_ffn:
+                # ⭐⭐⭐ 关键修复：在计算流中启动后台预取（真正的异步重叠）
                 with torch.cuda.stream(streams.compute_ffn):
+                    # 优化3: 预取未来层 FFN（考虑 warmup 已加载的层）
+                    if wm is not None and hasattr(wm, "prefetch_group_async"):
+                        warmup = int(getattr(wm, "warmup_layers", 0))
+                        D = int(getattr(wm, "group_prefetch_depth", 1))
+                        # 从 warmup 边界之后开始预取
+                        start_offset = max(1, warmup - self.layer_id) if self.layer_id < warmup else 1
+                        for off in range(start_offset, start_offset + D):
+                            nxt = self.layer_id + off
+                            if nxt < self.n_layer:
+                                wm.prefetch_group_async(nxt, "ffn")
+
                     ffn_in  = self.ffn_norm(h)
                     ffn_out = self.feed_forward(ffn_in)   # 在 compute_ffn 上排队
                     out     = h + ffn_out
@@ -1442,6 +1537,18 @@ class EncoderBlock(nn.Module):
                     ffn_evt.record(streams.compute_ffn)
                     torch.cuda.current_stream(dev).wait_event(ffn_evt)
             else:
+                # 回退到默认流（不推荐，但保证可运行）
+                # 优化3: 预取未来层 FFN（考虑 warmup）
+                if wm is not None and hasattr(wm, "prefetch_group_async"):
+                    warmup = int(getattr(wm, "warmup_layers", 0))
+                    D = int(getattr(wm, "group_prefetch_depth", 1))
+                    start_offset = max(1, warmup - self.layer_id) if self.layer_id < warmup else 1
+                    for off in range(start_offset, start_offset + D):
+                        nxt = self.layer_id + off
+                        if nxt < self.n_layer:
+                            wm.prefetch_group_async(nxt, "ffn")
+
+                # 然后才开始计算
                 out = h + self.feed_forward(self.ffn_norm(h))
             nvtx.range_pop()  # ffn
 
