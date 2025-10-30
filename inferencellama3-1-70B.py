@@ -217,21 +217,49 @@ def classify_mode(llama) -> str:
 
 def main():
     # （1）基础环境
+    # os.environ.setdefault("OMP_NUM_THREADS",  "8")
+    # os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+
+    # # （2）WSM 行为开关（滑窗 + 回环 + 组上限等） —— 与原脚本保持一致
+    # os.environ.setdefault("WSM_CPU_ROLLING_MODE",  "1")  # 滚动滑窗
+    # os.environ.setdefault("WSM_CPU_RING_OFFSET",   "0")
+    # os.environ.setdefault("WSM_CPU_WRAP_AROUND",   "1")  # 窗口末尾后回环到 L0
+    # os.environ.setdefault("WSM_CPU_ROLL_STRIDE",   "1")
+    # os.environ.setdefault("WSM_CPU_ROLL_SYNC",     "1")  # 计算线程同步推进
+    # os.environ.setdefault("WSM_AGGRESSIVE_GPU_PREFETCH", "2")  # 当前层 ffn + 下一层 attn
+    # os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX",   "1")
+    # os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "6")
+    # os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",       "1")  # 不卡在预热等待
+    # os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",   "8")
+    # os.environ.setdefault("WSM_KV_THROTTLE_MS",          "16")
+    
     os.environ.setdefault("OMP_NUM_THREADS",  "8")
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
-    # （2）WSM 行为开关（滑窗 + 回环 + 组上限等） —— 与原脚本保持一致
+    # （2）WSM 行为开关（滑窗 + 回环 + 组上限等）
     os.environ.setdefault("WSM_CPU_ROLLING_MODE",  "1")  # 滚动滑窗
-    os.environ.setdefault("WSM_CPU_RING_OFFSET",   "0")
+    os.environ.setdefault("WSM_CPU_RING_OFFSET",  "0")  
     os.environ.setdefault("WSM_CPU_WRAP_AROUND",   "1")  # 窗口末尾后回环到 L0
     os.environ.setdefault("WSM_CPU_ROLL_STRIDE",   "1")
     os.environ.setdefault("WSM_CPU_ROLL_SYNC",     "1")  # 计算线程同步推进
     os.environ.setdefault("WSM_AGGRESSIVE_GPU_PREFETCH", "2")  # 当前层 ffn + 下一层 attn
     os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX",   "1")
-    os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "6")
+    os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "10")
     os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",       "1")  # 不卡在预热等待
-    os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",   "8")
-    os.environ.setdefault("WSM_KV_THROTTLE_MS",          "16")
+    os.environ.setdefault("WSM_EVICT_FINISHED",        "1")   # 组算完即踢（释放预算）
+    
+    os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",       "8")
+    os.environ.setdefault("WSM_KV_THROTTLE_MS",       "16")
+    
+    os.environ.setdefault("WSM_BALANCE_PREFETCH", "1")
+    os.environ.setdefault("WSM_BALANCE_TOL",      "1")   # attn/ffn 允许相差 ≤1
+    os.environ.setdefault("WSM_PAIR_AHEAD",       "2")   # 就近择层范围：同层→i+1→i+2
+    os.environ.setdefault("WSM_KIND_AHEAD_CAP",   "2")   # 单一类型最大前瞻距离
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+    # 可选：减少初期碎片/线程数
+    os.environ.setdefault("OMP_NUM_THREADS",  "8")
+    os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -241,13 +269,25 @@ def main():
     probe("after runtime clamp")
 
     # 2) SSD streaming 配置（小 CPU cache + GPU 预热少量层）
+    # mode_config = {
+    #     "raw_device": RAW_DEV,
+    #     "ssd_manifest_path": MANIFEST,
+    #     "prefetch_distance": 10,
+    #     "max_cached_layers": 4,
+    #     "cpu_cache_layers": 30,
+    #     "warmup_layers": 4,       # 预热少量层
+    #     "staging_mb": 64,
+    #     "verbose": True,
+    # }
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
-        "prefetch_distance": 10,
+        "prefetch_distance": 6,
+        "group_prefetch_depth": 4,       # 与下游层内预取循环匹配
+        "prefetch_distance_layers": 6,   # 给 WSM 内部 cfg
         "max_cached_layers": 4,
-        "cpu_cache_layers": 30,
-        "warmup_layers": 4,       # 预热少量层
+        "cpu_cache_layers": 40,      
+        "warmup_layers": 4,         # 仅 GPU 预热第 0 层
         "staging_mb": 64,
         "verbose": True,
     }
@@ -280,7 +320,7 @@ def main():
 
     # —— 安全裁剪：先按 tokenizer 限制 prompt token 数，避免 total_len 溢出
     #     裁剪原则与原脚本相同，只是把 max_gen_len 从 1 改为 32
-    max_gen_len = 8
+    max_gen_len = 32
     max_prompt_tokens = llama.args.max_seq_len - max_gen_len
     tok = llama.tokenizer.encode(prompt, add_special_tokens=False)
     if len(tok) > max_prompt_tokens:
