@@ -232,7 +232,7 @@ def main():
     # os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",       "1")  # 不卡在预热等待
     # os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD",   "8")
     # os.environ.setdefault("WSM_KV_THROTTLE_MS",          "16")
-    
+
     os.environ.setdefault("OMP_NUM_THREADS",  "8")
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
 
@@ -243,7 +243,7 @@ def main():
     os.environ.setdefault("WSM_CPU_ROLL_STRIDE",   "1")
     os.environ.setdefault("WSM_CPU_ROLL_SYNC",     "1")  # 计算线程同步推进
     os.environ.setdefault("WSM_AGGRESSIVE_GPU_PREFETCH", "2")  # 当前层 ffn + 下一层 attn
-    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX",   "1")
+    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX",   "4")
     os.environ.setdefault("WSM_GPU_MAX_GROUPS",          "10")
     os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",       "1")  # 不卡在预热等待
     os.environ.setdefault("WSM_EVICT_FINISHED",        "1")   # 组算完即踢（释放预算）

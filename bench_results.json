@@ -1,0 +1,33 @@
+{
+  "batch_size": 2,
+  "max_new_tokens": 32,
+  "prompt_lens": [
+    2016,
+    2016
+  ],
+  "prefill_tokens_total": 4032,
+  "decode_tokens_total": 64,
+  "prefill_ms": 245515.25,
+  "first_token_decode_ms": 25732.006,
+  "ttft_ms": 271247.25,
+  "decode_ms": 823088.5,
+  "e2e_ms": 1068603.75,
+  "throughput_tok_s": 0.08,
+  "end_to_end_tok_s": 3.83,
+  "io_bw_MBps": {
+    "weight_h2d_MBps": 0.0,
+    "kv_h2d_MBps": 0.0,
+    "kv_d2h_MBps": 0.0
+  },
+  "gpu_mem_GB": {
+    "allocated_GB": 4.681426048278809,
+    "reserved_GB": 10.291015625
+  },
+  "mode": "mixed",
+  "device": "cuda:0",
+  "wsm": {
+    "enabled": true,
+    "ssd_enabled": true,
+    "gpu_max_groups": 6
+  }
+}

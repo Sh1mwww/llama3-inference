@@ -320,8 +320,8 @@ class SelfAttention(nn.Module):
             pass  # 回退到内部流创建
 
         self.streams = streams
-        self.compute_stream = getattr(streams, "compute_mha", None) or getattr(streams, "weight_compute", None)
-        self.weight_h2d_stream = getattr(streams, "weight_h2d_mha", None) or getattr(streams, "weight_h2d", None)
+        self.compute_stream = getattr(streams, "compute_mha", None) 
+        self.weight_h2d_stream = getattr(streams, "weight_h2d_mha", None) 
         self.weight_manager = None
 
         # 组级预取支持标记
@@ -1129,7 +1129,7 @@ class FeedForward(nn.Module):
     #     # ============================================================
     #     wm = getattr(self, "weight_manager", None)
     #     in_use = False
-    #     compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
+    #     compute_stream = getattr(self.streams, "compute_ffn", None) 
     #     try:
     #         if wm and hasattr(wm, "_mark_group_in_use"):
     #             wm._mark_group_in_use(self.layer_id, "ffn")
@@ -1264,7 +1264,7 @@ class FeedForward(nn.Module):
                 if hasattr(wm, "ensure_group_on_gpu"):
                     wm.ensure_group_on_gpu(self.layer_id, "ffn")
                     # 在 FFN 计算流上等待“组 ready”事件（避免误等别组）
-                    compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
+                    compute_stream = getattr(self.streams, "compute_ffn", None) 
                     if hasattr(wm, "wait_group_ready"):
                         wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
                 else:
@@ -1292,7 +1292,7 @@ class FeedForward(nn.Module):
                     print(f"[FFN][L{self.layer_id}] background prefetch skipped: {e}")
 
             # --- FFN 计算 ---
-            compute_stream = getattr(self.streams, "compute_ffn", None) or getattr(self.streams, "weight_compute", None)
+            compute_stream = getattr(self.streams, "compute_ffn", None) 
             if compute_stream:
                 with torch.cuda.stream(compute_stream):
                     with cuda_timer("ffn_us", self.layer_id):

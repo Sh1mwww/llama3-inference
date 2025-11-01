@@ -113,29 +113,19 @@ class Streams:
     kv_d2h: Optional[torch.cuda.Stream] = None
     # 事件池
     _event_pool: Optional[_EventPool] = None
-    # ---- 向后兼容（旧字段别名）----
-    # 旧代码可能使用 weight_h2d / weight_compute
-    weight_h2d: Optional[torch.cuda.Stream] = None
-    weight_compute: Optional[torch.cuda.Stream] = None
-
-    def __post_init__(self):
-        # 为旧字段提供别名：默认映射到 MHA 主路径
-        if self.weight_h2d is None:
-            self.weight_h2d = self.weight_h2d_mha
-        if self.weight_compute is None:
-            self.weight_compute = self.compute_mha
+    
             
     def wait_weight_ready_on_current(self, device: Optional[str] = None):
         # 仅在 GPU 上进行流同步
         if not torch.cuda.is_available():
             return
-        if self.weight_h2d_mha is None and self.weight_h2d_ffn is None and self.weight_h2d is None:
+        if self.weight_h2d_mha is None and self.weight_h2d_ffn is None :
             return
         # ★ 修正：进入 device 上下文再取 current_stream
         dev = device if device is not None else f"cuda:{torch.cuda.current_device()}"
         with torch.cuda.device(dev):
             cur = torch.cuda.current_stream()
-            for s in (self.weight_h2d_mha, self.weight_h2d_ffn, self.weight_h2d):
+            for s in (self.weight_h2d_mha, self.weight_h2d_ffn):
                 if s is not None:
                     cur.wait_stream(s)
                 

@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from .stream_mnt import get_streams
 from .config import load_runtime_config
+from .weight_lbt import classify_group  # 用于从参数名推断 attn/ffn
 
 # NVTX profiling support (no-op fallback if unavailable)
 try:
@@ -1419,16 +1420,15 @@ class WeightStreamingManager:
         ★ 修复 8: 检查 weight_h2d backlog，必要时 throttle KV I/O
         避免 KV 抢带宽导致权重迟迟不上来
         """
-        # 检查 weight_h2d stream 是否繁忙
-        h2d_stream = getattr(self.streams, "weight_h2d", None) if hasattr(self, "streams") else None
-        if h2d_stream is None:
-            return
-
-        try:
-            # 检查 stream 是否完成（False = 还在忙）
-            is_busy = not h2d_stream.query()
-        except Exception:
-            is_busy = False
+        # 同时观察两条 H2D 流
+        s_mha = getattr(self.streams, "weight_h2d_mha", None)
+        s_ffn = getattr(self.streams, "weight_h2d_ffn", None)
+        def _busy(s):
+            try:
+                return (s is not None) and (not s.query())
+            except Exception:
+                return False
+        is_busy = _busy(s_mha) or _busy(s_ffn)
 
         if is_busy:
             self._h2d_pending_count += 1
@@ -1452,14 +1452,31 @@ class WeightStreamingManager:
                             print(f"[WSM] KV throttle failed: {e}")
 
     def _record_layer_ready_event(self, idx: int):
-        """Record an event on the weight H2D stream marking all enqueued copies for this layer."""
-        if not torch.cuda.is_available() or getattr(self.streams, "weight_h2d", None) is None:
+        # """Record an event on the weight H2D stream marking all enqueued copies for this layer."""
+        # if not torch.cuda.is_available() or getattr(self.streams, "weight_h2d", None) is None:
+        #     return
+        # evt = self.layer_events.get(idx)
+        # if evt is None:
+        #     evt = torch.cuda.Event(blocking=False)
+        #     self.layer_events[idx] = evt
+        # evt.record(self.streams.weight_h2d)
+        
+        """在两条 H2D 流上各记一次“层就绪”事件，等待方需同时等待。"""
+        if not torch.cuda.is_available():
             return
-        evt = self.layer_events.get(idx)
-        if evt is None:
-            evt = torch.cuda.Event(blocking=False)
-            self.layer_events[idx] = evt
-        evt.record(self.streams.weight_h2d)
+        evts = []
+        mha = getattr(self.streams, "weight_h2d_mha", None)
+        ffn = getattr(self.streams, "weight_h2d_ffn", None)
+        for s in (mha, ffn):
+            if s is None:
+                continue
+            e = torch.cuda.Event(blocking=False)
+            e.record(s)
+            evts.append(e)
+        if not evts:
+            return
+        self.layer_events[idx] = tuple(evts) if len(evts) > 1 else evts[0]
+        
 
         # ★ 修复 8: 检查并 throttle KV
         self._check_and_throttle_kv()
@@ -1468,11 +1485,14 @@ class WeightStreamingManager:
         try:
             start = torch.cuda.Event(enable_timing=True)
             end   = torch.cuda.Event(enable_timing=True)
-            start.record(self.streams.weight_h2d)
-            end.record(self.streams.weight_h2d)
-            end.synchronize()
-            dt_ms = start.elapsed_time(end)  # ~0，但可以作为一次采样
-            self._last_h2d_ms = max(self._last_h2d_ms * 0.9, dt_ms)
+            # 使用 mha stream 来测量（也可以用 ffn，只是为了采样 H2D 活动）
+            h2d_stream = getattr(self.streams, "weight_h2d_mha", None) or getattr(self.streams, "weight_h2d_ffn", None)
+            if h2d_stream:
+                start.record(h2d_stream)
+                end.record(h2d_stream)
+                end.synchronize()
+                dt_ms = start.elapsed_time(end)  # ~0，但可以作为一次采样
+                self._last_h2d_ms = max(self._last_h2d_ms * 0.9, dt_ms)
         except Exception:
             pass
 
@@ -1490,11 +1510,12 @@ class WeightStreamingManager:
         if self.verbose:
             print(f"[WSM] _wait_layer_ready layer={idx} event={'exists' if evt else 'None'}")
         if evt is not None:
-            if self.verbose:
-                print(f"[WSM] _wait_layer_ready layer={idx} waiting on event...")
-            torch.cuda.current_stream(self.device).wait_event(evt)
-            if self.verbose:
-                print(f"[WSM] _wait_layer_ready layer={idx} event wait done")
+            st = torch.cuda.current_stream(self.device)
+            if isinstance(evt, tuple):
+                for e in evt:
+                    st.wait_event(e)
+            else:
+                st.wait_event(evt)
         else:
             if self.verbose:
                 print(f"[WSM] _wait_layer_ready layer={idx} fallback to wait_weight_ready_on_current...")
@@ -1561,7 +1582,7 @@ class WeightStreamingManager:
                 layer_idx in self.cpu_cache and param_name in self.cpu_cache[layer_idx]):
 
                 nvtx.range_push("cpu_cache_to_gpu")
-                with torch.cuda.stream(self.streams.weight_h2d):
+                with torch.cuda.stream(self._select_h2d_stream_for(name=param_name)):
                     cached_tensor = self.cpu_cache[layer_idx][param_name]
                     p_gpu = cached_tensor.to(self.device, non_blocking=True)
 
@@ -1585,7 +1606,7 @@ class WeightStreamingManager:
                 layer_idx in self.cpu_cache and param_name in self.cpu_cache[layer_idx]):
 
                 nvtx.range_push("cpu_cache_to_gpu")
-                with torch.cuda.stream(self.streams.weight_h2d):
+                with torch.cuda.stream(self._select_h2d_stream_for(name=param_name)):
                     cached_tensor = self.cpu_cache[layer_idx][param_name]
                     p_gpu = cached_tensor.to(self.device, non_blocking=True)
                 p.data = p_gpu
@@ -1597,7 +1618,7 @@ class WeightStreamingManager:
             # 注意：参数已经在 CPU 上且有完整数据，直接 transfer
             if p.numel() > 0:  # 确保不是 stub
                 nvtx.range_push("weight_h2d_stream")
-                with torch.cuda.stream(self.streams.weight_h2d):
+                with torch.cuda.stream(self._select_h2d_stream_for(name=param_name)):
                     nvtx.range_push("cpu_to_gpu_transfer")
                     p_gpu = p.data.to(self.device, non_blocking=True)
                     nvtx.range_pop()
@@ -1686,7 +1707,7 @@ class WeightStreamingManager:
                                 f"expected {expected}, got {tuple(cached_tensor.shape)}. "
                                 f"Check MANIFEST <-> params.json/model size."
                             )
-                    with torch.cuda.stream(self.streams.weight_h2d):
+                    with torch.cuda.stream(self._select_h2d_stream_for(module_name=module_name)):
                         p_gpu = chosen_tensor.to(self.device, non_blocking=True)
                         
                     params_to_replace[local_param_name] = nn.Parameter(p_gpu, requires_grad=p.requires_grad)
@@ -1710,7 +1731,7 @@ class WeightStreamingManager:
                             # 重试一次
                             if layer_idx in self.cpu_cache and full_param_name in self.cpu_cache[layer_idx]:
                                 cached_tensor = self.cpu_cache[layer_idx][full_param_name]
-                                with torch.cuda.stream(self.streams.weight_h2d):
+                                with torch.cuda.stream(self._select_h2d_stream_for(module_name=module_name)):
                                     p_gpu = cached_tensor.to(self.device, non_blocking=True)
                                 params_to_replace[local_param_name] = nn.Parameter(p_gpu, requires_grad=p.requires_grad)
                                 params_full_names[local_param_name] = full_param_name
@@ -1767,7 +1788,7 @@ class WeightStreamingManager:
                 except Exception:
                     pass
             elif b.device.type == "cpu":
-                with torch.cuda.stream(self.streams.weight_h2d):
+                with torch.cuda.stream(self._select_h2d_stream_for(module_name=module_name)):
                     b_gpu = b.detach().to(self.device, non_blocking=True)
                 try:
                     b.data = b_gpu
@@ -2166,7 +2187,14 @@ class WeightStreamingManager:
         """
         if not torch.cuda.is_available():
             return
-        h2d = getattr(self.streams, "weight_h2d", None)
+        # h2d = getattr(self.streams, "weight_h2d", None)
+        if group == "attn":
+            h2d = getattr(self.streams, "weight_h2d_mha", None)
+        elif group == "ffn":
+            h2d = getattr(self.streams, "weight_h2d_ffn", None)
+        else:
+            h2d = None
+            
         if h2d is None:
             return
 
@@ -2549,6 +2577,26 @@ class WeightStreamingManager:
             # 同 dtype/device/shape，走 copy_ 覆盖（常规路径）
             param.data.copy_(dst_gpu_tensor)
 
+# ---------- H2D stream 选择：按组分流 ----------
+    def _select_h2d_stream_for(self, name: Optional[str] = None, module_name: Optional[str] = None):
+        """
+        按参数/模块路径将 H2D 路由到对应流：
+          - *.attention.* -> weight_h2d_mha
+          - *.feed_forward.* -> weight_h2d_ffn
+        """
+        s = None
+        try:
+            n = (name or "").lower()
+            m = (module_name or "").lower()
+            if (".attention." in n) or ("attent" in m):
+                s = getattr(self.streams, "weight_h2d_mha", None)
+            elif (".feed_forward." in n) or ("feed_forward" in m) or ("ffn" in m):
+                s = getattr(self.streams, "weight_h2d_ffn", None)
+        except Exception:
+            s = None
+        # fallback：尽量选一条可用的新流
+        return s or getattr(self.streams, "weight_h2d_mha", None) or getattr(self.streams, "weight_h2d_ffn", None)
+
     def _move_to_gpu(self, pname: str, src_cpu_tensor: torch.Tensor, exclude: set[tuple[int,str]] | None = None):
         """
         CPU→GPU 搬运 + 安装（使用拷贝 + 替换 param.data 方式）
@@ -2559,10 +2607,8 @@ class WeightStreamingManager:
         need_bytes = src_cpu_tensor.numel() * src_cpu_tensor.element_size()
         self._ensure_gpu_headroom(need_bytes, exclude=exclude)
 
-        # 2) 获取 H2D stream
-        h2d_stream = getattr(self.streams, "weight_h2d", None) if hasattr(self, "streams") else None
-        if h2d_stream is None:
-            h2d_stream = self._copy_stream  # fallback
+        # 2) 获取 H2D stream（按参数名分流）
+        h2d_stream = self._select_h2d_stream_for(name=pname) or self._copy_stream
 
         # 3) H2D 传输（在 weight_h2d 流中进行）
         try:
@@ -2948,7 +2994,9 @@ class WeightStreamingManager:
 
         def _worker():
             try:
-                with torch.cuda.stream(self.streams.weight_h2d):
+                # 根据组类型选择对应的 H2D stream
+                h2d_stream = self.streams.weight_h2d_mha if group == "attn" else self.streams.weight_h2d_ffn
+                with torch.cuda.stream(h2d_stream):
                     # 确保 CPU cache 有这一层的流式权重（SSD→CPU）
                     if self.ssd_enabled and (layer_idx not in self.cpu_cache):
                         self._load_layer_to_cpu(layer_idx)
@@ -3399,13 +3447,23 @@ class WeightStreamingManager:
         - 闲：PCIE<lo 且 pinned>high -> PD=min(PD+1, cap)
         - 中：保持
         """
-        # 近似估计 PCIE 利用率：以 H2D stream 的 backlog 与最近 H2D 触发为 proxy
-        busy_proxy = 1.0
-        try:
-            # 如果 H2D stream 上还有工作未完成，则趋向 1，否则趋向 0
-            busy_proxy = 0.9 if (not self.streams.weight_h2d.query()) else 0.1
-        except Exception:
-            pass
+        # # 近似估计 PCIE 利用率：以 H2D stream 的 backlog 与最近 H2D 触发为 proxy
+        # busy_proxy = 1.0
+        # try:
+        #     # 如果 H2D stream 上还有工作未完成，则趋向 1，否则趋向 0
+        #     busy_proxy = 0.9 if (not self.streams.weight_h2d.query()) else 0.1
+        # except Exception:
+        #     pass
+        # 以两条 H2D 流的 backlog 作为 proxy
+        
+        def _busy(s):
+            try:
+                return (s is not None) and (not s.query())
+            except Exception:
+                return False
+        s_mha = getattr(self.streams, "weight_h2d_mha", None)
+        s_ffn = getattr(self.streams, "weight_h2d_ffn", None)
+        busy_proxy = 0.9 if (_busy(s_mha) or _busy(s_ffn)) else 0.1
         # EMA
         self._pcie_ema = self._ema_alpha * busy_proxy + (1.0 - self._ema_alpha) * self._pcie_ema
 
