@@ -332,7 +332,7 @@ def main():
     probe("before inference (decode)")
     out_tokens, out_texts = llama.text_completion(
         prompts=[prompt],
-        temperature=0.6,
+        temperature=0.0,
         max_gen_len=max_gen_len,
         batch_size=4,
     )

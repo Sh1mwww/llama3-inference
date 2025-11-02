@@ -377,7 +377,7 @@ class KVOffloader:
         self._pause_write_until = max(self._pause_write_until, time.time() + ms / 1000.0)
     
     def _writer_loop(self):
-        batch: list[tuple[int,int,torch.Tensor]] = []
+        batch: list[tuple[int,int,Union[torch.Tensor,torch.cuda.Event]]] = []
         last_flush = time.time()
         while not self._writer_stop.is_set():
             # 节流：写暂停期只拉队列不写（避免阻塞 push），但不超过 1 窗口累积
@@ -390,35 +390,57 @@ class KVOffloader:
                 batch.append(item)
             except Empty:
                 pass
-            
-            
+
+
             # 聚合：每 30ms 或积累到 ~1–2 MiB 的若干条后 flush
             flush_due = (time.time() - last_flush) * 1000.0 >= self._win_ms
-            agg_bytes = sum(x[2].numel() * x[2].element_size() for x in batch)
+            # 计算字节数时需要处理 Event 类型
+            agg_bytes = 0
+            for x in batch:
+                if len(x) >= 3 and isinstance(x[2], torch.Tensor):
+                    agg_bytes += x[2].numel() * x[2].element_size()
             big_enough = agg_bytes >= (1 << 20)  # 1 MiB 起刷
             if not (flush_due or big_enough):
                 continue
-            
+
             # 限速：滑窗控制实际写速率 ≤ 目标
             self._drain_window()
             if self._win_sum >= self._write_target_bps * (self._win_ms/1000.0):
                 # 轻睡，等窗口消化
                 time.sleep(0.001)
-                continue    
-            
+                continue
+
             # 真正执行写：串行写，避免过度竞争读
-            for (L, B, kv_cpu) in batch:
+            for item in batch:
+                layer, blk, token = item
+
+                # 检查是否是 CUDA Event，如果是则等待完成后再打包
+                if isinstance(token, torch.cuda.Event):
+                    try:
+                        token.synchronize()  # 背景线程等待，不阻塞主线程
+                    except Exception as e:
+                        print(f"[WARN] Event sync failed @L{layer} B{blk}: {e}")
+                        continue
+                    # 事件完成后，从 CPU pinned 内存打包 KV
+                    if self.k_cpu[layer][blk] is None or self.v_cpu[layer][blk] is None:
+                        print(f"[WARN] KV not available @L{layer} B{blk}, skip write")
+                        continue
+                    kv_cpu = torch.cat([self.k_cpu[layer][blk], self.v_cpu[layer][blk]], dim=-1).contiguous()
+                else:
+                    # 兼容旧路径：直接使用已打包的 tensor
+                    kv_cpu = token
+
                 nbytes = kv_cpu.numel() * kv_cpu.element_size()
                 try:
                     # 优先使用回你已有的 write_async；如不可用可退回 write()
                     if hasattr(self.ssd, "write_async"):
-                        self.ssd.write_async(L, B, kv_cpu, sync=False)
+                        self.ssd.write_async(layer, blk, kv_cpu, sync=False)
                     else:
-                        self.ssd.write(L, B, kv_cpu)
+                        self.ssd.write(layer, blk, kv_cpu)
                     self._win_bytes.append((time.time(), nbytes))
                     self._win_sum += nbytes
                 except Exception as e:
-                    print(f"[WARN] SSD write failed @L{L} B{B}: {e}")
+                    print(f"[WARN] SSD write failed @L{layer} B{blk}: {e}")
             batch.clear()
             last_flush = time.time()
     
@@ -530,17 +552,27 @@ class KVOffloader:
 
         # Optional SSD mirror: pack whole block (max_batch, heads, BLOCK, 2*dim) and queue for async write
         # 可选 SSD 镜像：打包整个块 (max_batch, heads, BLOCK, 2*dim) 并排队异步写入
+        # if self.ssd is not None and getattr(KVCacheArgs, "mirror_on_push", True):
+        #     # Wait for D2H transfer to complete before packing
+        #     # 在打包前等待 D2H 传输完成
+        #     if self.d2h_stream is not None:
+        #         self.d2h_stream.synchronize()
+        #     kv_pack_cpu = torch.cat(
+        #         [self.k_cpu[layer][blk], self.v_cpu[layer][blk]], dim=-1
+        #     ).contiguous()
+        #     # 改用阻塞式 put，避免轻易丢块（保留超时告警）
+        #     try:
+        #         self._write_queue.put((layer, blk, kv_pack_cpu), timeout=1.0)
+        #     except Full:
+        #         print(f"[KV][WARN] write queue full for 1.0s, drop mirror @L{layer} B{blk}")
         if self.ssd is not None and getattr(KVCacheArgs, "mirror_on_push", True):
-            # Wait for D2H transfer to complete before packing
-            # 在打包前等待 D2H 传输完成
+            # 记录一次 D2H 完成事件，但不在主线程等待
+            d2h_done = torch.cuda.Event(blocking=False)
             if self.d2h_stream is not None:
-                self.d2h_stream.synchronize()
-            kv_pack_cpu = torch.cat(
-                [self.k_cpu[layer][blk], self.v_cpu[layer][blk]], dim=-1
-            ).contiguous()
-            # 改用阻塞式 put，避免轻易丢块（保留超时告警）
+                d2h_done.record(self.d2h_stream)
+            # 把 (layer, blk, event) 交给后台写线程；后台线程等待 event 后再拼包+写盘
             try:
-                self._write_queue.put((layer, blk, kv_pack_cpu), timeout=1.0)
+                self._write_queue.put((layer, blk, d2h_done), timeout=1.0)
             except Full:
                 print(f"[KV][WARN] write queue full for 1.0s, drop mirror @L{layer} B{blk}")
         
@@ -564,36 +596,49 @@ class KVOffloader:
                     self._spill_to_ssd(layer, B)   # 已有方法：写→释放→on_ssd=True
             return
 
-        # 异步批写：组装批次
-        batch_blks, batch_tensors = [], []
+        # 异步批写：收集事件
+        events, ev_blks = [], []
         for B in blocks:
             if self.k_cpu[layer][B] is None:
                 continue
-            # 等待 D2H 完成，确保拼包一致
+            evt = torch.cuda.Event(blocking=False)
             if self.d2h_stream is not None:
-                self.d2h_stream.synchronize()
-            kv_pack = torch.cat([self.k_cpu[layer][B], self.v_cpu[layer][B]], dim=-1).contiguous()
-            batch_blks.append(B)
-            batch_tensors.append(kv_pack)
+                evt.record(self.d2h_stream)
+            events.append(evt)
+            ev_blks.append(B)
 
-        if not batch_blks:
+        if not ev_blks:
             return
 
-        fut = self.ssd.write_batch_async(layer, batch_blks, batch_tensors)  # SSD 后端已提供
-        # 完成回调：释放 pinned DRAM，置 on_ssd 标志
-        def _on_done(_):
-            for B in batch_blks:
-                if self._k_raw_buf[layer][B] is not None:
-                    self.pool.free_block(self._k_raw_buf[layer][B]); self._k_raw_buf[layer][B] = None
-                if self._v_raw_buf[layer][B] is not None:
-                    self.pool.free_block(self._v_raw_buf[layer][B]); self._v_raw_buf[layer][B] = None
-                self.k_cpu[layer][B] = self.v_cpu[layer][B] = None
-                self.on_ssd[layer][B] = True
-        try:
-            fut.add_done_callback(_on_done)
-        except Exception:
-            # 容错：如果不支持回调，就同步等待一下避免泄露
-            fut.result(timeout=None); _on_done(None)
+        # 后台线程：等事件→打包→批写
+        def _spill_job():
+            local_blks, local_tensors = [], []
+            for e, B in zip(events, ev_blks):
+                try:
+                    e.synchronize()
+                except Exception:
+                    pass
+                kv_pack = torch.cat([self.k_cpu[layer][B], self.v_cpu[layer][B]], dim=-1).contiguous()
+                local_blks.append(B)
+                local_tensors.append(kv_pack)
+            if local_blks:
+                fut = self.ssd.write_batch_async(layer, local_blks, local_tensors)
+                def _on_done(_):
+                    for BB in local_blks:
+                        if self._k_raw_buf[layer][BB] is not None:
+                            self.pool.free_block(self._k_raw_buf[layer][BB])
+                            self._k_raw_buf[layer][BB] = None
+                        if self._v_raw_buf[layer][BB] is not None:
+                            self.pool.free_block(self._v_raw_buf[layer][BB])
+                            self._v_raw_buf[layer][BB] = None
+                        self.k_cpu[layer][BB] = self.v_cpu[layer][BB] = None
+                        self.on_ssd[layer][BB] = True
+                try:
+                    fut.add_done_callback(_on_done)
+                except Exception:
+                    fut.result(timeout=None)
+                    _on_done(None)
+        threading.Thread(target=_spill_job, daemon=True).start()
 
         
 
@@ -781,40 +826,44 @@ class KVOffloader:
                     print(f"[KV][WARN] SSD load L{layer} B{b} failed: {e}")
 
         fut = self.prefetch_executor.submit(_io_task)
-        fut.result(timeout=None)  # 小心：这里等的是“IO任务排队完成”，不是 H2D；能保证 DRAM 就绪
 
-        # 2) DRAM->HBM：在 kv_h2d stream 上执行，并为这一组 block 记录事件
-        stream = self.h2d_stream or torch.cuda.current_stream()
-        k_list, v_list = [], []
-        with torch.cuda.stream(stream):
-            for b in uniq:
-                kc = self.k_cpu[layer][b]
-                vc = self.v_cpu[layer][b]
-                if kc is None or vc is None:
-                    raise RuntimeError(f"[KV] block {b} not present in DRAM for layer {layer}")
-                # 复用/或创建这个 block 的 GPU 暂存（只需容纳 use_bsz）
-                kg = self.gpu_k[layer][b]
-                vg = self.gpu_v[layer][b]
-                shape = (use_bsz, self.heads, BLOCK, self.dim)
-                need_new = (
-                    kg is None or kg.device.type != "cuda" or tuple(kg.shape) != shape
-                )
-                if need_new:
-                    kg = torch.empty(shape, dtype=kc.dtype, device=self.device)
-                    vg = torch.empty(shape, dtype=vc.dtype, device=self.device)
-                    self.gpu_k[layer][b] = kg
-                    self.gpu_v[layer][b] = vg
+        # 2) DRAM->HBM：在回调中执行，让 CPU I/O 与计算并发
+        def _after_cpu(_):
+            try:
+                stream = self.h2d_stream or torch.cuda.current_stream()
+                k_list, v_list = [], []
+                with torch.cuda.stream(stream):
+                    for b in uniq:
+                        kc = self.k_cpu[layer][b]
+                        vc = self.v_cpu[layer][b]
+                        if kc is None or vc is None:
+                            return  # 容错：等待下一次
+                        # 复用/或创建这个 block 的 GPU 暂存（只需容纳 use_bsz）
+                        kg = self.gpu_k[layer][b]
+                        vg = self.gpu_v[layer][b]
+                        shape = (use_bsz, self.heads, BLOCK, self.dim)
+                        if (kg is None) or (kg.device.type != "cuda") or (tuple(kg.shape) != shape):
+                            kg = torch.empty(shape, dtype=kc.dtype, device=self.device)
+                            vg = torch.empty(shape, dtype=vc.dtype, device=self.device)
+                            self.gpu_k[layer][b] = kg
+                            self.gpu_v[layer][b] = vg
+                        # H2D：把完整 block（按 use_bsz）搬到 GPU 暂存
+                        kg.copy_(kc[:use_bsz], non_blocking=True)
+                        vg.copy_(vc[:use_bsz], non_blocking=True)
+                        k_list.append(kg)
+                        v_list.append(vg)
+                evt = torch.cuda.Event(blocking=False)
+                evt.record(stream)
+                with self._prefetch_lock:
+                    self._prefetch_map[(int(layer), tuple(uniq), int(use_bsz))] = {"evt": evt, "k": k_list, "v": v_list}
+            except Exception as e:
+                print(f"[KV][prefetch] H2D callback failed: {e}")
 
-                # H2D：把完整 block（按 use_bsz）搬到 GPU 暂存
-                kg.copy_(kc[:use_bsz], non_blocking=True)
-                vg.copy_(vc[:use_bsz], non_blocking=True)
-                k_list.append(kg)
-                v_list.append(vg)
-
-        evt = torch.cuda.Event()
-        evt.record(stream)
-        with self._prefetch_lock:
-            self._prefetch_map[(int(layer), tuple(uniq), int(use_bsz))] = {"evt": evt, "k": k_list, "v": v_list}
+        try:
+            fut.add_done_callback(_after_cpu)
+        except Exception:
+            # 回调不可用，则让后台线程同步执行一次
+            _after_cpu(None)
 
     # 新增：供上层简单调用——在 L 的 MHA 完成后，FFN(L) 期间预取 L+1
     def prefetch_for_next_layer(self, *, current_layer: int, start_pos: int, seqlen: int, bsz: int, window_tokens: int = BLOCK):

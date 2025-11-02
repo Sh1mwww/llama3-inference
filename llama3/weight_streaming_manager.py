@@ -1283,8 +1283,12 @@ class WeightStreamingManager:
                     print(f"[WSM DEBUG] Layer {current_layer} near/beyond window end {L1}, advancing base {self.cpu_win_base} -> {new_base}")
                     self.cpu_win_base = new_base
 
-            # 确保窗口内的层都已加载
-            self._ensure_cpu_window()
+            # # 确保窗口内的层都已加载
+            # self._ensure_cpu_window()
+            
+            # 不在前向线程里做 SSD 同步读！
+            # 仅推进窗口基准与“缺失层排队”，由 _cpu_prefetch_worker 后台加载
+            self._advance_cpu_window_by_compute(current_layer)
 
     def _touch_cpu_layer(self, layer_idx: int):
         """
@@ -1948,10 +1952,15 @@ class WeightStreamingManager:
         
         # 在 meta 初始化+SSD 模式下，确保有 CPU 层缓存可用（按需从 SSD 拉起）
         if self.ssd_enabled and (idx not in self.cpu_cache):
-                try:
-                    self._load_layer_to_cpu(idx)
-                except Exception:
-                    pass
+            try:
+                # 先等后台加载一个短窗，避免立即卡主线程
+                self._wait_cpu_ready(idx, timeout=0.5)
+            except Exception:
+                # 入队由 _cpu_prefetch_worker 处理
+                with self._cpu_lock:
+                    if idx not in self._inflight_cpu_layers:
+                        self._inflight_cpu_layers.add(idx)
+                        self._cpu_pf_q.put((self._epoch, idx))
                 
         self._record_memory_stats("ensure_start", idx)
 
