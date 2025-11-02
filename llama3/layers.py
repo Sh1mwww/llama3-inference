@@ -1244,7 +1244,7 @@ class FeedForward(nn.Module):
                     D = max(1, int(os.getenv("WSM_GROUP_PREFETCH_DEPTH", "2")))
                     nL = getattr(wm, "n_layers", 0)
                     used = getattr(wm, "_gpu_group_lru", [])  # 仅做轻量预算估计
-                    budget = max(0, int(os.getenv("WSM_GPU_MAX_GROUPS", "6")) - len(used) - 1)
+                    budget = max(0, int(os.getenv("WSM_GPU_MAX_GROUPS", "10")) - len(used) - 1)
                     # 只在有预算时推进预取队列
                     depth = min(D, budget) if budget > 0 else 0
                     for off in range(1, depth + 1):

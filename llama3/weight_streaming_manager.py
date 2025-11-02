@@ -471,6 +471,20 @@ class WeightStreamingManager:
         self.pair_ahead_layers = int(os.getenv("WSM_PAIR_AHEAD", "2"))           # 就近层数，优先同层→i+1→i+2
         self.kind_ahead_cap = int(os.getenv("WSM_KIND_AHEAD_CAP", "2"))          # 单一类型最多前瞻距离
 
+
+        # --- within WeightStreamingManager.__init__ ---
+        self.gpu_max_groups      = int(os.getenv("WSM_GPU_MAX_GROUPS", "10"))
+        self.target_gpu_groups   = int(os.getenv("WSM_TARGET_GPU_GROUPS", str(self.gpu_max_groups)))
+        self.cpu_cache_layers    = int(os.getenv("WSM_CPU_CACHE_LAYERS", "40"))
+        self.cpu_back_margin     = int(os.getenv("WSM_CPU_BACK_MARGIN", "4"))
+        self.cpu_front_margin    = max(0, self.cpu_cache_layers - self.cpu_back_margin)
+        self.group_prefetch_depth = int(os.getenv("WSM_GROUP_PREFETCH_DEPTH", "6"))
+
+        self.evict_finished_group = (os.getenv("WSM_EVICT_FINISHED","1") == "1")
+        self.balance_prefetch    = (os.getenv("WSM_BALANCE_PREFETCH", "1") == "1")
+        self.balance_tolerance   = int(os.getenv("WSM_BALANCE_TOL", "1"))
+        self.pair_ahead_layers   = int(os.getenv("WSM_PAIR_AHEAD", "2"))
+
     # ---- Balanced group scheduler: key normalization ----------
     @staticmethod
     def _key(L: int, kind: str) -> tuple[int, str]:
@@ -2141,6 +2155,10 @@ class WeightStreamingManager:
             try:
                 self._evict_group_immediately(layer_idx, group)
                 self._shrink_gpu_groups_now()
+                try:
+                    self.rebalance_and_topoff(layer_idx)
+                except Exception:
+                    pass
             except Exception as e:
                 print(f"[WSM] Evict-on-finish failed: {e}")
         else:
@@ -2479,6 +2497,26 @@ class WeightStreamingManager:
         # 发起预取（注意：prefetch_group_async 内部会二次去重与容量控制）
         for (L, kind, pin, why) in schedule:
             self.prefetch_group_async(L, kind, pin=pin, reason=why)
+            
+    def notify_group_compute_done(self, layer_idx: int, group: str, evt: "torch.cuda.Event|None"):
+        """
+        由层在 compute 流上调用：仅把“顶补”延迟到 compute 结束后触发，避免提前收缩。
+        不调用任何 .synchronize()；仅在后台线程里 query/sync 该单个事件。
+        """
+        import threading
+        def _cb():
+            try:
+                if evt is not None:
+                    evt.synchronize()   # 只同步该事件，不影响其它流
+            except Exception:
+                pass
+            # 计算完成后及时补齐窗口
+            try:
+                self.rebalance_and_topoff(layer_idx)
+            except Exception:
+                pass
+        threading.Thread(target=_cb, name=f"wsm_done_L{layer_idx}_{group}", daemon=True).start()
+
 
     def _resident(self, L: int, kind: str) -> bool:
         """辅助方法：检查组是否已驻留（用于 rebalance_and_topoff）"""
@@ -2697,18 +2735,40 @@ class WeightStreamingManager:
         # ⭐ 修复2: 检查是否有后台预取任务在运行
         inflight_evt = self._gpu_group_inflight.get(key)
         if inflight_evt is not None:
-            # 后台预取正在进行，等待完成（给予充足的超时时间）
-            if self.verbose:
-                print(f"[WSM] Group {key} inflight detected, waiting for background prefetch...")
-            if inflight_evt.wait(timeout=5.0):  # 增加超时到 5 秒
-                # 等待成功，再次检查是否在 GPU（等待该组的事件）
-                if self._group_is_resident(layer_idx, group, wait_for_event=True):
-                    if self.verbose:
-                        print(f"[WSM] Group {key} prefetch completed successfully")
-                    return
-            else:
-                if self.verbose:
-                    print(f"[WSM] Group {key} inflight timeout; will fallback to sync load")
+            # 1) 优先在当前/计算流上挂依赖，保证后续 GPU kernel 不会早于 H2D
+            try:
+                cur = torch.cuda.current_stream(device=self.device)
+                # torch.cuda.Event 的正确使用：让“当前流”等这个 event
+                cur.wait_event(inflight_evt)  # 安全：若是 threading.Event 会抛异常，被下面捕获
+            except Exception:
+                pass
+
+            # 2) 兜底：按类型分别等待
+            try:
+                # threading.Event: 有 wait(seconds)
+                if hasattr(inflight_evt, "wait") and "threading" in type(inflight_evt).__module__:
+                    inflight_evt.wait(5.0)
+                else:
+                    # torch.cuda.Event: 轮询 query() + 超时
+                    t0 = time.monotonic()
+                    while not inflight_evt.query():
+                        if time.monotonic() - t0 > 5.0:
+                            if getattr(self, "verbose", False):
+                                print(f"[WSM] inflight H2D timeout for {key}; continue with sync ensure")
+                            break
+                        time.sleep(0.001)
+            except Exception:
+                # 最坏情况：直接同步该事件
+                try:
+                    inflight_evt.synchronize()
+                except Exception:
+                    pass
+
+            # 3) 清理 inflight，转入常驻 LRU（防止“僵尸 inflight”）
+            with self._group_lock:
+                self._gpu_group_inflight.pop(key, None)
+                if key not in self._gpu_group_lru:
+                    self._gpu_group_lru.append(key)
 
         # ⭐ 修复3: 确保 CPU 层已经在缓存（后台没完成就立刻兜底）
         try:
@@ -2718,6 +2778,18 @@ class WeightStreamingManager:
             self._load_layer_to_cpu(layer_idx)
 
         layer_cache = self.cpu_cache.get(layer_idx, {})
+
+        # ⭐ 修复2: 在传输前，预先确保有足够的组槽位
+        with self._group_lock:
+            while len(self._gpu_group_lru) >= self.gpu_max_groups - 1:  # 留1个槽位给当前组
+                ok = self._evict_one_group_from_gpu(exclude={key})
+                if not ok:
+                    ok = self._evict_one_group_from_gpu(exclude={key}, ignore_retain=True)
+                if not ok:
+                    if self.verbose:
+                        print(f"[WSM] Warning: cannot make room for {key}, will retry after OOM")
+                    break
+                torch.cuda.empty_cache()
 
         # ⭐ 修复: 在对应的 H2D stream context 中完成所有传输和 event 记录
         # 确保 event 在所有 .to() 操作入队后才被记录
@@ -2756,15 +2828,27 @@ class WeightStreamingManager:
         # while len(self._gpu_group_lru) > self.gpu_max_groups:
         #     self._evict_one_group_from_gpu(exclude={key})
 
+        # ⭐ 修复1: 强制驱逐直到符合预算，不允许超额
         with self._group_lock:
             if key in self._gpu_group_lru:
                 self._gpu_group_lru.remove(key)
             self._gpu_group_lru.append(key)
-            # 允许短暂超额；若确实要收缩，尝试一次驱逐即可
-            if len(self._gpu_group_lru) > self.gpu_max_groups:
-                ok = self._evict_one_group_from_gpu(exclude={key})
-                if not ok and self.verbose:
-                    print(f"[WSM] cannot evict under gpu_max_groups={self.gpu_max_groups}; allow temporary overflow={len(self._gpu_group_lru)}")
+
+            # 强制驱逐直到符合预算
+            max_tries = 10
+            tries = 0
+            while len(self._gpu_group_lru) > self.gpu_max_groups and tries < max_tries:
+                ok = self._evict_one_group_from_gpu(exclude={key}, ignore_retain=False)
+                if not ok:
+                    # 第二轮：忽略留存策略
+                    ok = self._evict_one_group_from_gpu(exclude={key}, ignore_retain=True)
+                if not ok:
+                    raise RuntimeError(
+                        f"Cannot evict groups to fit {key}; "
+                        f"LRU={len(self._gpu_group_lru)} > max={self.gpu_max_groups}"
+                    )
+                torch.cuda.empty_cache()
+                tries += 1
 
         self._touch_group(layer_idx, group)
         

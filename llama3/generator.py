@@ -783,7 +783,7 @@ class LLaMA:
                 verbose=cfg.get("verbose", False),
                 monitor_fragmentation=False,
                 ssd_manifest_path=cfg.get("ssd_manifest_path") or cfg.get("manifest_path"),
-                cpu_cache_layers=cfg.get("cpu_cache_layers", 50),
+                cpu_cache_layers=cfg.get("cpu_cache_layers", 40),  # ← 默认 40
                 staging_mb=cfg.get("staging_mb", 64),
             )
 
