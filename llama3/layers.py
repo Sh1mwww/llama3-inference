@@ -87,15 +87,24 @@ class PerformanceTracker:
 
 PERF_TRACKER = PerformanceTracker()
 
+# Profiling control via environment variable
+PROFILE = os.getenv("LLM_PROFILE", "0") == "1"
+
 @contextmanager
 def cuda_timer(key: str, layer_id: Optional[int] = None):
+    # No-op when profiling is disabled (避免任何同步开销)
+    if not PROFILE:
+        yield
+        return
+
     if not torch.cuda.is_available():
-        yield; return
-    
+        yield
+        return
+
     start_event = None
     end_event = None
     cuda_error_occurred = False
-    
+
     try:
         # Check CUDA context health before creating events
         try:
@@ -104,10 +113,10 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
             logger.warning(f"CUDA context unhealthy for {key}, skipping timing")
             yield
             return
-            
+
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
-        
+
         start_event.record()
         yield
         
@@ -132,8 +141,9 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
                 torch.cuda.current_device()
                 
                 end_event.record()
-                torch.cuda.synchronize()
-                
+                # 只同步当前流的事件，避免全局阻塞其它流（尤其是H2D）
+                end_event.synchronize()
+
                 elapsed_us = int(start_event.elapsed_time(end_event) * 1000)
 
                 with PERF_TRACKER.lock:
@@ -510,7 +520,7 @@ class SelfAttention(nn.Module):
         print(f"[ATTN] Layer {self.layer_id} forward starting...")
 
         # ============================================================
-        # 1) 确保 attn 组在 GPU，并等待该组 H2D 完成（在 compute_mha 流上等待）
+        # 1) 只用事件、不阻塞：标记组使用 + 等待组 ready 事件
         # ============================================================
         wm = getattr(self, "weight_manager", None)
         in_use = False
@@ -518,63 +528,21 @@ class SelfAttention(nn.Module):
             if wm and hasattr(wm, "_mark_group_in_use"):
                 wm._mark_group_in_use(self.layer_id, "attn")
                 in_use = True
-            if wm is not None:
-                # 确保 attn 组在 GPU（阻塞式，直到权重加载完成）
-                if hasattr(wm, "ensure_group_on_gpu"):
-                    wm.ensure_group_on_gpu(self.layer_id, "attn")
-                else:
-                    # 回退到层级加载
-                    modules = self._get_modules_dict()
-                    wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
 
-                # 在 compute stream 上等待 attn 组 H2D 传输完成（禁止降级到 CPU）
-                if hasattr(wm, "wait_group_ready"):
-                    wm.ensure_group_on_gpu(self.layer_id, "attn")
-                    wm.wait_group_ready(self.layer_id, "attn", compute_stream=self.compute_stream)
+            # ⭐ 只用事件等待，不做同步阻塞
+            # 在 compute_mha 流上等待 attn 组的 ready 事件（非阻塞式，只让流依赖事件）
+            if wm is not None and hasattr(wm, "wait_group_ready"):
+                wm.wait_group_ready(self.layer_id, "attn", compute_stream=self.compute_stream)
 
-            print(f"[ATTN] Layer {self.layer_id} weights ensured and ready")
+            # ⭐ 可选：等待 KV 块 ready 事件（如果有预取）
+            # 在 decode 阶段（start_pos > 0），等待本层所需的 KV 块 H2D 完成
+            if start_pos > 0 and self.offloader is not None and hasattr(self.offloader, "wait_blocks_ready"):
+                # 计算本层需要的块：最近窗口 tokens
+                blocks = self.offloader.plan_tail_window_blocks(start_pos, seqlen, window_tokens=BLOCK)
+                if blocks:
+                    self.offloader.wait_blocks_ready(self.layer_id, blocks, stream=self.compute_stream)
 
-            # ============================================================
-            # 2) 验证：所有权重必须已经在 CUDA 上（由 WSM 负责，forward 不做设备迁移）
-            # Validation: All weights must already be on CUDA (managed by WSM, forward does NOT do device migration)
-            # ============================================================
-            target_device = x.device
-
-            # 确保 target_device 是 CUDA（不接受 CPU）
-            if not str(target_device).startswith("cuda"):
-                raise RuntimeError(f"Layer {self.layer_id} SelfAttention: input x is on {target_device}, but only CUDA is supported")
-
-            for mod in (self.wq, self.wk, self.wv, self.wo):
-                # 权重必须在 CUDA，不允许 meta 或 CPU
-                if str(mod.weight.device) == "meta" or getattr(mod.weight, "is_meta", False):
-                    raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight still on meta device after ensure_group_on_gpu()")
-
-                if not str(mod.weight.device).startswith("cuda"):
-                    raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight on {mod.weight.device}, must be on CUDA (managed by WSM)")
-
-                # 验证设备一致性（不做迁移，只检查）
-                # Validate device consistency (no migration, only check)
-                if mod.weight.device != target_device:
-                    raise RuntimeError(f"Layer {self.layer_id} SelfAttention: {mod.__class__.__name__}.weight on {mod.weight.device} but input on {target_device}. "
-                                     "Device mismatch must be fixed by WSM, not by forward().")
-
-            print(f"[ATTN] Layer {self.layer_id} device validation passed (all on CUDA)")
-
-            # ============================================================
-            # 2.1) 强制同步：确保权重真正可访问（消除首次访问延迟）
-            # Force synchronization: ensure weights are truly accessible (eliminate first-access latency)
-            # ============================================================
-            if self.compute_stream is not None:
-                # 在 compute_mha 流上等待所有之前的操作（包括 H2D）
-                # Wait for all previous operations (including H2D) on compute_mha stream
-                self.compute_stream.synchronize()
-
-            # 预热 GEMM kernel（可选）：访问权重第一个元素触发 page fault
-            # Warm-up GEMM kernel (optional): access first element to trigger page fault
-            warmup_start = time.time()
-            _ = self.wq.weight[0, 0].item()
-            warmup_ms = (time.time() - warmup_start) * 1000
-            print(f"[ATTN] Layer {self.layer_id} weight warmup took {warmup_ms:.2f}ms")
+            print(f"[ATTN] Layer {self.layer_id} weights event wait done (non-blocking)")
 
             # 更新全局状态跟踪器
             tracker = get_global_tracker()
@@ -1255,24 +1223,20 @@ class FeedForward(nn.Module):
         wm = getattr(self, "weight_manager", None)
         in_use = False
         try:
-            # 标记并确保 FFN 组权重在 GPU
+            # ============================================================
+            # 只用事件、不阻塞：标记组使用 + 等待组 ready 事件
+            # ============================================================
             if wm and hasattr(wm, "_mark_group_in_use"):
                 wm._mark_group_in_use(self.layer_id, "ffn")
                 in_use = True
 
-            if wm is not None:
-                if hasattr(wm, "ensure_group_on_gpu"):
-                    wm.ensure_group_on_gpu(self.layer_id, "ffn")
-                    # 在 FFN 计算流上等待“组 ready”事件（避免误等别组）
-                    compute_stream = getattr(self.streams, "compute_ffn", None) 
-                    if hasattr(wm, "wait_group_ready"):
-                        wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
-                else:
-                    # 回退：层级 API（不建议，但保底）
-                    mods = self._get_modules_dict()
-                    wm.ensure_weights_cuda(self.layer_id, mods, priority=True)
+            # ⭐ 只用事件等待，不做同步阻塞
+            # 在 compute_ffn 流上等待 ffn 组的 ready 事件（非阻塞式，只让流依赖事件）
+            compute_stream = getattr(self.streams, "compute_ffn", None)
+            if wm is not None and hasattr(wm, "wait_group_ready"):
+                wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
 
-            print(f"[FFN] Layer {self.layer_id} weights ensured")
+            print(f"[FFN] Layer {self.layer_id} weights event wait done (non-blocking)")
 
             # ⭐⭐⭐ Background prefetch during FFN compute（后续 D 层 ATTn）
             try:
