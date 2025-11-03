@@ -72,10 +72,16 @@ class _PerfRecorder:
     def record_h2d_pair(self, start_evt, end_evt, meta=None):
         if not self.cuda: return
         self.h2d_evt_pairs.append((start_evt, end_evt, meta or {}))
+        # Debug: print first few recordings
+        if len(self.h2d_evt_pairs) <= 3:
+            print(f"[PERF DEBUG] H2D event recorded: {len(self.h2d_evt_pairs)}, meta={meta}")
 
     def record_compute_pair(self, start_evt, end_evt, meta=None):
         if not self.cuda: return
         self.compute_evt_pairs.append((start_evt, end_evt, meta or {}))
+        # Debug: print first few recordings
+        if len(self.compute_evt_pairs) <= 3:
+            print(f"[PERF DEBUG] Compute event recorded: {len(self.compute_evt_pairs)}, meta={meta}")
 
     # ---------- 工具：区间并集与交集 ----------
     @staticmethod
@@ -116,6 +122,8 @@ class _PerfRecorder:
     def finalize(self):
         if self._final is not None:
             return self._final
+
+        print(f"[PERF DEBUG] Finalizing... cuda={self.cuda}, h2d_pairs={len(self.h2d_evt_pairs)}, compute_pairs={len(self.compute_evt_pairs)}")
 
         if self.cuda:
             torch.cuda.synchronize(self.dev)
@@ -770,7 +778,8 @@ def main():
     # ⭐ 组级 GPU 预取（ahead=4）+ 组预算 + 等水位调度
     # ============================================================
     GPU_AHEAD_LAYERS = 4
-    GPU_MAX_GROUPS   = max(10, 2 + GPU_AHEAD_LAYERS * 2 + 1)  # ≈ 11：当前(2) + 预取(8) + 缓冲(1)
+    # GPU_MAX_GROUPS   = max(10, 2 + GPU_AHEAD_LAYERS * 2 + 1)  # ≈ 11：当前(2) + 预取(8) + 缓冲(1)
+    GPU_MAX_GROUPS = 10
 
     os.environ.setdefault("WSM_GPU_MAX_GROUPS", str(GPU_MAX_GROUPS))
     os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH", str(GPU_AHEAD_LAYERS))
@@ -817,6 +826,7 @@ def main():
     # 性能计时器初始化
     global G_PERF
     G_PERF = _PerfRecorder(device)
+    print(f"[PERF] G_PERF initialized: {G_PERF}, cuda={G_PERF.cuda}")
 
     # 1) 覆盖 pinned/注册池 + KV 池
     apply_runtime_overrides()
@@ -850,6 +860,13 @@ def main():
         mode_config=mode_config
     )
     probe("after LLaMA.build")
+
+    # ⭐ 将 G_PERF 注入到 llama3 模块中，让它们能够访问到全局 recorder
+    import llama3.layers as layers_module
+    import llama3.weight_streaming_manager as wsm_module
+    layers_module.G_PERF = G_PERF
+    wsm_module.G_PERF = G_PERF
+    print(f"[PERF] Injected G_PERF into llama3 modules")
 
     # 绑定 WSM 补丁
     wsm = getattr(llama, "weight_streaming_manager", None)

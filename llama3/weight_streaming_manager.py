@@ -479,6 +479,12 @@ class WeightStreamingManager:
         self.cpu_back_margin     = int(os.getenv("WSM_CPU_BACK_MARGIN", "4"))
         self.cpu_front_margin    = max(0, self.cpu_cache_layers - self.cpu_back_margin)
         self.group_prefetch_depth = int(os.getenv("WSM_GROUP_PREFETCH_DEPTH", "6"))
+        # 是否允许在溢出第二轮收缩时强制踢掉"非 IN_USE 的 pinned 组"
+        self.allow_force_unpin   = (os.getenv("WSM_ALLOW_FORCE_UNPIN", "1") == "1")
+        # 限制同时被 pin 的组数（软上限，超限则后续的 prefetch 不再 pin）
+        self.max_pinned_groups   = int(os.getenv("WSM_GROUP_PIN_BUDGET", "2"))
+        # 是否在前向路径同步 topoff（默认关闭，走异步回调）
+        self.rebalance_sync      = (os.getenv("WSM_REBALANCE_SYNC", "0") == "1")
 
         self.evict_finished_group = (os.getenv("WSM_EVICT_FINISHED","1") == "1")
         self.balance_prefetch    = (os.getenv("WSM_BALANCE_PREFETCH", "1") == "1")
@@ -690,7 +696,18 @@ class WeightStreamingManager:
                 f"insufficient headroom: need={required_bytes/2**20:.2f}MB "
                 f"free={free_now/2**20:.2f}MB guard={guard/2**20:.2f}MB")
     
-    
+    # ---- Public: ensure extra free space for upcoming compute ----------------
+    def ensure_headroom_mb(self, mb: int, exclude: "set[tuple[int,str]]|None" = None):
+        """
+        计算前的“临时显存工作区”预留（额外 headroom）。
+        会在不碰当前 in-use 组（以及 exclude 指定的组）的前提下，
+        通过逐出其它组 + empty_cache 来腾挪出 mb MB 的额外空闲。
+        """
+        try:
+            need = int(max(0, mb)) * 1024 * 1024
+        except Exception:
+            need = 0
+        self._ensure_gpu_headroom(need, exclude=exclude or set())
 
     def _evict_one_not_retained(self):
         # Try oldest→newest; evict the first not "retained recently"
@@ -2262,77 +2279,41 @@ class WeightStreamingManager:
         compute_stream: "torch.cuda.Stream | None" = None,
     ) -> None:
         """
-        等待 (layer_idx, group) 这组权重在 H2D 流上的完成事件（支持平衡调度器的 inflight 检测）。
-        - 快路径：该组已驻留于 GPU -> 直接返回
-        - 如果在 inflight 中：等待 threading.Event，然后并入 LRU
-        - 否则若存在组级 CUDA 事件 -> 将 compute_stream（或当前流）挂到该事件上
-        - 否则（无事件且不在 inflight）：触发兜底同步预取
+        在 compute_stream 上等待 (layer, group) 的 H2D 完成事件（非阻塞：仅挂依赖，不同步）。
+        若找不到组事件，则降级为"层事件"；再不行则让当前流等待 H2D 流 drain。
         """
-        k = self._key(layer_idx, group)
-
-        # 1) 快路径：该组已在 GPU
-        try:
-            if self._group_is_resident(layer_idx, group):
-                return
-        except KeyError as e:
-            raise ValueError(f"unknown group '{group}': {e}")
-
-        # 2) 检查是否在 inflight（平衡调度器扩展）
-        evt = None
-        with self._group_lock:
-            evt = self._gpu_group_inflight.get(k, None)
-
-        if evt is not None:
-            # inflight 中：等待 H2D 完成
-            if compute_stream is not None:
-                # 如果 evt 是 threading.Event，需要先同步，然后让 compute_stream 继续
-                if isinstance(evt, threading.Event):
-                    evt.wait()  # 等待 H2D 完成
-                else:
-                    # 如果是 torch.cuda.Event
-                    compute_stream.wait_event(evt)
-            else:
-                if isinstance(evt, threading.Event):
-                    evt.wait()
-                else:
-                    evt.synchronize()
-
-            # H2D 完成：并入 LRU，占用从 inflight 转为 resident
-            with self._group_lock:
-                self._gpu_group_inflight.pop(k, None)
-                if k not in self._gpu_group_lru:
-                    self._gpu_group_lru.append(k)
-            if self.verbose:
-                print(f"[WSM] H2D completed for {k}")
+        if not torch.cuda.is_available():
             return
 
-        # 3) 不在 inflight：检查是否有组级 CUDA 事件
-        cuda_evt = self._group_ready_events.get(k)
-        if cuda_evt is not None:
-            # 在目标 compute stream 上等待
+        # 规范化 key 与事件
+        key = (int(layer_idx), 'attn' if group == 'attn' else 'ffn')
+        evt = self._group_ready_events.get(key) or self.layer_events.get(int(layer_idx))
+
+        if evt is None:
+            # 回退：等待 H2D 流 drain（只挂依赖，不 .synchronize）
             try:
-                dev_obj = torch.device(self.device) if isinstance(self.device, str) else self.device
-                s = compute_stream or torch.cuda.current_stream(dev_obj)
-                s.wait_event(cuda_evt)
+                s = getattr(self.streams, "weight_h2d_mha" if group == "attn" else "weight_h2d_ffn", None)
+                if s is None:
+                    s = getattr(self.streams, "weight_h2d", None)
+                if s is not None:
+                    (compute_stream or torch.cuda.current_stream(self.device)).wait_stream(s)
             except Exception:
                 pass
             return
 
-        # 4) 既不在 inflight 也没有事件：兜底触发一次同步预取
-        if not self._group_is_resident(layer_idx, group):
-            if self.verbose:
-                print(f"[WSM] {k} not resident/inflight; forcing sync prefetch")
-            # ⭐ 修复：避免无限递归，直接调用 ensure_group_on_gpu（阻塞式）
-            try:
-                self.ensure_group_on_gpu(layer_idx, group)
-            except Exception as e:
-                if self.verbose:
-                    print(f"[WSM][WARN] Failed to ensure {k} on GPU: {e}")
-                # 如果失败，至少尝试一次异步预取（但不再递归等待）
+        # 组或层事件：直接 wait_event（不阻塞 CPU）
+        s = compute_stream or torch.cuda.current_stream(self.device)
+        if isinstance(evt, (list, tuple)):  # 层级事件可能是 (mha_evt, ffn_evt)
+            for e in evt:
                 try:
-                    self.prefetch_group_async(layer_idx, group, pin=False)
+                    s.wait_event(e)
                 except Exception:
                     pass
+        else:
+            try:
+                s.wait_event(evt)
+            except Exception:
+                pass
 
 
     
@@ -2527,28 +2508,39 @@ class WeightStreamingManager:
         return self._key(L, kind) in self._gpu_group_inflight
 
     def _shrink_gpu_groups_now(self, exclude: set[tuple[int, str]] = frozenset()):
-        # 分两轮：第一轮尊重“最近触达”；第二轮忽略之
+        # 分两轮：第一轮尊重"最近触达"；第二轮忽略之
         for pass_idx in (0, 1):
             while True:
                 with self._group_lock:
                     if len(self._gpu_group_lru) <= self.gpu_max_groups:
                         return
                 ok = self._evict_one_group_from_gpu(
-                    exclude=exclude, 
+                    exclude=exclude,
                     ignore_retain=(pass_idx == 1)
                 )
                 if not ok:
-                    # 没有可踢的候选（全在用/都在排除/都刚触达）
+                    # 第二轮仍失败：尝试强制解 pin + 淘汰"非 IN_USE 的 pinned 组"
+                    if pass_idx == 1 and self.allow_force_unpin:
+                        ok = self._evict_one_group_from_gpu(
+                            exclude=exclude, ignore_retain=True, allow_unpin=True
+                        )
+                        if ok:
+                            continue
                     if self.verbose:
                         print(f"[WSM] shrink pass{pass_idx}: no candidate; "
                             f"overflow={len(self._gpu_group_lru)} > cap={self.gpu_max_groups}")
                     break  # 进入下一轮（若还有）
 
 
-    def _evict_one_group_from_gpu(self, exclude=(), ignore_retain: bool = False):
+    def _evict_one_group_from_gpu(self, exclude=(), ignore_retain: bool = False, allow_unpin: bool = False):
         """
-        LRU 淘汰一个组；跳过 exclude、IN_USE；可选择忽略“最近触达”留存。
+        LRU 淘汰一个组；跳过 exclude、IN_USE；可选择忽略"最近触达"留存。
         优先选择 FFN（显存更大），否则按 LRU。
+
+        Args:
+            exclude: 排除的组键集合
+            ignore_retain: 是否忽略"最近触达"保护
+            allow_unpin: 是否允许强制解 pin（仅对非 IN_USE 的 pinned 组）
         """
         cand_idx = None
         cand_key = None
@@ -2557,18 +2549,25 @@ class WeightStreamingManager:
 
         with self._group_lock:
             for i, (lyr, grp) in enumerate(list(self._gpu_group_lru)):
-                key = (lyr, grp)
+                key = (int(lyr), str(grp))
                 if key in exclude:
                     continue
-                # 修改：检查 refcount > 0
-                if self._gpu_group_in_use.get(key, 0) > 0:
-                    if self.verbose:
-                        print(f"[WSM] Skipping eviction of IN_USE group {key}")
+                if key in inflight_keys:
                     continue
-                if key in inflight_keys:             # 正在加载
+                in_use = self._gpu_group_in_use.get(key, 0) > 0
+                if in_use:
                     continue
                 if (not ignore_retain) and self._should_retain_group(lyr, grp):
                     continue
+                # 跳过 pinned；若允许强制，则先解 pin 再作为候选
+                if self._is_pinned(lyr, grp):
+                    if not allow_unpin:
+                        continue
+                    with self._group_lock:
+                        # 只对"非使用中"的 pinned 组做强制解 pin（一次性全部释放）
+                        self._pinned_groups.pop(key, None)
+                        if self.verbose:
+                            print(f"[WSM] force-unpin {key} to satisfy budget")
 
                 # 选择策略：优先 FFN；否则第一个可行的 LRU
                 if grp == "ffn":
@@ -3087,97 +3086,115 @@ class WeightStreamingManager:
     #         print(f"[WSM][prefetch] Starting background H2D for {key}{pin_suffix}")
 
     #     return True  # 成功发起了新的 H2D 操作
-    def prefetch_group_async(self, layer_idx: int, group: str,
-                            pin: bool = False, reason: str = "window"):
-        """
-        后台线程+H2D stream 发起 (layer,group) 组的权重预取：
-        - SSD->CPU（若缺）在后台读，不阻塞
-        - DRAM/pinned->HBM 在对应 H2D 流上 copy_
-        - 记录组级 ready 事件；计算流只需 wait_event
-        """
-        L = int(layer_idx); kind = 'attn' if group == 'attn' else 'ffn'
-        key = (L, kind)
+    def prefetch_group_async(self, layer_idx: int, group: str, pin: bool=False, reason: str=""):
+        """非阻塞预取 (layer, group)。不满足预算/闸门条件时直接跳过（下次再试）。"""
+        if layer_idx < 0 or layer_idx >= self.n_layers:
+            return False
+        key = self._key(layer_idx, group)
+        suffixes = GROUPS[group]
 
-        # 去重：已驻留 / 在飞直接返回
-        if self._group_is_resident(L, kind) or key in self._gpu_group_inflight:
-            return
-
-        # 立刻登记“在飞”，用 CUDA Event 做占位（供 waiters 绑定）
-        evt_inflight = torch.cuda.Event(blocking=False)
+        # 去重：已驻留/在飞 → 最多只补一个 pin 引用（不重复入队）
         with self._group_lock:
-            self._gpu_group_inflight[key] = evt_inflight
+            if self._group_is_resident(layer_idx, group) or (key in self._gpu_group_inflight):
+                if pin:
+                    self._pinned_groups[key] = self._pinned_groups.get(key, 0) + 1
+                return False
+            # 预算守门：把 LRU + inflight 都纳入
+            inflight_cnt = len(self._gpu_group_inflight)
+            if (len(self._gpu_group_lru) + inflight_cnt) >= self.gpu_max_groups:
+                # 尝试立即收缩一次（两轮，最后可 force-unpin）
+                self._shrink_gpu_groups_now(exclude={key})
+                if (len(self._gpu_group_lru) + len(self._gpu_group_inflight)) >= self.gpu_max_groups:
+                    # 仍然没有余量：放弃本次预取
+                    return False
+            # 标记 inflight，并把它放到 LRU 尾部
+            self._gpu_group_inflight[key] = torch.cuda.Event(blocking=False)
+            if key in self._gpu_group_lru:
+                self._gpu_group_lru.remove(key)
+            self._gpu_group_lru.append(key)
+            # 控制 pin 水位
+            if pin:
+                if sum(1 for k,c in self._pinned_groups.items() if c>0) >= self.max_pinned_groups:
+                    pin = False
+                else:
+                    self._pinned_groups[key] = self._pinned_groups.get(key, 0) + 1
 
-        # 可选：pin 住，避免刚预取完就被 LRU 选中
-        if pin:
-            self.pin_group(L, kind, reason=reason)
+        L = int(layer_idx)
+        kind = 'attn' if group == 'attn' else 'ffn'
 
+        # 估算需要的字节，先做 headroom 收敛（必要时两轮、可 force-unpin）
+        need_bytes = 0
+        for suf in suffixes:
+            pname = f"layers.{L}.{suf}"
+            t = None
+            if self.ssd_enabled and (L in self.cpu_cache) and (pname in self.cpu_cache[L]):
+                t = self.cpu_cache[L][pname]
+            elif pname in self.name_to_param:
+                t = self.name_to_param[pname]
+            if t is not None:
+                need_bytes += t.numel() * t.element_size()
+        try:
+            self._ensure_gpu_headroom(need_bytes, exclude={key})
+        except Exception:
+            # 再试一次：强制收缩
+            self._shrink_gpu_groups_now(exclude={key})
+
+        # H2D 限流：拿不到闸门就放弃这次（避免 backlog 雪崩）
+        if not self._h2d_sem.acquire(blocking=False):
+            with self._group_lock:
+                self._gpu_group_inflight.pop(key, None)
+                # 补偿 pin
+                if pin:
+                    c = self._pinned_groups.get(key, 0)
+                    self._pinned_groups[key] = max(0, c-1)
+                    if self._pinned_groups[key] == 0:
+                        self._pinned_groups.pop(key, None)
+            return False
+
+        # 后台线程执行 H2D
         def _task():
             try:
-                # 1) 确保 CPU 层有缓存（后台线程可直接读，不卡主线程）
-                if self.ssd_enabled and (L not in self.cpu_cache):
-                    try:
-                        tmp = self._read_layer_from_ssd(L)   # SSD->pinned DRAM
-                        with self._cpu_lock:
-                            self.cpu_cache[L] = tmp
-                            if L in self._cpu_lru: self._cpu_lru.remove(L)
-                            self._cpu_lru.append(L)
-                    except Exception as e:
-                        if self.verbose: print(f"[WSM][prefetch] SSD read fail L{L}: {e}")
-                        # 不中断，后面可能从模型或别处兜底
-
-                layer_cache = self.cpu_cache.get(L, {})
-
-                # 2) H2D：把本组的所有参数搬上卡（在对应 H2D 流中）
-                h2d = (self.streams.weight_h2d_mha if kind == 'attn'
-                    else self.streams.weight_h2d_ffn)
+                h2d = self._select_h2d_stream_for(module_name=("wq" if group=="attn" else "w1")) or self._copy_stream
                 with torch.cuda.stream(h2d):
-                    for suf in (("attention.wq.weight","attention.wk.weight",
-                                "attention.wv.weight","attention.wo.weight")
-                                if kind == 'attn' else
-                                ("feed_forward.w1.weight","feed_forward.w2.weight",
-                                "feed_forward.w3.weight")):
+                    # SSD→CPU（必要时）
+                    if self.ssd_enabled and (L not in self.cpu_cache):
+                        self._load_layer_to_cpu(L)
+                    # CPU→GPU
+                    layer_cache = self.cpu_cache.get(L, {})
+                    for suf in suffixes:
                         pname = f"layers.{L}.{suf}"
                         src = layer_cache.get(pname)
                         if src is None:
-                            # 传统模式兜底：从模型 CPU 参数 copy（若存在）
                             p = self.name_to_param.get(pname)
                             if p is not None and (p.device.type == "cpu") and p.numel() > 0:
                                 src = p.detach().contiguous().pin_memory()
                         if src is None:
-                            raise RuntimeError(f"CPU cache miss: {pname}")
+                            continue
                         self._move_to_gpu(pname, src, exclude={key})
-
-                        if kind == 'attn' and getattr(self, "kv_offloader", None) is not None:
-                            # window_tokens 缺省 = BLOCK(256)，可按需调大
-                            # 预取完成后会在 KV 的 H2D 流上记录 block ready 事件
-                            try:
-                                # 你在 SelfAttention 里可据 start_pos/seqlen 传参；这里演示最近 256 token：
-                                blocks = self.kv_offloader.plan_tail_window_blocks(start_pos=self._last_kv_pos, seqlen=1)
-                                self.kv_offloader.prefetch_async(layer=L, blocks=blocks, bsz=self.kv_offloader.max_batch,
-                                                                device=self.device)
-                            except Exception:
-                                pass
-
-                    # 3) 组级 ready 事件（在该 H2D 流上记录）
+                    # 记录组级 ready 事件
                     self._record_group_ready_event(L, kind)
-
-                # 4) 并入组 LRU，释放 inflight 标志
+                # 完成：从 inflight 转入 resident
                 with self._group_lock:
-                    if key in self._gpu_group_lru: self._gpu_group_lru.remove(key)
+                    evt_inflight = self._gpu_group_inflight.pop(key, None)
+                    if key in self._gpu_group_lru:
+                        self._gpu_group_lru.remove(key)
                     self._gpu_group_lru.append(key)
-                    self._gpu_group_inflight.pop(key, None)
-
-                # 用 inflight event 告知完成（让已绑定到该 event 的等待也能放行）
-                evt_inflight.record(h2d)
+                # 记录 inflight 事件完成
+                if evt_inflight is not None:
+                    evt_inflight.record(h2d)
 
             except Exception as e:
-                # 失败也要清理在飞标志，避免卡死
-                with self._group_lock:
-                    self._gpu_group_inflight.pop(key, None)
                 if self.verbose:
                     print(f"[WSM][prefetch] failed for {key}: {e}")
-
-        threading.Thread(target=_task, name=f"wsm_pf_{L}_{kind}", daemon=True).start()
+                with self._group_lock:
+                    self._gpu_group_inflight.pop(key, None)
+            finally:
+                try:
+                    self._h2d_sem.release()
+                except Exception:
+                    pass
+        self._bg_submit(_task)
+        return True
     
 
 

@@ -1,4 +1,5 @@
-from typing import List, Dict, Any   
+from typing import List, Dict, Any
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -9,6 +10,11 @@ from .layers import (
     EncoderBlock,
     precompute_theta_pos_frequencies,
 )
+
+@dataclass
+class _RuntimeSwitch:
+    """运行时开关：控制是否使用管线化 forward"""
+    PIPELINED: bool = True   # 可通过外部配置/环境变量控制
 
 
 class Transformer(nn.Module):
@@ -118,7 +124,68 @@ class Transformer(nn.Module):
         self.kv_times: List[float] = [0.0] * args.n_layers
         self.attn_times: List[float] = [0.0] * args.n_layers
 
+    def _forward_pipelined(self, tokens: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """
+        使用 EncoderBlock.forward_async() 的非阻塞接口。
+        注意：由于 L+1 依赖 L 的 out，这里仍是顺序等待上一个 Future，
+        但层内 MHA/FFN 与跨层 H2D 已被重叠，且接口对上层是异步友好的。
+        """
+        dev = str(self.args.device)
+        dtype = getattr(self, "param_dtype", torch.bfloat16)
+
+        # 1) embed：确保 tokens 与 embedding 在同一设备（与原实现一致）
+        embed_dev = self.embed_tokens.weight.device
+        if tokens.device != embed_dev:
+            if tokens.device.type == "cpu" and not tokens.is_pinned():
+                tokens = tokens.pin_memory()
+            tokens = tokens.to(embed_dev, non_blocking=True)
+        if tokens.dtype != torch.long:
+            tokens = tokens.long()
+        h = self.embed_tokens(tokens)
+
+        # 确保后续计算设备/精度
+        if h.device != dev or h.dtype != dtype:
+            h = h.to(device=dev, dtype=dtype, non_blocking=True)
+
+        # 2) freqs 只在设备不一致时搬一次（沿用缓存逻辑）
+        if getattr(self, "_freqs_cached_dev", None) != dev:
+            self._freqs_cached = self.freqs_complex.to(dev, non_blocking=True)
+            self._freqs_cached_dev = dev
+        freqs = self._freqs_cached
+
+        # 3) 逐层，但用 forward_async()（层内与跨层 H2D 重叠已在层内完成）
+        futures = []
+        for idx, info in enumerate(self.layer_infos):
+            blk = info["block"]
+            # 启动本层的异步执行（立即返回 Future）
+            f = blk.forward_async(h, start_pos, freqs)
+            # 由于下一层的输入依赖当前层的 out（数学依赖），此处必须拿结果
+            h = f.result()
+            futures.append(f)
+
+            # 更新性能统计（与原 forward 一致）
+            self.kv_times[idx] = blk.attention.kv_elapsed_time
+            self.attn_times[idx] = blk.attention.attn_time
+
+        h = self.norm(h)
+        out = self.output(h).float()
+        return out
+
     def forward(self, tokens: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """
+        保留原 forward 语义；当开关打开时，走 pipelined 包装（内部仍保证正确性）。
+        """
+        # 检查是否使用管线化模式
+        use_pipe = getattr(self, "_runtime_switch", None)
+        if use_pipe is None:
+            # 首次调用：初始化运行时开关（默认开启管线化）
+            self._runtime_switch = _RuntimeSwitch(PIPELINED=True)
+            use_pipe = self._runtime_switch
+
+        if use_pipe.PIPELINED:
+            return self._forward_pipelined(tokens, start_pos)
+
+        # === 原 forward 的安全版（保持现有逻辑；如需保留，可继续使用）===
         bsz, seqlen = tokens.shape
 
         if hasattr(self.args, 'device') and self.args.device and not self.args.device.startswith('meta'):

@@ -872,6 +872,50 @@ class KVOffloader:
         except Exception as e:
             print(f"[KV][WARN] prefetch submit failed: {e}")
             
+    def prefetch_blocks_async(
+        self,
+        layer_idx: int,
+        blocks: "list[int]",
+        stream: "torch.cuda.Stream | None" = None,
+        bsz: "int | None" = None,
+        device: "str | torch.device | None" = None,
+    ):
+        """
+        触发给定 block 集合的异步预取（SSD/DRAM→GPU），并在 KV H2D 流上记录
+        block 级 CUDA 事件；供 compute 流通过 wait_blocks_ready() 做非阻塞依赖。
+
+        Args:
+            layer_idx: 层索引
+            blocks: 需要预取的 block 索引列表
+            stream: 可选的 CUDA 流（优先使用；否则用 offloader 的 kv_h2d）
+            bsz: 批大小（用于分配 GPU 缓冲区）
+            device: 目标设备（默认为 self.device）
+        """
+        if not blocks:
+            return
+        if not torch.cuda.is_available():
+            return
+
+        # 选流：优先调用方传入；否则用 offloader 的 kv_h2d（如有）
+        s = stream or getattr(self.streams, "kv_h2d", None) if hasattr(self, 'streams') else None
+        if s is None:
+            # 退化到当前流也可工作，但建议总是传入 kv_h2d
+            s = torch.cuda.current_stream()
+
+        # 兼容已有 prefetch_async()（它内部会创建/记录 block 事件到 self._kv_ready_events）
+        try:
+            effective_bsz = bsz if bsz is not None else getattr(self, "max_batch", 1)
+            effective_dev = device if device is not None else getattr(self, "device", "cuda")
+            # 进入 KV H2D 流上下文，让后续记录的事件与数据入队在同一条流
+            with torch.cuda.stream(s):
+                self.prefetch_async(layer=layer_idx, blocks=blocks, bsz=effective_bsz, device=effective_dev)
+        except AttributeError:
+            # 没有 prefetch_async 的老实现：可在这里补上你自己的 SSD/DRAM→GPU copy，并手动记录事件
+            for bid in blocks:
+                e = torch.cuda.Event(blocking=False)
+                e.record(s)
+                self._kv_ready_events[(int(layer_idx), int(bid))] = e
+
     def wait_blocks_ready(self, layer: int, blocks: list[int], stream: "torch.cuda.Stream|None" = None):
         """在给定 stream 上等待若干块的 H2D ready 事件（若存在则等待；没有则直接返回）。"""
         s = stream or torch.cuda.current_stream()

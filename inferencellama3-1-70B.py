@@ -404,7 +404,9 @@ def main():
     # ⭐ 组级 GPU 预取（ahead=4）+ 组预算 + 等水位调度
     # ============================================================
     GPU_AHEAD_LAYERS = 4
-    GPU_MAX_GROUPS   = max(10, 2 + GPU_AHEAD_LAYERS * 2 + 1)  # ≈ 11：当前(2) + 预取(8) + 缓冲(1)
+    # CRITICAL: Reduced from 11 to 6 to reserve ~2-3GB for activation tensors during prefill
+    # 70B model: each group ~400-500MB, 6 groups = ~3GB weights, leaving ~12GB for activations
+    GPU_MAX_GROUPS   = 6  # Reduced to prevent OOM during long-sequence prefill
 
     os.environ.setdefault("WSM_GPU_MAX_GROUPS", str(GPU_MAX_GROUPS))
     os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH", str(GPU_AHEAD_LAYERS))
