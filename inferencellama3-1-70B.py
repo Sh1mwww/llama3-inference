@@ -408,11 +408,12 @@ def main():
     # 70B model: each group ~400-500MB, 6 groups = ~3GB weights, leaving ~12GB for activations
     GPU_MAX_GROUPS   = 6  # Reduced to prevent OOM during long-sequence prefill
 
-    os.environ.setdefault("WSM_GPU_MAX_GROUPS", str(GPU_MAX_GROUPS))
-    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH", str(GPU_AHEAD_LAYERS))
-    os.environ.setdefault("WSM_BALANCE_PREFETCH", "1")
-    os.environ.setdefault("WSM_PAIR_AHEAD", "2")      # 同层→i+1→i+2
-    os.environ.setdefault("WSM_KIND_AHEAD_CAP", "2")  # 单一类型最大前瞻距离
+    os.environ.setdefault("WSM_GPU_MAX_GROUPS",        str(GPU_MAX_GROUPS))
+    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH",  str(GPU_AHEAD_LAYERS))
+    os.environ.setdefault("WSM_GPU_AHEAD",             str(GPU_AHEAD_LAYERS))  # 供 WSM 读取
+    os.environ.setdefault("WSM_BALANCE_PREFETCH",      "1")
+    os.environ.setdefault("WSM_PAIR_AHEAD",            "2")  # (i+1..i+2).ffn 顶补
+    os.environ.setdefault("WSM_KIND_AHEAD_CAP",        "2")
     os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "4")
 
     # 计算结束立刻释放（避免组堆积）
@@ -425,8 +426,10 @@ def main():
     # ============================================================
     # ⭐ 环形 CPU 窗口（SSD -> pinned DRAM，80 层取模）
     # ============================================================
-    CPU_CAP_VALUE    = 40   # i+4..i+4+cap 的 cap
-    CPU_RING_OFFSET  = 4    # 窗口从 i+4 起
+    # CRITICAL FIX: CPU窗口必须从 i+1 开始以覆盖GPU预取需要的层 (i+1..i+4)
+    # 如果offset=4，则窗口是[i+4..i+43]，GPU需要的i+1,i+2,i+3不在窗口内！
+    CPU_CAP_VALUE    = 40   # 窗口大小：40层
+    CPU_RING_OFFSET  = 1    # 窗口从 i+1 起，确保GPU预取的i+1..i+4都在DRAM中
     os.environ.setdefault("WSM_CPU_RING_MODE",     "1")
     os.environ.setdefault("WSM_CPU_RING_OFFSET",   str(CPU_RING_OFFSET))
     os.environ.setdefault("WSM_CPU_CACHE_CAP_LAYERS", str(CPU_CAP_VALUE))
@@ -440,12 +443,16 @@ def main():
 
     # 配置总结
     print("=" * 80)
-    print("🔧 组级 GPU 预取（ahead=4）+ 环形 CPU 窗口")
+    print("🔧 组级 GPU 预取（ahead=4）+ 环形 CPU 窗口 [FIXED VERSION]")
     print("=" * 80)
-    print(f"GPU 预取距离: {GPU_AHEAD_LAYERS} 层")
+    print(f"GPU 预取距离: {GPU_AHEAD_LAYERS} 层 (预取 i+1..i+{GPU_AHEAD_LAYERS})")
     print(f"GPU 组预算:   {GPU_MAX_GROUPS} 组(attn/ffn)")
     print(f"CPU 窗口容量: {CPU_CAP_VALUE} 层 (环形，对 80 层取模)")
-    print(f"CPU 环形偏移: i+{CPU_RING_OFFSET}")
+    print(f"CPU 环形偏移: i+{CPU_RING_OFFSET} ⭐ CRITICAL: 必须覆盖GPU预取层")
+    print(f"CPU 窗口范围: [i+{CPU_RING_OFFSET} .. i+{CPU_RING_OFFSET + CPU_CAP_VALUE - 1}]")
+    print("=" * 80)
+    print(f"⚠️  IMPORTANT: 如果看到此消息但offset={CPU_RING_OFFSET}，说明配置已正确！")
+    print(f"⚠️  如果仍有问题，请检查WSM是否真的加载了新代码")
     print("=" * 80)
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"

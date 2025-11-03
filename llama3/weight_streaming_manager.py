@@ -619,52 +619,90 @@ class WeightStreamingManager:
             plan.append((self._wrap(i + d), 'attn', False))
         return plan
 
-    def pump_gpu_window_prefetch(self, i: int):
-        """
-        非阻塞发起/维持 GPU 窗口：保证 (i,'ffn') + (i+1..i+ahead,'attn') 在 GPU。
-        - 已驻留/在飞则跳过
-        - 预算允许再补 (i+1,'ffn')
-        """
-        # 先用已有 LRU/在飞集合估算空间
-        used = len(self._gpu_group_lru) + len(self._gpu_group_inflight)
-        budget = max(0, self.gpu_max_groups - used - 1)  # 留 1 组余量防抖
-        targets = self._target_gpu_groups_for_i(i)
+    # def pump_gpu_window_prefetch(self, i: int):
+    #     """
+    #     非阻塞发起/维持 GPU 窗口：保证 (i,'ffn') + (i+1..i+ahead,'attn') 在 GPU。
+    #     - 已驻留/在飞则跳过
+    #     - 预算允许再补 (i+1,'ffn')
+    #     """
+    #     # 先用已有 LRU/在飞集合估算空间
+    #     used = len(self._gpu_group_lru) + len(self._gpu_group_inflight)
+    #     budget = max(0, self.gpu_max_groups - used - 1)  # 留 1 组余量防抖
+    #     targets = self._target_gpu_groups_for_i(i)
 
-        # 第一轮：硬性目标
-        for (L, kind, pin) in targets:
-            if not self._group_is_resident(L, kind) and (L, kind) not in self._gpu_group_inflight:
-                self.prefetch_group_async(L, kind, pin=pin, reason="gpu_window")
+    #     # 第一轮：硬性目标
+    #     for (L, kind, pin) in targets:
+    #         if not self._group_is_resident(L, kind) and (L, kind) not in self._gpu_group_inflight:
+    #             self.prefetch_group_async(L, kind, pin=pin, reason="gpu_window")
 
-        # 第二轮：若还有预算，补 (i+1,'ffn')
-        if budget > 0:
-            L1 = self._wrap(i + 1)
-            if not self._group_is_resident(L1, 'ffn') and (L1, 'ffn') not in self._gpu_group_inflight:
-                self.prefetch_group_async(L1, 'ffn', pin=False, reason="topoff_ffn")
+    #     # 第二轮：若还有预算，补 (i+1,'ffn')
+    #     if budget > 0:
+    #         L1 = self._wrap(i + 1)
+    #         if not self._group_is_resident(L1, 'ffn') and (L1, 'ffn') not in self._gpu_group_inflight:
+    #             self.prefetch_group_async(L1, 'ffn', pin=False, reason="topoff_ffn")
+    
+    # -------- GPU window: i.ffn(pin) + (i+1..i+4).attn --------
+    def pump_gpu_window_prefetch(self, current_layer: int) -> None:
+        """Strict GPU window: pin (i,'ffn') + prefetch (i+1..i+gpu_ahead,'attn')."""
+        D = max(1, int(self.gpu_ahead_layers))
+        # pair first (pin)
+        self.prefetch_group_async(current_layer, "ffn", pin=True, reason="pair")
+        # i+1..i+D ATTn
+        for off in range(1, D + 1):
+            nxt = current_layer + off
+            if nxt >= self.n_layers:
+                break
+            self.prefetch_group_async(nxt, "attn", pin=False, reason=f"i+{off}.attn")
+        # 轻量顶补（不改变窗口语义，仅补齐预算空位）
+        try:
+            if hasattr(self, "rebalance_and_topoff"):
+                self.rebalance_and_topoff(current_layer)
+        except Exception:
+            pass
+
+    # -------- CPU DRAM ring window: anchor = i+4, size = 40 --------
+    def _schedule_cpu_ring_async(self, current_layer: int) -> None:
+        """Async schedule a DRAM ring window [i+offset .. i+offset+cap-1] (mod n)."""
+        if not getattr(self, "ssd_enabled", False):
+            if self.verbose:
+                print(f"[WSM DEBUG] _schedule_cpu_ring_async skipped: ssd_enabled=False")
+            return
+        if not self.cpu_ring_mode:
+            if self.verbose:
+                print(f"[WSM DEBUG] _schedule_cpu_ring_async skipped: cpu_ring_mode=False")
+            return
+        nL = int(self.n_layers)
+        if nL <= 0:
+            return
+        anchor = (int(current_layer) + int(self.cpu_ring_offset)) % nL
+        target = set(self._ring_range(anchor, int(self.cpu_cache_cap)))
+        if self.verbose:
+            print(f"[WSM DEBUG] _schedule_cpu_ring_async(L{current_layer}): anchor={anchor}, offset={self.cpu_ring_offset}, target={sorted(list(target))[:10]}...{sorted(list(target))[-3:]}")
+        # 入队缺层 SSD->DRAM（避免重复/inflight）
+        with self.cpu_cache_lock:
+            present = set(self.cpu_cache.keys())
+        missing = [L for L in target if (L not in present)]
+        for L in missing:
+            with self._cpu_lock:
+                if L in self._inflight_cpu_layers:
+                    continue
+                self._inflight_cpu_layers.add(L)
+            try:
+                self._cpu_pf_q.put_nowait((self._epoch, int(L)))
+            except Exception:
+                with self._cpu_lock:
+                    self._inflight_cpu_layers.discard(L)
+                break
+        # 淘汰环外层，保持 DRAM 环窗
+        with self.cpu_cache_lock:
+            for L in list(self.cpu_cache.keys()):
+                if L not in target:
+                    self.cpu_cache.pop(L, None)
+                    if self.verbose:
+                        print(f"[WSM] Evicted CPU cache layer {L} (ring)")
 
 
-    # def _ensure_gpu_headroom(self, required_bytes: int, exclude: set[tuple[int,str]] | None = None):
-    #     """确保有 enough_free ≥ required + guard，不够则逐出（排除 in_use 与 exclude）。"""
-    #     guard = self._gpu_free_guard_mb * 1024 * 1024
-    #     exclude = exclude or set()
-    #     tries = 0
-    #     while True:
-    #         free_now = self._free_gpu_mem_bytes()
-    #         if free_now >= required_bytes + guard:
-    #             return
-    #         # 逐出一个 LRU 组（跳过 in_use 与 exclude）
-    #         if not self._evict_one_group_from_gpu(exclude=exclude):
-    #             # 再清一次缓存；仍不够就抛
-    #             torch.cuda.empty_cache()
-    #             free_now = self._free_gpu_mem_bytes()
-    #             if free_now >= required_bytes + guard:
-    #                 return
-    #             raise torch.cuda.OutOfMemoryError(
-    #                 f"insufficient headroom: need={required_bytes/2**20:.2f}MB "
-    #                 f"free={free_now/2**20:.2f}MB guard={guard/2**20:.2f}MB")
-    #         torch.cuda.empty_cache()
-    #         tries += 1
-    #         if tries > 64:
-    #             raise torch.cuda.OutOfMemoryError("eviction loop exceeded")
+
     def _ensure_gpu_headroom(self, required_bytes: int, exclude: set[tuple[int,str]] | None = None):
         guard = self._gpu_free_guard_mb * 1024 * 1024
         exclude = exclude or set()
@@ -1279,12 +1317,37 @@ class WeightStreamingManager:
         滚动模式下：把 CPU 窗口右移（默认 1 层），从而：
         - 逐出窗口左端（例如刚刚进入计算的层）
         - 把窗口右端的新层从 SSD→DRAM 预取进来
+
+        环形模式下：触发 CPU 环形窗口预取
         """
-        # 没开 SSD 后端或没启用滚动，就不做事，仍更新保留窗口用于 GPU LRU
+        # DEBUG: 诊断为什么环形预取没有被触发
+        if self.verbose and cur_layer % 10 == 0:
+            print(f"[WSM DEBUG] note_compute_advance(L{cur_layer}): ssd_enabled={self.ssd_enabled}, cpu_ring_mode={getattr(self, 'cpu_ring_mode', None)}, cpu_rolling_mode={getattr(self, 'cpu_rolling_mode', None)}")
+
+        # 更新保留窗口用于 GPU LRU
         self._refresh_retain_window(cur_layer)
 
-        if not self.ssd_enabled or not self.cpu_rolling_mode:
-            return
+        # ⭐ FIXED: 支持环形模式
+        if self.ssd_enabled:
+            # 优先使用环形模式（cpu_ring_mode）
+            if getattr(self, "cpu_ring_mode", False):
+                if self.verbose and cur_layer % 10 == 0:
+                    print(f"[WSM DEBUG] Calling _schedule_cpu_ring_async for L{cur_layer}")
+                self._schedule_cpu_ring_async(cur_layer)
+                return
+            # 回退到滚动模式（cpu_rolling_mode）
+            elif getattr(self, "cpu_rolling_mode", False):
+                if self.verbose and cur_layer % 10 == 0:
+                    print(f"[WSM DEBUG] Using rolling mode for L{cur_layer}")
+                pass  # 继续执行下面的滚动逻辑
+            else:
+                if self.verbose and cur_layer % 10 == 0:
+                    print(f"[WSM DEBUG] No CPU prefetch mode enabled")
+                return  # 两种模式都未启用
+        else:
+            if self.verbose and cur_layer % 10 == 0:
+                print(f"[WSM DEBUG] SSD not enabled, skipping CPU prefetch")
+            return  # SSD未启用
 
         # 允许的 window 基准范围：[0 .. max_base]
         max_base = max(0, self.n_layers - self.cpu_cache_cap)
@@ -1910,67 +1973,24 @@ class WeightStreamingManager:
         n = self.n_layers
         return [ (start + k) % n for k in range(count) ]
 
-    # def _pre_hook_factory(self, idx: int):
-    #     def _pre_hook(_module, _inputs):
-    #         # 1) CPU：触达 + 滑窗（保持你现有逻辑）
-    #         self._touch_cpu_layer(idx)
-    #         if self.ssd_enabled:
-    #             self._schedule_cpu_prefetch(idx)
-
-    #         # 2) 组级：等水位 + 就近补齐（在预算内异步发起）
-    #         if self.grouped_mode and self.balance_prefetch:
-    #             used = len(self._gpu_group_lru)
-    #             budget = max(0, self.gpu_max_groups - used - 1)  # 预留1个安全名额
-    #             if budget > 0:
-    #                 plan = self._plan_balanced_groups(idx, budget)
-    #                 for (lid, grp) in plan:
-    #                     try:
-    #                         self.prefetch_group_async(lid, grp)
-    #                     except Exception as e:
-    #                         if self.verbose:
-    #                             print(f"[WSM] Balanced prefetch failed for L{lid}.{grp}: {e}")
-    #         else:
-    #             # 兜底：至少确保当前层在GPU（非组模式）
-    #             self.ensure_on_gpu(idx, wait=True)
-
-    #     return _pre_hook
-    # def _pre_hook_factory(self, idx: int):
-    #     def _pre_hook(_module, _inputs):
-    #         # 1) CPU 侧：仅触达 + 推进“预取游标”，不做任何同步 IO
-    #         self._touch_cpu_layer(idx)
-    #         if self.ssd_enabled:
-    #             # 以前这里是 self._schedule_cpu_prefetch(idx) —— 会触发同步“确保窗口”
-    #             # 现在改为只推进游标，把 IO 投递给后台线程 wsm_cpu_pf
-    #             self._advance_cpu_window_by_compute(idx)
-
-    #         # 2) 组级平衡预取（异步）：保持 attn/ffn 等水位，并在预算内就近补齐
-    #         if self.grouped_mode and self.balance_prefetch:
-    #             used = len(self._gpu_group_lru)
-    #             budget = max(0, self.gpu_max_groups - used - 1)  # 预留 1 个安全名额
-    #             if budget > 0:
-    #                 plan = self._plan_balanced_groups(idx, budget)
-    #                 for (lid, grp) in plan:
-    #                     try:
-    #                         self.prefetch_group_async(lid, grp)
-    #                     except Exception as e:
-    #                         if self.verbose:
-    #                             print(f"[WSM] Balanced prefetch failed for L{lid}.{grp}: {e}")
-    #         else:
-    #             # 兜底：至少确保当前层在GPU（若没开组级）
-    #             self.ensure_on_gpu(idx, wait=True)
-
-    #     return _pre_hook
 
     def _pre_hook_factory(self, idx: int):
         def _pre_hook(_module, _inputs):
-            # 触达 + 推进 CPU 环形窗口（非阻塞，后台线程加载）
+            # 1) 触达：更新 CPU LRU
             self._touch_cpu_layer(idx)
+            # 2) CPU：以 i+offset 为锚的 40 层环窗，异步入队（SSD→DRAM）
             if self.ssd_enabled:
-                self._advance_cpu_window_by_compute(idx)  # 仅入队，不做同步 IO
-
-            # GPU：按 i+4 策略发起组级预取（非阻塞）
+                if getattr(self, "cpu_ring_mode", False):
+                    self._schedule_cpu_ring_async(idx)
+                else:
+                    self._advance_cpu_window_by_compute(idx)
+            # 3) GPU：保证 (i,ffn)(pin) + (i+1…i+ahead).attn 常驻/在飞
+            try:
+                # 在 ATTN→FFN 缝隙保护同层 FFN
+                self.pin_group(idx, "ffn", reason="pair")
+            except Exception:
+                pass
             self.pump_gpu_window_prefetch(idx)
-
         return _pre_hook
 
     def ensure_on_gpu(self, idx: int, wait: bool):
@@ -2165,9 +2185,16 @@ class WeightStreamingManager:
         self._touch_group(layer_idx, group)
         if self.verbose:
             print(f"[WSM] Unmarked group {key} from IN_USE (refcount={self._gpu_group_in_use.get(key, 0)})")
-        # —— 收敛阀门：把 _gpu_group_lru 收回预算（必要时忽略 retain）——
-        # self._shrink_gpu_groups_now(exclude={key})
+        # # —— 收敛阀门：把 _gpu_group_lru 收回预算（必要时忽略 retain）——
+        # # self._shrink_gpu_groups_now(exclude={key})
         
+        # if getattr(self, "evict_finished_group", False):
+        
+        # 额外保护：在 ATTN→FFN 缝隙，避免把同层 FFN 淘汰
+        pair_protect = set()
+        if group == "attn":
+            pair_protect.add((int(layer_idx), "ffn"))
+
         if getattr(self, "evict_finished_group", False):
             try:
                 self._evict_group_immediately(layer_idx, group)
@@ -2180,7 +2207,9 @@ class WeightStreamingManager:
                 print(f"[WSM] Evict-on-finish failed: {e}")
         else:
             # 保持原行为：把刚结束的组排除掉，只收缩"其它组"到上限
-            self._shrink_gpu_groups_now(exclude={key})
+            # self._shrink_gpu_groups_now(exclude={key})
+            self._shrink_gpu_groups_now(exclude={key} | pair_protect)
+ 
             
         if group == 'ffn' and self.ssd_enabled:
             try:
