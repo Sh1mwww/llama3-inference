@@ -406,7 +406,7 @@ def main():
     GPU_AHEAD_LAYERS = 4
     # CRITICAL: Reduced from 11 to 6 to reserve ~2-3GB for activation tensors during prefill
     # 70B model: each group ~400-500MB, 6 groups = ~3GB weights, leaving ~12GB for activations
-    GPU_MAX_GROUPS   = 6  # Reduced to prevent OOM during long-sequence prefill
+    GPU_MAX_GROUPS   = 10  # Reduced to prevent OOM during long-sequence prefill
 
     os.environ.setdefault("WSM_GPU_MAX_GROUPS",        str(GPU_MAX_GROUPS))
     os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH",  str(GPU_AHEAD_LAYERS))
@@ -417,11 +417,14 @@ def main():
     os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "4")
 
     # 计算结束立刻释放（避免组堆积）
-    os.environ.setdefault("WSM_EVICT_FINISHED", "1")  # ← 修正为 1（你的草稿里误写成了 0）
-    os.environ.setdefault("WSM_GRP_RETAIN_MS", "3")   # 极短保留窗口
+    os.environ.setdefault("WSM_EVICT_FINISHED", "1")
+    os.environ.setdefault("WSM_GRP_RETAIN_MS", "0")   # ⭐ 设为 0：无人使用时立即可驱逐
 
     # 跳过预加载等待：边跑边滚动预取
     os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT", "1")
+
+    # ⭐ 调试开关：用于验证驱逐是否正常工作
+    os.environ.setdefault("WSM_DEBUG_PREFETCH", "1")  # 打印预取/驱逐细节
 
     # ============================================================
     # ⭐ 环形 CPU 窗口（SSD -> pinned DRAM，80 层取模）
@@ -493,6 +496,9 @@ def main():
     # 绑定 WSM 补丁
     wsm = getattr(llama, "weight_streaming_manager", None)
     if wsm is not None:
+        # ⭐ 关键：先保存原始方法，避免递归调用！
+        wsm._original_wait_group_ready = wsm.wait_group_ready
+        # 然后用 patch 版本替换
         wsm.wait_group_ready     = types.MethodType(_patched_wait_group_ready, wsm)
         wsm._ensure_module_on_gpu = types.MethodType(_patched_ensure_module_on_gpu, wsm)
         print("[WSM PATCH] strict group-ready + CPU stub loader enabled")

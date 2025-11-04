@@ -70,4 +70,5 @@ Thumbs.db
 # Data and cache
 /data/
 /cache/
-/checkpoints/
+/checkpoints/history/
+history1/

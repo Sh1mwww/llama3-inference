@@ -573,9 +573,12 @@ class KVOffloader:
             d2h_evt = torch.cuda.Event(blocking=False)
             d2h_evt.record(stream)
             try:
-                self._pack_queue.put((layer, blk, d2h_evt), timeout=0.5)
+                self._pack_queue.put_nowait((layer, blk, d2h_evt))
             except Full:
-                print(f"[KV][WARN] pack queue full, drop mirror @L{layer} B{blk}")
+                # 丢弃镜像，不要阻塞前向线程
+                if getattr(KVCacheArgs, "verbose_pool", False):
+                    print(f"[KV][WARN] drop mirror (pack queue full) @L{layer} B{blk}")
+
 
         
     # kv_offload.py 内（类 KVOffloader）
@@ -642,7 +645,21 @@ class KVOffloader:
                     _on_done(None)
         threading.Thread(target=_spill_job, daemon=True).start()
 
-        
+        # 在 KVOffloader 类中追加
+    def prefetch_for_next_layer(self, *, current_layer: int, start_pos: int, seqlen: int,
+                                bsz: int, window_tokens: int = BLOCK):
+        """
+        为“下一层”的解码提前拉起最近窗口的历史 KV（SSD->DRAM->HBM），纯异步。
+        """
+        if self.layers <= 0:
+            return
+        nxt = min(int(current_layer) + 1, int(self.layers) - 1)
+        # 下一层会访问到的“尾窗”块（以当前已写入的末尾 token 为界）
+        end_pos = int(start_pos) + int(seqlen)  # 已完成到的最后 token 的下一位置
+        blocks = self.plan_tail_window_blocks(end_pos - 1, 1, window_tokens=window_tokens)
+        if blocks:
+            self.prefetch_async(layer=nxt, blocks=blocks, bsz=int(bsz), device=self.device)
+
 
     def ensure_on_gpu(self, layer_idx: int, start_pos: int, k_cur: torch.Tensor, v_cur: torch.Tensor):
         """
@@ -693,62 +710,7 @@ class KVOffloader:
 
         return k_cur, v_cur
 
-    # def fetch(self, layer: int, blocks: torch.Tensor, batch_idx: int = 0, bsz: int | None = None):
-    #     """
-    #     Return concatenated K/V for the given **unique** block indices (ascending).
-    #     返回给定唯一块索引（升序）的拼接 K/V。
-    #     If blocks are on SSD, load them back to DRAM first; then transfer DRAM→HBM.
-    #     如果块在 SSD 上，首先将它们加载回 DRAM；然后传输 DRAM→HBM。
-
-    #     Returns:
-    #         K, V of shape: (bsz, heads, sum(blocks)*BLOCK, dim) on GPU
-    #         形状为 (bsz, heads, sum(blocks)*BLOCK, dim) 的 K, V 在 GPU 上
-
-    #     Ensures:
-    #         - All returned tensors are on CUDA (prevents CPU/CUDA device mismatch in attention)
-    #         - 所有返回的张量都在 CUDA 上（防止注意力计算中的 CPU/CUDA 设备不匹配）
-    #     """
-    #     uniq = blocks.to(torch.long).unique(sorted=True).tolist()  # Ensure correct dtype / 确保正确的数据类型
-
-    #     # SSD → DRAM for needed blocks / SSD → DRAM 加载需要的块
-    #     need_load = [b for b in uniq if self.on_ssd[layer][b]]
-    #     for b in need_load:
-    #         self._load_from_ssd(layer, b)
-
-    #     # DRAM → HBM copy (batched across blocks) on H2D stream
-    #     # DRAM → HBM 拷贝（批量跨块）在 H2D 流上
-    #     use_bsz = int(bsz) if bsz is not None else self.max_batch
-    #     k_parts, v_parts = [], []
-    #     stream = self.h2d_stream or torch.cuda.current_stream()
-    #     with torch.cuda.stream(stream):
-    #         for b in uniq:
-    #             if self.k_cpu[layer][b] is None:
-    #                 raise RuntimeError(f"[KVOffloader] block {b} not pushed (layer {layer})")
-    #             k_parts.append(self.k_cpu[layer][b][:use_bsz].to(self.device, non_blocking=True))
-    #             v_parts.append(self.v_cpu[layer][b][:use_bsz].to(self.device, non_blocking=True))
-
-    #     # Wait for transfer to complete on current stream
-    #     # 等待当前流上的传输完成
-    #     if stream is not torch.cuda.current_stream():
-    #         torch.cuda.current_stream().wait_stream(stream)
-
-    #     # Concatenate along token dimension (dim=2)
-    #     # 在 token 维度（dim=2）上拼接
-    #     k_full = torch.cat(k_parts, dim=2)
-    #     v_full = torch.cat(v_parts, dim=2)
-
-    #     # ============================================================
-    #     # 确保返回的 K/V 在 CUDA 上（防止 CPU/CUDA 设备不匹配）
-    #     # Ensure returned K/V are on CUDA (prevent CPU/CUDA device mismatch)
-    #     # ============================================================
-    #     if k_full.device.type != "cuda":
-    #         k_full = k_full.to(self.device, non_blocking=True)
-    #     if v_full.device.type != "cuda":
-    #         v_full = v_full.to(self.device, non_blocking=True)
-
-    #     return k_full, v_full
-    
-    # 替换：fetch() —— 优先消费“已预取的 GPU 暂存 + 事件”，否则回落到同步路径
+   
     def fetch(self, layer: int, blocks: torch.Tensor, batch_idx: int = 0, bsz: int | None = None):
         uniq = blocks.to(torch.long).unique(sorted=True).tolist()
         try:

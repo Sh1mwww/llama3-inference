@@ -276,90 +276,27 @@ def _patched_wait_group_ready(self, layer_idx: int, group: str, compute_stream=N
     """
     等待 (layer_idx, group) 组就绪；事件结束后**二次校验**是否真在 GPU。
     若仍不在，则强制同步 ensure_group_on_gpu()。
+
+    ⭐ 双保险：decoder 切换检测（从高层回到 layer 0 且还没 prime 过）
     """
-    kind = 'attn' if group == 'attn' else 'ffn'
-    key  = (int(layer_idx), kind)
-
-    # 0) 快路径：已驻留
-    try:
-        if self._group_is_resident(*key):
-            return
-    except Exception:
-        pass
-
-    # 1) 若有 inflight 事件：等待
-    evt = self._gpu_group_inflight.get(key)
-    if evt is not None:
-        if compute_stream is not None:
-            # 兼容 threading.Event / torch.cuda.Event
-            _t0 = time.perf_counter()
-            try:
-                if hasattr(evt, "wait"):  # threading.Event
-                    evt.wait()
-                else:
-                    compute_stream.wait_event(evt)
-            except Exception:
-                try:
-                    evt.synchronize()
-                except Exception:
-                    pass
-            finally:
-                if G_PERF is not None:
-                    G_PERF.add_host_io_wait((time.perf_counter()-_t0)*1000.0)
-        else:
-            _t0 = time.perf_counter()
-            try:
-                if hasattr(evt, "wait"):
-                    evt.wait()
-                else:
-                    evt.synchronize()
-            except Exception:
-                pass
-            finally:
-                if G_PERF is not None:
-                    G_PERF.add_host_io_wait((time.perf_counter()-_t0)*1000.0)
-
-        # 从 inflight 转常驻
-        with self._group_lock:
-            self._gpu_group_inflight.pop(key, None)
-            if key not in self._gpu_group_lru:
-                self._gpu_group_lru.append(key)
-        if getattr(self, "verbose", False):
-            print(f"[WSM] H2D completed for {key}")
-
-        # ★ 关键：事件完成后再次校验；不在就同步兜底搬运
-        if not self._group_is_resident(*key, wait_for_event=True):
+    # ===== 双保险：decoder 切换检测 =====
+    # 检测从"高层回到 0"且还没 prime 过 → 说明进入 decoder 阶段
+    if layer_idx == 0 and not getattr(self, "_decoder_prime_done", False):
+        last_layer = getattr(self, "_last_executed_layer", -1)
+        if last_layer > 0 and hasattr(self, "_prime_decoder_window"):
             if getattr(self, "verbose", False):
-                print(f"[WSM] Ready event done but {key} not resident; forcing sync ensure")
-            self.ensure_group_on_gpu(layer_idx, kind)
-        return
-
-    # 2) 若只记录了 CUDA 事件：把 compute_stream 挂到事件上
-    cuda_evt = self._group_ready_events.get(key)
-    if cuda_evt is not None:
-        try:
-            dev_obj = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
-            s = compute_stream or torch.cuda.current_stream(dev_obj)
-            _t0 = time.perf_counter()
-            s.wait_event(cuda_evt)
-        except Exception:
+                print(f"[WSM FAILSAFE] Detected decoder start (L{last_layer}→L0); priming now")
             try:
-                cuda_evt.synchronize()
-            except Exception:
-                pass
-        finally:
-            if G_PERF is not None:
-                G_PERF.add_host_io_wait((time.perf_counter()-_t0)*1000.0)
+                self._prime_decoder_window(first_n=4)
+                self._decoder_prime_done = True
+            except Exception as e:
+                if getattr(self, "verbose", False):
+                    print(f"[WSM FAILSAFE] Failed to prime decoder: {e}")
+    # ===============================================
 
-        # 再次校验
-        if not self._group_is_resident(*key, wait_for_event=True):
-            if getattr(self, "verbose", False):
-                print(f"[WSM] CUDA event existed but {key} not resident; forcing sync ensure")
-            self.ensure_group_on_gpu(layer_idx, kind)
-        return
-
-    # 3) 没有任何可等待对象：直接兜底同步加载
-    self.ensure_group_on_gpu(layer_idx, kind)
+    # 原始等待逻辑：调用原始的（未被 patch 的）wait_group_ready
+    # 注意：_original_wait_group_ready 会在 patch 时保存
+    return self._original_wait_group_ready(layer_idx, group, compute_stream=compute_stream)
 
 
 def _patched_ensure_module_on_gpu(self, m: torch.nn.Module, layer_idx: int | None = None, module_name: str | None = None):
@@ -786,7 +723,7 @@ def main():
     os.environ.setdefault("WSM_BALANCE_PREFETCH", "1")
     os.environ.setdefault("WSM_PAIR_AHEAD", "2")      # 同层→i+1→i+2
     os.environ.setdefault("WSM_KIND_AHEAD_CAP", "2")  # 单一类型最大前瞻距离
-    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "4")
+    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "12")
 
     # 计算结束立刻释放（避免组堆积）
     os.environ.setdefault("WSM_EVICT_FINISHED", "1")  # ← 修正为 1（你的草稿里误写成了 0）
@@ -871,6 +808,9 @@ def main():
     # 绑定 WSM 补丁
     wsm = getattr(llama, "weight_streaming_manager", None)
     if wsm is not None:
+        # ⭐ 关键：先保存原始方法，避免递归调用！
+        wsm._original_wait_group_ready = wsm.wait_group_ready
+        # 然后用 patch 版本替换
         wsm.wait_group_ready     = types.MethodType(_patched_wait_group_ready, wsm)
         wsm._ensure_module_on_gpu = types.MethodType(_patched_ensure_module_on_gpu, wsm)
         print("[WSM PATCH] strict group-ready + CPU stub loader enabled")
