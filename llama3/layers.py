@@ -373,7 +373,7 @@ class SelfAttention(nn.Module):
         self.layer_id = -1
         self.attention_history = []  # 用于分析注意力模式
         self.qkv_buffer = None
-        self.scores_buffer = None
+        # scores_buffer 已移除 - Flash Attention 不需要预分配 [B,H,T,T] 矩阵
         # self.streams = streams  # 保存streams引用用于compute
         
     def _get_causal_mask(self, t: int, device):
@@ -454,58 +454,54 @@ class SelfAttention(nn.Module):
         wm.ensure_weights_cuda(self.layer_id, modules, priority=True)
 
     def _allocate_buffers(self, batch_size: int, seq_len: int, max_kv_len: int):
-        if (self.qkv_buffer is None or 
-            self.qkv_buffer[0].size(0) < batch_size or 
+        """
+        ⚠️ 此方法目前未被使用（已改用 Flash Attention）
+        使用 scaled_dot_product_attention 后，不再需要预分配 attention scores buffer
+        Flash Attention 内部使用 kernel fusion，避免物化 [B,H,T,T] 矩阵
+
+        保留此方法仅用于向后兼容，如果需要回退到手写 attention 可以参考
+        """
+        if (self.qkv_buffer is None or
+            self.qkv_buffer[0].size(0) < batch_size or
             self.qkv_buffer[0].size(1) < seq_len):
-            
+
             with cuda_timer("memory_alloc_us", self.layer_id):
-                MAX_BUFFER_ELEMENTS = 50_000_000  # 约100MB for float16
+                # 注意：使用 Flash Attention 后，不再需要 scores_buffer
+                # 以下代码仅分配 QKV buffers（如果需要）
                 q_elements = batch_size * seq_len * self.n_heads_q * self.head_dim
                 kv_elements = batch_size * seq_len * self.n_kv_heads * self.head_dim
-                scores_elements = batch_size * self.n_heads_q * seq_len * max_kv_len
-                if scores_elements > MAX_BUFFER_ELEMENTS:
-                    logger.warning(f"Large attention buffer requested ({scores_elements} elements), limiting to prevent OOM")
-                    safe_kv_len = MAX_BUFFER_ELEMENTS // (batch_size * self.n_heads_q * seq_len)
-                    max_kv_len = min(max_kv_len, max(safe_kv_len, 1024))  # 至少保留1024
-                    scores_elements = batch_size * self.n_heads_q * seq_len * max_kv_len
-                    self.use_chunked_attention = True
-                else:
-                    self.use_chunked_attention = False
-                
+
                 try:
                     from .memory_manager import GlobalMemoryManager
                     memory_manager = GlobalMemoryManager.get_instance()
                     if memory_manager:
-                        total_bytes = (q_elements + 2 * kv_elements + scores_elements) * 2  # float16
+                        # 只计算 QKV 的内存需求（不包括 scores）
+                        total_bytes = (q_elements + 2 * kv_elements) * 2  # float16
                         if not memory_manager.can_allocate(total_bytes):
                             # 尝试清理内存
                             if hasattr(self, 'qkv_buffer') and self.qkv_buffer:
                                 del self.qkv_buffer
-                            if hasattr(self, 'scores_buffer') and self.scores_buffer:
-                                del self.scores_buffer
                             torch.cuda.empty_cache()
-                            
+
                             if not memory_manager.can_allocate(total_bytes):
                                 raise RuntimeError(f"Insufficient GPU memory: need {total_bytes/(1024**3):.2f}GB")
                 except ImportError:
                     pass  # memory_manager not available
-                
+
                 try:
-                    # QKV buffer
+                    # QKV buffer (如果需要)
                     q_shape = (batch_size, seq_len, self.n_heads_q, self.head_dim)
                     kv_shape = (batch_size, seq_len, self.n_kv_heads, self.head_dim)
-                    
+
                     self.qkv_buffer = (
                         torch.empty(q_shape, dtype=torch.float16, device=self.device),
                         torch.empty(kv_shape, dtype=torch.float16, device=self.device),
                         torch.empty(kv_shape, dtype=torch.float16, device=self.device)
                     )
-                    # Attention scores buffer
-                    scores_shape = (batch_size, self.n_heads_q, seq_len, max_kv_len)
-                    self.scores_buffer = torch.empty(scores_shape, dtype=torch.float16, device=self.device)
-                    
+                    # ✅ scores_buffer 已移除 - Flash Attention 不需要显式分配
+
                 except torch.cuda.OutOfMemoryError as e:
-                    logger.error(f"GPU OOM during buffer allocation: batch={batch_size}, seq={seq_len}, kv_len={max_kv_len}")
+                    logger.error(f"GPU OOM during buffer allocation: batch={batch_size}, seq={seq_len}")
                     torch.cuda.empty_cache()
                     raise RuntimeError(f"GPU OOM: Cannot allocate attention buffers. Try reducing batch_size (current: {batch_size}) or max sequence length.") from e
     
@@ -759,22 +755,31 @@ class SelfAttention(nn.Module):
 
             k_full = k_full.to(q.dtype)
             v_full = v_full.to(q.dtype)
-            # 重复KV头以匹配查询头数
+            # 重复KV头以匹配查询头数（使用零拷贝视图扩展，避免物理复制）
             # if self.n_heads_q != self.n_kv_heads:
             if (self.n_heads_q != self.n_kv_heads) and (k_full.size(1) != self.n_heads_q):
-                k_full = k_full.repeat_interleave(self.n_rep, dim=1)
-                v_full = v_full.repeat_interleave(self.n_rep, dim=1)
+                # 旧方式（物理复制）：
+                # k_full = k_full.repeat_interleave(self.n_rep, dim=1)
+                # v_full = v_full.repeat_interleave(self.n_rep, dim=1)
+
+                # 新方式（零拷贝）：(B,Hkv,Tk,D) -> (B,Hkv,1,Tk,D) -> (B,Hkv,n_rep,Tk,D) -> (B,Hq,Tk,D)
+                k_full = k_full.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1)\
+                               .reshape(bsz, self.n_heads_q, k_full.size(2), self.head_dim)
+                v_full = v_full.unsqueeze(2).expand(-1, -1, self.n_rep, -1, -1)\
+                               .reshape(bsz, self.n_heads_q, v_full.size(2), self.head_dim)
         
             # 确保缓冲区足够大
             q = q.transpose(1, 2)  # (B, H, Tq, D)
 
-            # 在进入注意力计算前为 workspace 预留显存余量（避免 softmax/归约瞬时 OOM）
+            # 在进入注意力计算前为 workspace 预留显存余量
+            # 注意：使用 Flash Attention 后，workspace 需求大幅降低（无需物化 [B,H,T,T]）
             wm = getattr(self, "weight_manager", None)
             if wm is not None and hasattr(wm, "ensure_headroom_mb"):
                 try:
-                    extra_headroom_mb = int(os.getenv("ATTN_WORKSPACE_HEADROOM_MB", "256"))
+                    # 默认 64 MB（Flash Attention 只需少量 workspace）
+                    extra_headroom_mb = int(os.getenv("ATTN_WORKSPACE_HEADROOM_MB", "64"))
                 except Exception:
-                    extra_headroom_mb = 256
+                    extra_headroom_mb = 64
                 # 避免误逐出当前层 attn 组
                 excl = {(self.layer_id, "attn")}
                 wm.ensure_headroom_mb(extra_headroom_mb, exclude=excl)
@@ -782,6 +787,14 @@ class SelfAttention(nn.Module):
             # Attention计算 - 使用compute stream
             nvtx.range_push(f"layer_{self.layer_id}_attention_compute")
             do_profile_gpu = bool(self.enable_profiling and x.is_cuda)
+
+            # 🔥 使用 Flash Attention - 统一使用旧 API（更稳定）
+            # 注意：PyTorch 2.4+ 的新 API (torch.nn.attention.sdpa_kernel) 参数不同
+            # 为了兼容性，统一使用 torch.backends.cuda.sdp_kernel
+            is_causal = hasattr(self, 'apply_causal_mask') and self.apply_causal_mask
+            from torch.backends.cuda import sdp_kernel as sdpa_kernel
+            sdpa_ctx = sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
+
             if compute_stream:
                 with torch.cuda.stream(compute_stream):
                     with cuda_timer("attn_us", self.layer_id):
@@ -791,19 +804,11 @@ class SelfAttention(nn.Module):
                             attn_evt_end = torch.cuda.Event(enable_timing=True)
                             attn_evt_start.record()
 
-                        scores = torch.matmul(q, k_full.transpose(2, 3))
-                        scores = scores / math.sqrt(self.head_dim)
-
-                        # causal mask
-                        if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
-                            seq_len_q = q.size(2)
-                            seq_len_k = k_full.size(2)
-                            mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
-                            scores = scores.masked_fill(mask.bool(), float('-inf'))
-
-                        # Softmax和输出计算
-                        attn_weights = torch.softmax(scores, dim=-1)
-                        out = torch.matmul(attn_weights, v_full)
+                        # 避免物化 [B,H,T,T] 的 scores/attn_weights
+                        with sdpa_ctx:
+                            out = torch.nn.functional.scaled_dot_product_attention(
+                                q, k_full, v_full, attn_mask=None, dropout_p=0.0, is_causal=is_causal
+                            )
 
                         if do_profile_gpu:
                             attn_evt_end.record()
@@ -821,29 +826,11 @@ class SelfAttention(nn.Module):
                         attn_evt_end = torch.cuda.Event(enable_timing=True)
                         attn_evt_start.record()
 
-                    scores = torch.matmul(q, k_full.transpose(2, 3))
-                    scores = scores / math.sqrt(self.head_dim)
-
-                    # causal mask
-                    if hasattr(self, 'apply_causal_mask') and self.apply_causal_mask:
-                        seq_len_q = q.size(2)
-                        seq_len_k = k_full.size(2)
-                        # mask = torch.triu(torch.ones(seq_len_q, seq_len_k, device=q.device), diagonal=1)
-                        # # scores = scores.masked_fill(mask.bool(), float('-inf'))
-                    
-                        # mask = self._get_causal_mask(scores.size(-1), device=scores.device)
-                        seq_len_q = q.size(2)
-                        seq_len_k = k_full.size(2)
-                        delta = max(0, seq_len_k - seq_len_q)
-                        mask = torch.triu(torch.ones((seq_len_q, seq_len_k), dtype=torch.bool, device=q.device),
-                                        diagonal=1 + delta)
-                        scores = scores.masked_fill(mask, float('-inf'))
-                    
-
-
-                    # Softmax和输出计算
-                    attn_weights = torch.softmax(scores, dim=-1)
-                    out = torch.matmul(attn_weights, v_full)
+                    # 避免物化 [B,H,T,T] 的 scores/attn_weights
+                    with sdpa_ctx:
+                        out = torch.nn.functional.scaled_dot_product_attention(
+                            q, k_full, v_full, attn_mask=None, dropout_p=0.0, is_causal=is_causal
+                        )
 
                     if do_profile_gpu:
                         attn_evt_end.record()
@@ -854,45 +841,8 @@ class SelfAttention(nn.Module):
                     else:
                         self.attn_time = 0
             nvtx.range_pop()  # attention_compute
-            # out = out.transpose(1, 2).reshape(bsz, seqlen, -1)
-        
-            # stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
-            # self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
-            # self.attn_time       = stats.get("attn_us",     0)
-        
-            # # Update block importances (only if offloader exists)
-            # if getattr(self, "offloader", None) is not None:
-            #     with torch.no_grad():
-            #         token_imp = attn_weights.mean(dim=(0, 1, 2))  # (Tkv,)
-            #         block_scores = []
-            #         for i, _ in enumerate(blocks):
-            #             s = i * self.block_sz
-            #             e = min(s + self.block_sz, token_imp.size(0))
-            #             score = self._safe_item_sum_1d(token_imp, s, e)
-            #             block_scores.append(score)
 
-            #         self.offloader.update_importances(self.layer_id, blocks, block_scores, batch_idx=batch_idx)
-
-            # feat = self.n_heads_q * self.head_dim  # = dim
-            # if out.dim() == 2:
-            #     # 误展平成 [B, seqlen*dim] 的情形：还原成 [B, seqlen, dim]
-            #     out = out.view(bsz, seqlen, self.n_heads_q, self.head_dim).reshape(bsz, seqlen, feat)
-            # elif out.dim() == 3 and out.size(-1) != feat:
-            #     # 例如被写成 view(bsz, -1) 合并了最后两维
-            #     out = out.reshape(bsz, seqlen, feat)
-
-            # # 输出投影 - 使用compute stream
-            # if compute_stream:
-            #     with torch.cuda.stream(compute_stream):
-            #         result = self.wo(out)
-            # else:
-            #     result = self.wo(out)
-
-            # total_time = (time.time() - start_time) * 1000000  # 转换为微秒
-            # PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
-            # print(f"[ATTN] Layer {self.layer_id} computation done")
-            # return result
-        
+            # 转换回 [B, T, H, D] 格式
             out = out.transpose(1, 2).contiguous()
 
             # --- 统计信息（若有） ---
@@ -905,45 +855,10 @@ class SelfAttention(nn.Module):
             B, Tq = bsz, seqlen
             w = self.wo.weight
         
-            # 重要度统计（可选）：仅在显式开启且显存充足时计算（避免 reduce 操作引发 OOM）
-            if getattr(self, "offloader", None) is not None:
-                # 使用统一的调试开关（默认关闭，避免额外显存占用）
-                enable_imp = os.getenv("LLM_ATTN_DEBUG_TOKEN_IMP", "0") == "1"
-                if enable_imp and ('attn_weights' in locals()) and (attn_weights is not None) \
-                   and not getattr(attn_weights, "is_meta", False):
-                    # 仅在空闲显存充足时才做，避免瞬时 OOM
-                    try:
-                        min_free_mb = int(os.getenv("KV_IMPORTANCE_MIN_FREE_MB", "512"))
-                    except Exception:
-                        min_free_mb = 512
-                    try:
-                        with torch.cuda.device(x.device):
-                            free_b, _ = torch.cuda.mem_get_info()
-                    except Exception:
-                        free_b = 0
-                    if free_b >= (min_free_mb * 1024 * 1024):
-                        with torch.no_grad():
-                            # 避免额外放大：先转 fp16 再做 mean，并且不保留中间张量
-                            token_imp = attn_weights.to(torch.float16).mean(dim=(0, 1, 2))  # (Tkv,)
-                            if 'blocks' not in locals() or blocks is None:
-                                Tkv = int(token_imp.size(0))
-                                nblk = (Tkv + self.block_sz - 1) // self.block_sz
-                                blocks = [(i*self.block_sz, min((i+1)*self.block_sz, Tkv)) for i in range(nblk)]
-                            block_scores = []
-                            for i, _ in enumerate(blocks):
-                                s = i * self.block_sz
-                                e = min(s + self.block_sz, token_imp.size(0))
-                                score = self._safe_item_sum_1d(token_imp, s, e) if hasattr(self, "_safe_item_sum_1d") \
-                                        else float(token_imp[s:e].sum().detach().cpu().item())
-                                block_scores.append(score)
-                            self.offloader.update_importances(self.layer_id, blocks, block_scores,
-                                                              batch_idx=locals().get("batch_idx", 0))
-                    # 显存不足则静默跳过（不影响正确性）
-                # 若完全不需要，尽早释放注意力矩阵减小峰值
-                try:
-                    del attn_weights
-                except Exception:
-                    pass
+            # ⚠️ 注意：使用 Flash Attention 后，attn_weights 不再物化
+            # 重要度统计功能已被禁用，因为 scaled_dot_product_attention 不返回权重矩阵
+            # 这是内存优化的预期行为：避免物化 [B,H,T,T] 的巨大矩阵
+            # 如果需要 token importance 统计，需要使用其他方法（例如梯度、探针等）
                     
                     
             # --- 形状护栏：确保送入 wo 前为 [B, seqlen, dim] ---
@@ -1308,16 +1223,18 @@ class FeedForward(nn.Module):
             if compute_stream:
                 with torch.cuda.stream(compute_stream):
                     with cuda_timer("ffn_us", self.layer_id):
-                        gate = self.w1(x)
-                        up   = self.w3(x)
-                        hidden = F.silu(gate) * up
-                        result = self.w2(hidden)
+                        gate = self.w1(x)         # (B,T,28672)
+                        up   = self.w3(x)         # (B,T,28672)
+                        gate = F.silu(gate, inplace=True)       # in-place：覆盖 gate
+                        up.mul_(gate)             # in-place：up 直接变成 hidden
+                        result  = self.w2(up)        # 仅两块大张量存活
             else:
                 with cuda_timer("ffn_us", self.layer_id):
-                    gate = self.w1(x)
-                    up   = self.w3(x)
-                    hidden = F.silu(gate) * up
-                    result = self.w2(hidden)
+                    gate = self.w1(x)         # (B,T,28672)
+                    up   = self.w3(x)         # (B,T,28672)
+                    gate = F.silu(gate, inplace=True)       # in-place：覆盖 gate
+                    up.mul_(gate)             # in-place：up 直接变成 hidden
+                    result  = self.w2(up)        # 仅两块大张量存活
 
             # 通知：FFN 组计算完成（便于组级 LRU 收缩/回收）
             if wm and hasattr(wm, "notify_group_compute_done"):

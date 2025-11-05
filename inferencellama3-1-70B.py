@@ -2,16 +2,31 @@
 # -*- coding: utf-8 -*-
 
 """
-基于 test_70b_prefill_ssd.py 的完整推理脚本：
-- 维持相同的运行时配置（WSM/SSD 流式权重、KV 池、env 等）
-- 将生成长度改为 max_gen_len=32，并真正 decode 输出文本
-- 按需求：在计算第 i 层时，保证 i+1..i+4 的组级权重已在 GPU（事件就绪，无阻塞等待）；
-  DRAM 侧维持 i+4 .. i+4+cap 的环形窗口（对 80 层取模）
+Llama3.1-70B 推理 + 轻量级 Profiler（JSON/CSV 自动写入固定目录）
+- 记录会影响 inference 的关键路径用时（prefill / decode per-token / e2e / FTL 近似 / 吞吐）
+- 同时记录不会影响 inference 的准备/探针/日志时间（non_inference 类别）
+- 对 WSM 两个关键函数（wait_group_ready / _ensure_module_on_gpu）做埋点统计
+- 采用 CUDA Events 逐 token 计时，统一同步，尽量低扰动
+- 生成结果固定写入 LOG_DIR，自动输出 JSON + CSV 两种格式
 """
 
 import os
 from pathlib import Path
+import types
+import json, csv, uuid, platform, math, time, re
+from datetime import datetime, timezone
+from contextlib import contextmanager, nullcontext
+
+# 🔥 CUDA 内存分配器配置（必须在 import torch 之前）
+# expandable_segments 与异步流操作可能有冲突，暂时禁用
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # 限制分块大小，减少碎片
+
 import torch
+
+# ===== 你可以改这里：日志输出目录 & 运行标签（可留空） =====
+LOG_DIR = Path("/home/roger/llama3-inference/logs")   # 自动创建
+RUN_TAG = ""                                          # 例如 "ablation-a1"；留空则自动仅用 run_id
 
 # ===== 项目内模块 =====
 from llama3.generator import LLaMA
@@ -45,193 +60,206 @@ def _debug_build(*args, **kw):
 
 _gen.LLaMA.build = staticmethod(_debug_build)
 
-# ===== WSM runtime monkey-patch: strict ready + CPU stub loader =====
-import types
+# ======= 轻量级 Profiler（低扰动；CUDA Events；保存 JSON/CSV） =======
+PROFILER = None  # 全局句柄
 
-def _patched_wait_group_ready(self, layer_idx: int, group: str, compute_stream=None):
-    """
-    等待 (layer_idx, group) 组就绪；事件结束后**二次校验**是否真在 GPU。
-    若仍不在，则强制同步 ensure_group_on_gpu()。
-    """
-    kind = 'attn' if group == 'attn' else 'ffn'
-    key  = (int(layer_idx), kind)
+def _now_utc():
+    return datetime.now(timezone.utc).isoformat()
 
-    # 0) 快路径：已驻留
-    try:
-        if self._group_is_resident(*key):
-            return
-    except Exception:
-        pass
+def _flatten_extras(extras: dict):
+    out = {}
+    for k,v in (extras or {}).items():
+        out[k] = v if (isinstance(v,(int,float,str,bool)) or v is None) else str(v)
+    return out
 
-    # 1) 若有 inflight 事件：等待
-    evt = self._gpu_group_inflight.get(key)
-    if evt is not None:
-        if compute_stream is not None:
-            # 兼容 threading.Event / torch.cuda.Event
+class InferenceProfiler:
+    def __init__(self, run_name: str | None = None):
+        self.run_id   = run_name or f"run-{uuid.uuid4().hex[:8]}"
+        self.t0_ns    = time.perf_counter_ns()
+        self.timeline = []   # 墙钟阶段
+        self.active   = False
+        self.cuda     = torch.cuda.is_available()
+        self.forward_events = []      # GPU：[(kind,batch,seqlen,start_ev,end_ev)]
+        self.forward_events_cpu = []  # CPU 回退：[(kind,batch,seqlen,dt_ms)]
+        self.bookkeep  = {}
+        self.meta      = {
+            "started_at_utc": _now_utc(),
+            "python": platform.python_version(),
+            "torch": getattr(torch, "__version__", "unknown"),
+            "device": ("cuda" if self.cuda else "cpu"),
+        }
+        if self.cuda:
             try:
-                if hasattr(evt, "wait"):  # threading.Event
-                    evt.wait()
-                else:
-                    compute_stream.wait_event(evt)
-            except Exception:
-                try:
-                    evt.synchronize()
-                except Exception:
-                    pass
-        else:
-            try:
-                if hasattr(evt, "wait"):
-                    evt.wait()
-                else:
-                    evt.synchronize()
+                self.meta["cuda_device_name"] = torch.cuda.get_device_name(0)
+                self.meta["cuda_cc"] = ".".join(map(str, torch.cuda.get_device_capability(0)))
             except Exception:
                 pass
 
-        # 从 inflight 转常驻
-        with self._group_lock:
-            self._gpu_group_inflight.pop(key, None)
-            if key not in self._gpu_group_lru:
-                self._gpu_group_lru.append(key)
-        if getattr(self, "verbose", False):
-            print(f"[WSM] H2D completed for {key}")
-
-        # ★ 关键：事件完成后再次校验；不在就同步兜底搬运
-        if not self._group_is_resident(*key, wait_for_event=True):
-            if getattr(self, "verbose", False):
-                print(f"[WSM] Ready event done but {key} not resident; forcing sync ensure")
-            self.ensure_group_on_gpu(layer_idx, kind)
-        return
-
-    # 2) 若只记录了 CUDA 事件：把 compute_stream 挂到事件上
-    cuda_evt = self._group_ready_events.get(key)
-    if cuda_evt is not None:
+    @contextmanager
+    def span(self, name: str, category: str, **extras):
+        s = time.perf_counter_ns()
         try:
-            dev_obj = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
-            s = compute_stream or torch.cuda.current_stream(dev_obj)
-            s.wait_event(cuda_evt)
-        except Exception:
-            try:
-                cuda_evt.synchronize()
-            except Exception:
-                pass
+            yield
+        finally:
+            e = time.perf_counter_ns()
+            rec = {
+                "name": name, "cat": category,
+                "t_start_ms": (s - self.t0_ns) / 1e6,
+                "t_end_ms":   (e - self.t0_ns) / 1e6,
+                "dur_ms":     (e - s) / 1e6,
+            }
+            rec.update(_flatten_extras(extras))
+            self.timeline.append(rec)
+            if name == "inference_e2e":
+                self.bookkeep["inference_s_ns"] = s
+                self.bookkeep["inference_e_ns"] = e
 
-        # 再次校验
-        if not self._group_is_resident(*key, wait_for_event=True):
-            if getattr(self, "verbose", False):
-                print(f"[WSM] CUDA event existed but {key} not resident; forcing sync ensure")
-            self.ensure_group_on_gpu(layer_idx, kind)
-        return
+    @contextmanager
+    def inference_scope(self):
+        self.active = True
+        with self.span("inference_e2e", "inference"):
+            yield
+        self.active = False
 
-    # 3) 没有任何可等待对象：直接兜底同步加载
-    self.ensure_group_on_gpu(layer_idx, kind)
+    def wrap_model_forward(self, model):
+        orig = model.forward
 
+        def _classify_args(args, kwargs):
+            cand = None
+            for k in ("tokens", "input_ids"):
+                t = kwargs.get(k, None)
+                if torch.is_tensor(t) and t.dim() == 2:
+                    cand = t; break
+            if cand is None:
+                for a in args:
+                    if torch.is_tensor(a) and a.dtype in (torch.long, torch.int32, torch.int64) and a.dim() == 2:
+                        cand = a; break
+            if cand is None:
+                return None, None
+            B, T = int(cand.size(0)), int(cand.size(1))
+            return B, T
 
-def _patched_ensure_module_on_gpu(self, m: torch.nn.Module, layer_idx: int | None = None, module_name: str | None = None):
-    """
-    扩展：把 **0-size CPU stub** 当作 meta 一样处理，优先从 CPU cache 取回并上卡。
-    其它情况仍复用原先的 _ensure_param_on_gpu() 路径。
-    """
-    params_to_replace = {}
-    params_full_names = {}
+        def wrapped(*args, **kwargs):
+            if not self.active:
+                return orig(*args, **kwargs)
+            B, T = _classify_args(args, kwargs)
+            kind = "prefill" if (T is not None and T > 1) else ("decode" if T == 1 else "unknown")
 
-    def _full_name(layer_idx: int, module_name: str, local_param_name: str) -> str:
-        if module_name in ("wq", "wk", "wv", "wo"):
-            parent = "attention"
-        elif module_name in ("w1", "w2", "w3"):
-            parent = "feed_forward"
+            if self.cuda:
+                s_ev = torch.cuda.Event(enable_timing=True)
+                e_ev = torch.cuda.Event(enable_timing=True)
+                s_ev.record()
+                out = orig(*args, **kwargs)
+                e_ev.record()
+                self.forward_events.append((kind, B, T, s_ev, e_ev))
+                return out
+            else:
+                s = time.perf_counter_ns()
+                out = orig(*args, **kwargs)
+                e = time.perf_counter_ns()
+                self.forward_events_cpu.append((kind, B, T, (e - s) / 1e6))
+                return out
+
+        model.forward = wrapped
+
+    # 供 WSM 补丁使用
+    def span_if_active(self, name, category, **extras):
+        return self.span(name, category, **extras) if self is not None else nullcontext()
+
+    def _compute_decode_stats(self, arr):
+        if not arr:
+            return {"count": 0}
+        s = sorted(arr)
+        q = lambda p: s[int((len(s)-1)*p)]
+        return {
+            "count": len(arr),
+            "sum_ms": sum(arr),
+            "mean_ms": sum(arr)/len(arr),
+            "p50_ms": q(0.50),
+            "p90_ms": q(0.90),
+            "p99_ms": q(0.99),
+        }
+
+    def finalize(self, tokens_in: int | None, tokens_out: int | None, extra_meta: dict | None = None):
+        if extra_meta: self.meta.update(_flatten_extras(extra_meta))
+        # 统一同步后读取 CUDA Event
+        decode_ms = []
+        prefill_total = 0.0
+        if self.cuda and self.forward_events:
+            torch.cuda.synchronize()
+            for kind, B, T, s_ev, e_ev in self.forward_events:
+                dt = float(s_ev.elapsed_time(e_ev))  # ms
+                if kind == "prefill": prefill_total += dt
+                elif kind == "decode": decode_ms.append(dt)
+        elif self.forward_events_cpu:
+            for kind, B, T, dt in self.forward_events_cpu:
+                if kind == "prefill": prefill_total += dt
+                elif kind == "decode": decode_ms.append(dt)
+
+        inf_span = next((x for x in self.timeline if x["name"]=="inference_e2e"), None)
+        e2e_ms = inf_span["dur_ms"] if inf_span else None
+        first_decode_ms = decode_ms[0] if decode_ms else None
+        ftl_approx = (prefill_total + first_decode_ms) if (first_decode_ms is not None) else None
+
+        # 分类聚合
+        sum_cat = {}
+        for ev in self.timeline:
+            sum_cat.setdefault(ev["cat"], 0.0)
+            sum_cat[ev["cat"]] += float(ev["dur_ms"])
+
+        def _sum_by_name_prefix(prefix):
+            items = [ev for ev in self.timeline if ev["name"].startswith(prefix)]
+            return {"calls": len(items), "total_ms": sum(float(ev["dur_ms"]) for ev in items)}
+        wsm_stats = {
+            "wait_group_ready": {"calls": _sum_by_name_prefix("wsm.wait_group_ready")["calls"],
+                                 "total_ms": _sum_by_name_prefix("wsm.wait_group_ready")["total_ms"]},
+            "ensure_module_on_gpu": {"calls": _sum_by_name_prefix("wsm.ensure_module_on_gpu")["calls"],
+                                     "total_ms": _sum_by_name_prefix("wsm.ensure_module_on_gpu")["total_ms"]},
+        }
+
+        # 吞吐
+        prefill_tps = (float(tokens_in)/ (prefill_total/1000.0)) if (tokens_in and prefill_total>0) else None
+        decode_tps  = (float(tokens_out)/ (sum(decode_ms)/1000.0)) if (tokens_out and decode_ms) else None
+
+        self.result = {
+            "run": self.meta | {"run_id": self.run_id, "finished_at_utc": _now_utc()},
+            "counts": {"tokens_in": tokens_in, "tokens_out": tokens_out},
+            "timings": {
+                "inference_e2e_ms": e2e_ms,
+                "prefill_total_ms": prefill_total if prefill_total>0 else None,
+                "first_decode_forward_ms": first_decode_ms,
+                "first_token_latency_ms_approx": ftl_approx,
+                "decode_stats": self._compute_decode_stats(decode_ms),
+                "by_category_ms": sum_cat,
+            },
+            "throughput": {
+                "prefill_toks_per_s": prefill_tps,
+                "decode_toks_per_s": decode_tps,
+            },
+            "wsm": wsm_stats,
+            "decode_step_ms": decode_ms,   # 完整序列
+            "timeline": self.timeline,     # 方便溯源
+        }
+
+    def save(self, path: str):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if path.lower().endswith(".json"):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.result, f, ensure_ascii=False, indent=2)
+        elif path.lower().endswith(".csv"):
+            rows = []
+            for ev in self.timeline:
+                r = {"kind":"span","name":ev["name"],"cat":ev["cat"],
+                     "t_start_ms":ev["t_start_ms"],"t_end_ms":ev["t_end_ms"],"dur_ms":ev["dur_ms"]}
+                rows.append(r)
+            for i,dt in enumerate(self.result.get("decode_step_ms", [])):
+                rows.append({"kind":"decode_step","name":f"decode_{i:04d}","cat":"inference","t_start_ms":"", "t_end_ms":"", "dur_ms":dt})
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=["kind","name","cat","t_start_ms","t_end_ms","dur_ms"])
+                w.writeheader(); w.writerows(rows)
         else:
-            parent = module_name or ""
-        return f"layers.{layer_idx}.{parent}.{module_name}.{local_param_name}" if parent else f"layers.{layer_idx}.{module_name}.{local_param_name}"
-
-    def _fetch_from_cpu_cache(name: str):
-        if (layer_idx is not None) and (layer_idx in self.cpu_cache):
-            return self.cpu_cache[layer_idx].get(name)
-        return None
-
-    for local_param_name, p in m.named_parameters(recurse=False):
-        full_name = None
-        if (layer_idx is not None) and (module_name is not None):
-            full_name = _full_name(layer_idx, module_name, local_param_name)
-
-        is_meta     = (p.device.type == "meta") or getattr(p, "is_meta", False)
-        is_cpu_stub = (p.device.type == "cpu")  and (p.numel() == 0)
-
-        if (is_meta or is_cpu_stub) and self.ssd_enabled and full_name:
-            # 确保本层已有 CPU cache（没有就立即加载）
-            if (layer_idx not in self.cpu_cache):
-                try:
-                    self._load_layer_to_cpu(int(layer_idx))
-                except Exception:
-                    pass
-
-            cached = _fetch_from_cpu_cache(full_name)
-            # 形状修复：若 cache 的 key 与期望 shape 不配，尝试同族别名
-            expected = tuple(getattr(getattr(m, local_param_name), "shape", ()))
-            chosen_name, chosen_tensor = None, None
-
-            def _try_pick(names: list[str]):
-                nonlocal chosen_name, chosen_tensor
-                for nm in names:
-                    t = _fetch_from_cpu_cache(nm)
-                    if t is not None and (not expected or tuple(t.shape) == expected):
-                        chosen_name, chosen_tensor = nm, t
-                        break
-
-            if cached is not None and (not expected or tuple(cached.shape) == expected):
-                chosen_name, chosen_tensor = full_name, cached
-            else:
-                cand = []
-                if module_name in ("wq", "wk", "wv"):
-                    cand = [f"layers.{layer_idx}.attention.{x}.{local_param_name}" for x in ("wq","wk","wv")]
-                elif module_name in ("w1", "w2", "w3"):
-                    cand = [f"layers.{layer_idx}.feed_forward.{x}.{local_param_name}" for x in ("w1","w2","w3")]
-                else:
-                    cand = [full_name]
-                _try_pick(cand)
-                if chosen_tensor is None and cached is not None:
-                    chosen_name, chosen_tensor = full_name, cached  # 退而求其次
-
-            if chosen_tensor is not None:
-                with torch.cuda.stream(self._select_h2d_stream_for(module_name=module_name)):
-                    p_gpu = chosen_tensor.to(self.device, non_blocking=True)
-                params_to_replace[local_param_name] = torch.nn.Parameter(p_gpu, requires_grad=p.requires_grad)
-                params_full_names[local_param_name] = chosen_name or full_name
-                if getattr(self, "verbose", False):
-                    print(f"[WSM DEBUG] ✓ Loaded {'meta' if is_meta else 'stub'} param {params_full_names[local_param_name]} to GPU: {tuple(p_gpu.shape)}")
-            else:
-                if getattr(self, "verbose", False):
-                    print(f"[WSM WARN] CPU cache miss for {full_name} (layer {layer_idx}); will rely on ensure_group_on_gpu() later")
-            continue  # 该参数处理完毕
-
-        # 其它情况：沿用原来的 CPU→GPU 逻辑
-        self._ensure_param_on_gpu(p, layer_idx, full_name)
-
-    # 安装替换后的 Parameter，并维护 name 映射
-    for pname, new_param in params_to_replace.items():
-        m._parameters[pname] = new_param
-        full = params_full_names.get(pname)
-        if full:
-            try:
-                pobj = getattr(m, pname)
-            except Exception:
-                pobj = new_param
-            self.name_to_param[full] = pobj
-            self.param_owner[full]   = (m, pname)
-
-    # buffer 维持原有策略：meta→materialize，CPU→上卡
-    for b in m.buffers(recurse=True):
-        if getattr(b, "is_meta", False):
-            try:
-                b = b.to_empty(device=self.device)
-            except Exception:
-                pass
-        elif b.device.type == "cpu":
-            with torch.cuda.stream(self._select_h2d_stream_for(module_name=module_name)):
-                b_gpu = b.detach().to(self.device, non_blocking=True)
-            try:
-                b.data = b_gpu
-            except Exception:
-                pass
+            with open(path + ".json", "w", encoding="utf-8") as f:
+                json.dump(self.result, f, ensure_ascii=False, indent=2)
 
 # ===== 路径与常量（按你的环境） =====
 PROMPT_TXT = Path("/home/roger/llama3-inference/prompts/prompts_batch512_len2048.txt")
@@ -344,7 +372,7 @@ def configure_kv_pool():
     # DRAM 配置
     KVCacheArgs.dram_limit_gb     = 24.0
     KVCacheArgs.dram_sizing_batch = 32
-    KVCacheArgs.block_bytes       = 4 * 1024 * 1024
+    KVCacheArgs.block_bytes       = 1 * 1024 * 1024
     KVCacheArgs.preallocate       = False
     KVCacheArgs.lazy_init         = True
 
@@ -368,10 +396,8 @@ def configure_kv_pool():
 def classify_mode(llama) -> str:
     """
     返回：'ssd-streaming' / 'cpu-gpu-streaming' / 'full-gpu' / 'full-cpu' / 'meta-only'
-    并打印判据，方便确认现在到底跑的是什么。
     """
     m = llama.model
-    # 1) 是否装了 WSM（并且带 SSD）
     if hasattr(llama, "weight_streaming_manager"):
         wsm = llama.weight_streaming_manager
         ssd = bool(getattr(wsm, "ssd_enabled", False) or getattr(wsm, "ssd", None))
@@ -379,7 +405,6 @@ def classify_mode(llama) -> str:
         mode = "ssd-streaming" if ssd else "cpu-gpu-streaming"
         print(f"[MODE] detected={mode}  (has WSM, ssd={ssd}, disable_cpu_warm={cpu_warm})")
         return mode
-    # 2) 无 WSM：看参数分布
     cpu, cuda, meta = 0,0,0
     for _,p in m.named_parameters():
         b = p.numel()*p.element_size()
@@ -395,145 +420,411 @@ def classify_mode(llama) -> str:
     print("[MODE] mixed/unrecognized (check PARAMS dump below)")
     return "unknown"
 
+# ===== WSM runtime monkey-patch: strict ready + CPU stub loader （带计时埋点） =====
+def _patched_wait_group_ready(self, layer_idx: int, group: str, compute_stream=None):
+    """
+    等待 (layer_idx, group) 组就绪；事件结束后**二次校验**是否真在 GPU。
+    若仍不在，则强制同步 ensure_group_on_gpu()。
+    """
+    with (PROFILER.span("wsm.wait_group_ready", "wsm", layer_idx=int(layer_idx), group=str(group))
+          if (globals().get("PROFILER") is not None) else nullcontext()):
+        kind = 'attn' if group == 'attn' else 'ffn'
+        key  = (int(layer_idx), kind)
+
+        # 0) 快路径：已驻留
+        try:
+            if self._group_is_resident(*key):
+                return
+        except Exception:
+            pass
+
+        # 1) 若有 inflight 事件：等待
+        evt = self._gpu_group_inflight.get(key)
+        if evt is not None:
+            if compute_stream is not None:
+                try:
+                    if hasattr(evt, "wait"):  # threading.Event
+                        evt.wait()
+                    else:
+                        compute_stream.wait_event(evt)
+                except Exception:
+                    try:
+                        evt.synchronize()
+                    except Exception:
+                        pass
+            else:
+                try:
+                    if hasattr(evt, "wait"):
+                        evt.wait()
+                    else:
+                        evt.synchronize()
+                except Exception:
+                    pass
+
+            # 从 inflight 转常驻
+            with self._group_lock:
+                self._gpu_group_inflight.pop(key, None)
+                if key not in self._gpu_group_lru:
+                    self._gpu_group_lru.append(key)
+            if getattr(self, "verbose", False):
+                print(f"[WSM] H2D completed for {key}")
+
+            # ★ 关键：事件完成后再次校验；不在就同步兜底搬运
+            if not self._group_is_resident(*key, wait_for_event=True):
+                if getattr(self, "verbose", False):
+                    print(f"[WSM] Ready event done but {key} not resident; forcing sync ensure")
+                self.ensure_group_on_gpu(layer_idx, kind)
+            return
+
+        # 2) 若只记录了 CUDA 事件：把 compute_stream 挂到事件上
+        cuda_evt = self._group_ready_events.get(key)
+        if cuda_evt is not None:
+            try:
+                dev_obj = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
+                s = compute_stream or torch.cuda.current_stream(dev_obj)
+                s.wait_event(cuda_evt)
+            except Exception:
+                try:
+                    cuda_evt.synchronize()
+                except Exception:
+                    pass
+
+            # 再次校验
+            if not self._group_is_resident(*key, wait_for_event=True):
+                if getattr(self, "verbose", False):
+                    print(f"[WSM] CUDA event existed but {key} not resident; forcing sync ensure")
+                self.ensure_group_on_gpu(layer_idx, kind)
+            return
+
+        # 3) 没有任何可等待对象：直接兜底同步加载
+        self.ensure_group_on_gpu(layer_idx, kind)
+
+
+def _patched_ensure_module_on_gpu(self, m: torch.nn.Module, layer_idx: int | None = None, module_name: str | None = None):
+    """
+    扩展：把 **0-size CPU stub** 当作 meta 一样处理，优先从 CPU cache 取回并上卡。
+    其它情况仍复用原先的 _ensure_param_on_gpu() 路径。
+    """
+    with (PROFILER.span("wsm.ensure_module_on_gpu", "wsm", layer_idx=(None if layer_idx is None else int(layer_idx)), module=str(module_name))
+          if (globals().get("PROFILER") is not None) else nullcontext()):
+        params_to_replace = {}
+        params_full_names = {}
+
+        def _full_name(layer_idx: int, module_name: str, local_param_name: str) -> str:
+            if module_name in ("wq", "wk", "wv", "wo"):
+                parent = "attention"
+            elif module_name in ("w1", "w2", "w3"):
+                parent = "feed_forward"
+            else:
+                parent = module_name or ""
+            return f"layers.{layer_idx}.{parent}.{module_name}.{local_param_name}" if parent else f"layers.{layer_idx}.{module_name}.{local_param_name}"
+
+        def _fetch_from_cpu_cache(name: str):
+            if (layer_idx is not None) and (layer_idx in self.cpu_cache):
+                return self.cpu_cache[layer_idx].get(name)
+            return None
+
+        for local_param_name, p in m.named_parameters(recurse=False):
+            full_name = None
+            if (layer_idx is not None) and (module_name is not None):
+                full_name = _full_name(layer_idx, module_name, local_param_name)
+
+            is_meta     = (p.device.type == "meta") or getattr(p, "is_meta", False)
+            is_cpu_stub = (p.device.type == "cpu")  and (p.numel() == 0)
+
+            if (is_meta or is_cpu_stub) and self.ssd_enabled and full_name:
+                # 确保本层已有 CPU cache（没有就立即加载）
+                if (layer_idx not in self.cpu_cache):
+                    try:
+                        self._load_layer_to_cpu(int(layer_idx))
+                    except Exception:
+                        pass
+
+                cached = _fetch_from_cpu_cache(full_name)
+                expected = tuple(getattr(getattr(m, local_param_name), "shape", ()))
+                chosen_name, chosen_tensor = None, None
+
+                def _try_pick(names: list[str]):
+                    nonlocal chosen_name, chosen_tensor
+                    for nm in names:
+                        t = _fetch_from_cpu_cache(nm)
+                        if t is not None and (not expected or tuple(t.shape) == expected):
+                            chosen_name, chosen_tensor = nm, t
+                            break
+
+                if cached is not None and (not expected or tuple(cached.shape) == expected):
+                    chosen_name, chosen_tensor = full_name, cached
+                else:
+                    cand = []
+                    if module_name in ("wq", "wk", "wv"):
+                        cand = [f"layers.{layer_idx}.attention.{x}.{local_param_name}" for x in ("wq","wk","wv")]
+                    elif module_name in ("w1", "w2", "w3"):
+                        cand = [f"layers.{layer_idx}.feed_forward.{x}.{local_param_name}" for x in ("w1","w2","w3")]
+                    else:
+                        cand = [full_name]
+                    _try_pick(cand)
+                    if chosen_tensor is None and cached is not None:
+                        chosen_name, chosen_tensor = full_name, cached  # 退而求其次
+
+                if chosen_tensor is not None:
+                    with torch.cuda.stream(self._select_h2d_stream_for(module_name=module_name)):
+                        p_gpu = chosen_tensor.to(self.device, non_blocking=True)
+                    params_to_replace[local_param_name] = torch.nn.Parameter(p_gpu, requires_grad=p.requires_grad)
+                    params_full_names[local_param_name] = chosen_name or full_name
+                    if getattr(self, "verbose", False):
+                        print(f"[WSM DEBUG] ✓ Loaded {'meta' if is_meta else 'stub'} param {params_full_names[local_param_name]} to GPU: {tuple(p_gpu.shape)}")
+                else:
+                    if getattr(self, "verbose", False):
+                        print(f"[WSM WARN] CPU cache miss for {full_name} (layer {layer_idx}); will rely on ensure_group_on_gpu() later")
+                continue  # 该参数处理完毕
+
+            # 其它情况：沿用原来的 CPU→GPU 逻辑
+            self._ensure_param_on_gpu(p, layer_idx, full_name)
+
+        # 安装替换后的 Parameter，并维护 name 映射
+        for pname, new_param in params_to_replace.items():
+            m._parameters[pname] = new_param
+            full = params_full_names.get(pname)
+            if full:
+                try:
+                    pobj = getattr(m, pname)
+                except Exception:
+                    pobj = new_param
+                self.name_to_param[full] = pobj
+                self.param_owner[full]   = (m, pname)
+
+        # buffer 维持原有策略：meta→materialize，CPU→上卡
+        for b in m.buffers(recurse=True):
+            if getattr(b, "is_meta", False):
+                try:
+                    b = b.to_empty(device=self.device)
+                except Exception:
+                    pass
+            elif b.device.type == "cpu":
+                with torch.cuda.stream(self._select_h2d_stream_for(module_name=module_name)):
+                    b_gpu = b.detach().to(self.device, non_blocking=True)
+                try:
+                    b.data = b_gpu
+                except Exception:
+                    pass
+
+# ---------- 辅助：固定规则生成 JSON/CSV 路径 ----------
+def _sanitize_for_filename(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"[^A-Za-z0-9_.+-]", "-", s)
+
+def build_output_paths(log_dir: Path, run_id: str, mode: str) -> tuple[Path, Path]:
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    tag = _sanitize_for_filename(RUN_TAG)
+    stem = f"{ts}_{run_id}_{mode}" if not tag else f"{ts}_{tag}_{run_id}_{mode}"
+    json_path = log_dir / f"{stem}.json"
+    csv_path  = log_dir / f"{stem}.csv"
+    return json_path, csv_path
+
+# ---------- 运行主流程 ----------
 def main():
+    global PROFILER
+
+    # 固定目录：自动创建
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 不再使用环境变量；run_id 可附带 RUN_TAG
+    base_tag = RUN_TAG.strip() or None
+    PROFILER = InferenceProfiler(run_name=base_tag)
+
     # 基础系统开销收敛
     os.environ.setdefault("OMP_NUM_THREADS",  "8")
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
+    # PYTORCH_CUDA_ALLOC_CONF 已在顶部设置（必须在 import torch 前）
 
     # ============================================================
     # ⭐ 组级 GPU 预取（ahead=4）+ 组预算 + 等水位调度
     # ============================================================
     GPU_AHEAD_LAYERS = 4
-    # CRITICAL: Reduced from 11 to 6 to reserve ~2-3GB for activation tensors during prefill
-    # 70B model: each group ~400-500MB, 6 groups = ~3GB weights, leaving ~12GB for activations
-    GPU_MAX_GROUPS   = 10  # Reduced to prevent OOM during long-sequence prefill
+    GPU_MAX_GROUPS   = 10  # 控制权重在卡上的组数，避免长序列 prefill OOM
 
     os.environ.setdefault("WSM_GPU_MAX_GROUPS",        str(GPU_MAX_GROUPS))
     os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH",  str(GPU_AHEAD_LAYERS))
-    os.environ.setdefault("WSM_GPU_AHEAD",             str(GPU_AHEAD_LAYERS))  # 供 WSM 读取
+    os.environ.setdefault("WSM_GPU_AHEAD",             str(GPU_AHEAD_LAYERS))
     os.environ.setdefault("WSM_BALANCE_PREFETCH",      "1")
-    os.environ.setdefault("WSM_PAIR_AHEAD",            "2")  # (i+1..i+2).ffn 顶补
+    os.environ.setdefault("WSM_PAIR_AHEAD",            "2")
     os.environ.setdefault("WSM_KIND_AHEAD_CAP",        "2")
     os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "4")
-
-    # 计算结束立刻释放（避免组堆积）
-    os.environ.setdefault("WSM_EVICT_FINISHED", "1")
-    os.environ.setdefault("WSM_GRP_RETAIN_MS", "0")   # ⭐ 设为 0：无人使用时立即可驱逐
-
-    # 跳过预加载等待：边跑边滚动预取
-    os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT", "1")
-
-    # ⭐ 调试开关：用于验证驱逐是否正常工作
-    os.environ.setdefault("WSM_DEBUG_PREFETCH", "1")  # 打印预取/驱逐细节
+    os.environ.setdefault("WSM_EVICT_FINISHED",        "1")
+    os.environ.setdefault("WSM_GRP_RETAIN_MS",         "0")
+    os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",     "1")
+    os.environ.setdefault("WSM_DEBUG_PREFETCH",        "1")
 
     # ============================================================
     # ⭐ 环形 CPU 窗口（SSD -> pinned DRAM，80 层取模）
     # ============================================================
-    # CRITICAL FIX: CPU窗口必须从 i+1 开始以覆盖GPU预取需要的层 (i+1..i+4)
-    # 如果offset=4，则窗口是[i+4..i+43]，GPU需要的i+1,i+2,i+3不在窗口内！
-    CPU_CAP_VALUE    = 40   # 窗口大小：40层
-    CPU_RING_OFFSET  = 1    # 窗口从 i+1 起，确保GPU预取的i+1..i+4都在DRAM中
+    CPU_CAP_VALUE    = 40   # 窗口大小
+    CPU_RING_OFFSET  = 1    # 窗口从 i+1 起，覆盖 GPU 预取的 i+1..i+4
     os.environ.setdefault("WSM_CPU_RING_MODE",     "1")
     os.environ.setdefault("WSM_CPU_RING_OFFSET",   str(CPU_RING_OFFSET))
     os.environ.setdefault("WSM_CPU_CACHE_CAP_LAYERS", str(CPU_CAP_VALUE))
     os.environ.setdefault("WSM_CPU_CACHE_HWM_LAYERS", str(CPU_CAP_VALUE + 3))
     os.environ.setdefault("WSM_CPU_CACHE_LWM_LAYERS", str(max(2, CPU_CAP_VALUE - 3)))
     os.environ.setdefault("WSM_CPU_BACK_MARGIN",   "4")
-
-    # —— H2D/KV 传输仲裁（防止两边抢带宽）——
     os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD", "2")
     os.environ.setdefault("WSM_KV_THROTTLE_MS",        "16")
 
-    # 配置总结
+    # 配置总结（仅打印）
     print("=" * 80)
     print("🔧 组级 GPU 预取（ahead=4）+ 环形 CPU 窗口 [FIXED VERSION]")
     print("=" * 80)
     print(f"GPU 预取距离: {GPU_AHEAD_LAYERS} 层 (预取 i+1..i+{GPU_AHEAD_LAYERS})")
     print(f"GPU 组预算:   {GPU_MAX_GROUPS} 组(attn/ffn)")
     print(f"CPU 窗口容量: {CPU_CAP_VALUE} 层 (环形，对 80 层取模)")
-    print(f"CPU 环形偏移: i+{CPU_RING_OFFSET} ⭐ CRITICAL: 必须覆盖GPU预取层")
+    print(f"CPU 环形偏移: i+{CPU_RING_OFFSET}  (确保覆盖 GPU 预取层)")
     print(f"CPU 窗口范围: [i+{CPU_RING_OFFSET} .. i+{CPU_RING_OFFSET + CPU_CAP_VALUE - 1}]")
-    print("=" * 80)
-    print(f"⚠️  IMPORTANT: 如果看到此消息但offset={CPU_RING_OFFSET}，说明配置已正确！")
-    print(f"⚠️  如果仍有问题，请检查WSM是否真的加载了新代码")
     print("=" * 80)
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     # 1) 覆盖 pinned/注册池 + KV 池
-    apply_runtime_overrides()
-    configure_kv_pool()
-    probe("after runtime clamp")
+    with PROFILER.span("apply_runtime_overrides", "setup"):
+        apply_runtime_overrides()
+    with PROFILER.span("configure_kv_pool", "setup"):
+        configure_kv_pool()
+    with PROFILER.span("probe_after_runtime_clamp", "non_inference"):
+        probe("after runtime clamp")
 
-    # 2) WSM（SSD 流式）构造参数：关闭整层预取，改用组级窗口
+    # 2) WSM（SSD 流式）构造参数
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
         "prefetch_distance": 0,                     # 关闭整层预取
         "group_prefetch_depth": GPU_AHEAD_LAYERS,   # 组级预取深度（=4）
-        "max_cached_layers": 8,                     # 组级起主导，这里仅作保险
+        "max_cached_layers": 8,                     # 保险
         "cpu_cache_layers": CPU_CAP_VALUE,          # CPU 环形容量
         "warmup_layers": 1,                         # 至少预热第 0 层到 CPU
         "staging_mb": 64,
         "verbose": True,
     }
 
-    # 3) 构建（meta + SSD 流式），不会把 70B 权重全载入 CPU
-    probe("before LLaMA.build")
-    print("[CHECK] calling LLaMA.build(mode='mixed', load_model=False)")
-    llama = LLaMA.build(
-        checkpoints_dir=CKPT_DIR,
-        load_model=False,           # 关键：不把 checkpoint 载入 CPU
-        device=device,
-        max_seq_len=2048,
-        max_batch_size=32,
-        topk_blk=8,
-        mode="mixed",
-        mode_config=mode_config
-    )
-    probe("after LLaMA.build")
+    # 3) 构建（meta + SSD 流式）
+    with PROFILER.span("probe_before_build", "non_inference"):
+        probe("before LLaMA.build")
+    with PROFILER.span("LLaMA.build", "setup"):
+        llama = LLaMA.build(
+            checkpoints_dir=CKPT_DIR,
+            load_model=False,           # 不把 checkpoint 全载入 CPU
+            device=device,
+            max_seq_len=2048,
+            max_batch_size=32,
+            topk_blk=8,
+            mode="mixed",
+            mode_config=mode_config
+        )
+    with PROFILER.span("probe_after_build", "non_inference"):
+        probe("after LLaMA.build")
 
-    # 绑定 WSM 补丁
+    # 绑定 WSM 补丁 + 包装 forward 以记录 CUDA Event
     wsm = getattr(llama, "weight_streaming_manager", None)
     if wsm is not None:
-        # ⭐ 关键：先保存原始方法，避免递归调用！
         wsm._original_wait_group_ready = wsm.wait_group_ready
-        # 然后用 patch 版本替换
-        wsm.wait_group_ready     = types.MethodType(_patched_wait_group_ready, wsm)
-        wsm._ensure_module_on_gpu = types.MethodType(_patched_ensure_module_on_gpu, wsm)
+        wsm.wait_group_ready           = types.MethodType(_patched_wait_group_ready, wsm)
+        wsm._ensure_module_on_gpu      = types.MethodType(_patched_ensure_module_on_gpu, wsm)
         print("[WSM PATCH] strict group-ready + CPU stub loader enabled")
 
-    # 识别/打印"实际模式" + 参数分布
-    mode = classify_mode(llama)
-    dump_param_inventory(llama.model, f"after build ({mode})")
+    PROFILER.wrap_model_forward(llama.model)
 
-    # 4) 读取 prompt 并做“安全裁剪”（max_gen_len=32）
-    try:
-        prompt_path = PROMPT_TXT
-        prompt = prompt_path.read_text(encoding="utf-8").strip()
-    except Exception as e:
-        raise RuntimeError(f"无法读取 {prompt_path}: {e}")
+    # 4) 读取 prompt + 安全裁剪（max_gen_len=32）
+    batch_size = 2
+    max_gen_len = 32
 
-    # —— 安全裁剪：按 tokenizer 限制 prompt token 数
-    max_gen_len = 32  
-    max_prompt_tokens = llama.args.max_seq_len - max_gen_len
-    tok = llama.tokenizer.encode(prompt, add_special_tokens=False)
-    if len(tok) > max_prompt_tokens:
-        tok = tok[-max_prompt_tokens:]
-        prompt = llama.tokenizer.decode(tok)
+    with PROFILER.span("read_prompt_file", "prompt"):
+        try:
+            prompt_path = PROMPT_TXT
+            file_content = prompt_path.read_text(encoding="utf-8").strip()
+
+            # 解析多个prompts（按 "===== PROMPT XXXX =====" 分隔）
+            import re
+            prompt_blocks = re.split(r'=====\s*PROMPT\s+\d+\s+.*?=====\s*\n', file_content)
+            # 过滤空字符串
+            prompt_blocks = [p.strip() for p in prompt_blocks if p.strip()]
+
+            # 取前batch_size个prompts
+            prompts = prompt_blocks[:batch_size]
+            if len(prompts) < batch_size:
+                # 如果prompts不足，重复最后一个prompt来填充
+                print(f"Warning: Only {len(prompts)} prompts found, padding to {batch_size}")
+                while len(prompts) < batch_size:
+                    prompts.append(prompts[-1])
+
+            print(f"Loaded {len(prompts)} prompts for batch_size={batch_size}")
+
+        except Exception as e:
+            raise RuntimeError(f"无法读取 {prompt_path}: {e}")
+
+    with PROFILER.span("tokenize_and_clip", "prompt"):
+        max_prompt_tokens = llama.args.max_seq_len - max_gen_len
+
+        # 对每个prompt进行tokenize和裁剪
+        clipped_prompts = []
+        for prompt in prompts:
+            tok = llama.tokenizer.encode(prompt, add_special_tokens=False)
+            if len(tok) > max_prompt_tokens:
+                tok = tok[-max_prompt_tokens:]
+                prompt = llama.tokenizer.decode(tok)
+            clipped_prompts.append(prompt)
+
+        prompts = clipped_prompts
+        # 使用第一个prompt的token数作为统计（假设所有prompt长度相似）
+        tokens_in_count = len(llama.tokenizer.encode(prompts[0], add_special_tokens=False))
 
     # 5) 真正推理（decode）
-    probe("before inference (decode)")
-    out_tokens, out_texts = llama.text_completion(
-        prompts=[prompt],
-        temperature=0.0,
-        max_gen_len=max_gen_len,
-        batch_size=1,
-    )
-    probe("after inference (decode)")
+    with PROFILER.span("probe_before_infer", "non_inference"):
+        probe("before inference (decode)")
+    with PROFILER.inference_scope():  # 端到端推理时间
+        out_tokens, out_texts = llama.text_completion(
+            prompts=prompts,
+            temperature=0.0,
+            max_gen_len=max_gen_len,
+            batch_size=batch_size,
+        )
+    with PROFILER.span("probe_after_infer", "non_inference"):
+        probe("after inference (decode)")
 
-    print(f"\n========== Generation (len={max_gen_len}) ==========")
-    print(out_texts[0])
+    # ==== 统计 tokens_out ====
+    def _count_output_tokens(out_tokens_obj):
+        try:
+            if isinstance(out_tokens_obj, (list, tuple)):
+                if len(out_tokens_obj) > 0 and isinstance(out_tokens_obj[0], (list, tuple)):
+                    return len(out_tokens_obj[0])
+                return len(out_tokens_obj)
+            if torch.is_tensor(out_tokens_obj):
+                return int(out_tokens_obj.numel())
+        except Exception:
+            pass
+        return None
+
+    tokens_out_count = _count_output_tokens(out_tokens)
+
+    # ==== 汇总与保存 ====
+    mode = classify_mode(llama)
+    PROFILER.finalize(
+        tokens_in=tokens_in_count,
+        tokens_out=tokens_out_count,
+        extra_meta={"llama_mode": mode, "device_str": str(device)}
+    )
+
+    # 自动生成 JSON/CSV 路径并各保存一次
+    json_path, csv_path = build_output_paths(LOG_DIR, PROFILER.run_id, mode)
+    PROFILER.save(str(json_path))
+    PROFILER.save(str(csv_path))
+    print(f"[Profiler] JSON: {json_path}")
+    print(f"[Profiler] CSV : {csv_path}")
+
+    # ==== 输出生成文本（不影响计时）====
+    print(f"\n========== Generation (batch_size={batch_size}, len={max_gen_len}) ==========")
+    # 只显示前3个和最后1个，避免输出太长
+    for i in [0, 1, 2, batch_size-1]:
+        if i < len(out_texts):
+            print(f"\n--- Batch {i} ---")
+            print(out_texts[i][:200] + "..." if len(out_texts[i]) > 200 else out_texts[i])
     print("=========================================")
 
 if __name__ == "__main__":
