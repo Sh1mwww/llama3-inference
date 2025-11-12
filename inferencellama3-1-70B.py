@@ -22,6 +22,9 @@ from contextlib import contextmanager, nullcontext
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # 限制分块大小，减少碎片
 
+# 🔥 WSM 无兜底策略：锁定事件驱动调度，禁用同步兜底 (no-fallback)
+os.environ["WSM_NO_FALLBACK"] = "1"
+
 import torch
 
 # ===== 你可以改这里：日志输出目录 & 运行标签（可留空） =====
@@ -31,7 +34,7 @@ RUN_TAG = ""                                          # 例如 "ablation-a1"；�
 # ===== 项目内模块 =====
 from llama3.generator import LLaMA
 from llama3.config import KVCacheArgs, load_runtime_config, runtime_config_to_dict
-from llama3 import generator as _gen
+from llama3 import generator as _gen, stream_mnt
 
 # ========== build() 包装：只加日志，不改库 ==========
 _orig_build = _gen.LLaMA.build
@@ -420,84 +423,18 @@ def classify_mode(llama) -> str:
     print("[MODE] mixed/unrecognized (check PARAMS dump below)")
     return "unknown"
 
-# ===== WSM runtime monkey-patch: strict ready + CPU stub loader （带计时埋点） =====
-def _patched_wait_group_ready(self, layer_idx: int, group: str, compute_stream=None):
+# ===== WSM wait_group_ready 包装（仅添加 Profiler 计时，不改逻辑） =====
+def _wrap_wait_group_ready(original_method):
     """
-    等待 (layer_idx, group) 组就绪；事件结束后**二次校验**是否真在 GPU。
-    若仍不在，则强制同步 ensure_group_on_gpu()。
+    包装 WSM.wait_group_ready，添加 profiler 计时埋点。
+    完全异步的等待逻辑已在 WSM 主类中实现。
     """
-    with (PROFILER.span("wsm.wait_group_ready", "wsm", layer_idx=int(layer_idx), group=str(group))
-          if (globals().get("PROFILER") is not None) else nullcontext()):
-        kind = 'attn' if group == 'attn' else 'ffn'
-        key  = (int(layer_idx), kind)
-
-        # 0) 快路径：已驻留
-        try:
-            if self._group_is_resident(*key):
-                return
-        except Exception:
-            pass
-
-        # 1) 若有 inflight 事件：等待
-        evt = self._gpu_group_inflight.get(key)
-        if evt is not None:
-            if compute_stream is not None:
-                try:
-                    if hasattr(evt, "wait"):  # threading.Event
-                        evt.wait()
-                    else:
-                        compute_stream.wait_event(evt)
-                except Exception:
-                    try:
-                        evt.synchronize()
-                    except Exception:
-                        pass
-            else:
-                try:
-                    if hasattr(evt, "wait"):
-                        evt.wait()
-                    else:
-                        evt.synchronize()
-                except Exception:
-                    pass
-
-            # 从 inflight 转常驻
-            with self._group_lock:
-                self._gpu_group_inflight.pop(key, None)
-                if key not in self._gpu_group_lru:
-                    self._gpu_group_lru.append(key)
-            if getattr(self, "verbose", False):
-                print(f"[WSM] H2D completed for {key}")
-
-            # ★ 关键：事件完成后再次校验；不在就同步兜底搬运
-            if not self._group_is_resident(*key, wait_for_event=True):
-                if getattr(self, "verbose", False):
-                    print(f"[WSM] Ready event done but {key} not resident; forcing sync ensure")
-                self.ensure_group_on_gpu(layer_idx, kind)
-            return
-
-        # 2) 若只记录了 CUDA 事件：把 compute_stream 挂到事件上
-        cuda_evt = self._group_ready_events.get(key)
-        if cuda_evt is not None:
-            try:
-                dev_obj = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
-                s = compute_stream or torch.cuda.current_stream(dev_obj)
-                s.wait_event(cuda_evt)
-            except Exception:
-                try:
-                    cuda_evt.synchronize()
-                except Exception:
-                    pass
-
-            # 再次校验
-            if not self._group_is_resident(*key, wait_for_event=True):
-                if getattr(self, "verbose", False):
-                    print(f"[WSM] CUDA event existed but {key} not resident; forcing sync ensure")
-                self.ensure_group_on_gpu(layer_idx, kind)
-            return
-
-        # 3) 没有任何可等待对象：直接兜底同步加载
-        self.ensure_group_on_gpu(layer_idx, kind)
+    def wrapped(self, layer_idx: int, group: str, compute_stream=None):
+        with (PROFILER.span("wsm.wait_group_ready", "wsm", layer_idx=int(layer_idx), group=str(group))
+              if (globals().get("PROFILER") is not None) else nullcontext()):
+            # 调用 WSM 原生的完全异步 wait_group_ready
+            return original_method(layer_idx, group, compute_stream)
+    return wrapped
 
 
 def _patched_ensure_module_on_gpu(self, m: torch.nn.Module, layer_idx: int | None = None, module_name: str | None = None):
@@ -650,19 +587,31 @@ def main():
     os.environ.setdefault("WSM_BALANCE_PREFETCH",      "1")
     os.environ.setdefault("WSM_PAIR_AHEAD",            "2")
     os.environ.setdefault("WSM_KIND_AHEAD_CAP",        "2")
-    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "4")
+    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "8")
     os.environ.setdefault("WSM_EVICT_FINISHED",        "1")
-    os.environ.setdefault("WSM_GRP_RETAIN_MS",         "0")
-    os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",     "1")
+    os.environ.setdefault("WSM_CPU_EVICT_AFTER_USE",        "1")
+
+    os.environ.setdefault("WSM_GRP_RETAIN_MS",         "100")
+    os.environ.setdefault("WSM_SKIP_PRELOAD_WAIT",     "0")
     os.environ.setdefault("WSM_DEBUG_PREFETCH",        "1")
+    
+    os.environ.setdefault("WSM_POOLED_CPU_READ",        "1")
+    os.environ.setdefault("WSM_CPU_PF_WORKERS",         "8")
+    os.environ.setdefault("WSM_REBALANCE_SYNC",         "1")  
+    os.environ.setdefault("WSM_VERBOSE_MISMATCH",       "1")
+    
+    
+  
 
     # ============================================================
-    # ⭐ 环形 CPU 窗口（SSD -> pinned DRAM，80 层取模）
+    # 环形 CPU 窗口（SSD -> pinned DRAM，80 层取模）
     # ============================================================
     CPU_CAP_VALUE    = 40   # 窗口大小
     CPU_RING_OFFSET  = 1    # 窗口从 i+1 起，覆盖 GPU 预取的 i+1..i+4
     os.environ.setdefault("WSM_CPU_RING_MODE",     "1")
-    os.environ.setdefault("WSM_CPU_RING_OFFSET",   str(CPU_RING_OFFSET))
+    # ✅ 修复：offset=0 确保窗口从当前层开始，避免当前层不在窗口内
+    # 原来的 offset=1 会导致执行 L0 时窗口为 [L1..L40]，L0 缺失导致崩溃
+    os.environ.setdefault("WSM_CPU_RING_OFFSET",   "0")  # 改为 0
     os.environ.setdefault("WSM_CPU_CACHE_CAP_LAYERS", str(CPU_CAP_VALUE))
     os.environ.setdefault("WSM_CPU_CACHE_HWM_LAYERS", str(CPU_CAP_VALUE + 3))
     os.environ.setdefault("WSM_CPU_CACHE_LWM_LAYERS", str(max(2, CPU_CAP_VALUE - 3)))
@@ -695,11 +644,9 @@ def main():
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
-        "prefetch_distance": 0,                     # 关闭整层预取
-        "group_prefetch_depth": GPU_AHEAD_LAYERS,   # 组级预取深度（=4）
         "max_cached_layers": 8,                     # 保险
         "cpu_cache_layers": CPU_CAP_VALUE,          # CPU 环形容量
-        "warmup_layers": 1,                         # 至少预热第 0 层到 CPU
+        "warmup_layers": 2,                         # ⚠️ Fix: 预热前 2 层到 GPU（避免首层竞态）
         "staging_mb": 64,
         "verbose": True,
     }
@@ -718,21 +665,30 @@ def main():
             mode="mixed",
             mode_config=mode_config
         )
+        s = stream_mnt.get_streams("cuda:0")
+        print("h2d_mha:", s.weight_h2d_mha)
+        print("h2d_ffn:", s.weight_h2d_ffn)
+        print("cmp_mha:", s.compute_mha)
+        print("cmp_ffn:", s.compute_ffn)
+        print("kv_h2d:", s.kv_h2d, "kv_d2h:", s.kv_d2h)
     with PROFILER.span("probe_after_build", "non_inference"):
         probe("after LLaMA.build")
 
-    # 绑定 WSM 补丁 + 包装 forward 以记录 CUDA Event
+    # 绑定 WSM 补丁：仅为 profiler 计时，wait_group_ready 的异步逻辑已在 WSM 主类实现
     wsm = getattr(llama, "weight_streaming_manager", None)
     if wsm is not None:
-        wsm._original_wait_group_ready = wsm.wait_group_ready
-        wsm.wait_group_ready           = types.MethodType(_patched_wait_group_ready, wsm)
-        wsm._ensure_module_on_gpu      = types.MethodType(_patched_ensure_module_on_gpu, wsm)
-        print("[WSM PATCH] strict group-ready + CPU stub loader enabled")
+        # 包装 wait_group_ready 以添加 profiler 计时
+        original_wait = wsm.wait_group_ready
+        wsm.wait_group_ready = types.MethodType(_wrap_wait_group_ready(original_wait), wsm)
+
+        # 保留 ensure_module_on_gpu 的 CPU stub loader 补丁
+        wsm._ensure_module_on_gpu = types.MethodType(_patched_ensure_module_on_gpu, wsm)
+        print("[WSM PATCH] Profiler wrapper + CPU stub loader enabled")
 
     PROFILER.wrap_model_forward(llama.model)
 
     # 4) 读取 prompt + 安全裁剪（max_gen_len=32）
-    batch_size = 2
+    batch_size = 1
     max_gen_len = 32
 
     with PROFILER.span("read_prompt_file", "prompt"):

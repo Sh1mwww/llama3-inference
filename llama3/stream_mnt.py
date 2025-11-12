@@ -209,7 +209,7 @@ def get_streams(device: str) -> Streams:
 
 
 def clear_streams_cache():
-    global _streams_cache , _event_pools
+    # global _streams_cache , _event_pools
     _streams_cache.clear()
     _event_pools.clear()
     

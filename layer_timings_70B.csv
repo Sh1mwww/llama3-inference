@@ -1,1 +1,0 @@
-batch_idx,layer_idx,token_idx,total_ms,compute_ms,weight_load_ms,timestamp

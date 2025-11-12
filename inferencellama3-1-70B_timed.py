@@ -67,7 +67,8 @@ class _PerfRecorder:
     def record_t0(self):
         if not self.cuda: return
         self.t0_evt = torch.cuda.Event(enable_timing=True)
-        self.t0_evt.record(torch.cuda.current_stream(self.dev))
+        with torch.cuda.device(self.dev):
+            self.t0_evt.record(torch.cuda.current_stream())
 
     def record_h2d_pair(self, start_evt, end_evt, meta=None):
         if not self.cuda: return
@@ -723,7 +724,8 @@ def main():
     os.environ.setdefault("WSM_BALANCE_PREFETCH", "1")
     os.environ.setdefault("WSM_PAIR_AHEAD", "2")      # 同层→i+1→i+2
     os.environ.setdefault("WSM_KIND_AHEAD_CAP", "2")  # 单一类型最大前瞻距离
-    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "12")
+    # ⭐ 增加 H2D backlog 限制以缓解权重流瓶颈（根据显存余量调整 6~8）
+    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "8")
 
     # 计算结束立刻释放（避免组堆积）
     os.environ.setdefault("WSM_EVICT_FINISHED", "1")  # ← 修正为 1（你的草稿里误写成了 0）
@@ -774,8 +776,6 @@ def main():
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
-        "prefetch_distance": 0,                     # 关闭整层预取
-        "group_prefetch_depth": GPU_AHEAD_LAYERS,   # 组级预取深度（=4）
         "max_cached_layers": 8,                     # 组级起主导，这里仅作保险
         "cpu_cache_layers": CPU_CAP_VALUE,          # CPU 环形容量
         "warmup_layers": 1,                         # 至少预热第 0 层到 CPU

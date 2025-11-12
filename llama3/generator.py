@@ -311,195 +311,288 @@ class LLaMA:
             print(f"❌ GPU OOM during preloading: {e}")
             print("💡 Consider reducing max_layers_in_gpu or using weight streaming")
             raise
+        
+    # --- paste into llama3/generator.py (inside class LLaMA) ---
 
     def _configure_weight_streaming(self, streaming_config: dict):
         """
-        Enable weight streaming (keep activations on GPU, stream per-layer weights).
-        NOTE: Intentionally keeps local imports to avoid circular deps and heavy eager imports.
+        Weight streaming：激活 6 条流，保持激活在 HBM，按层流式权重到 GPU。
         """
         print("🔧 Configuring Weight Streaming...")
-
-        # Local imports intentionally kept (avoid circular imports / heavy startup)
         from .weight_streaming_manager import WeightStreamingManager
-        # from .layers import .
         from .stream_mnt import get_streams
-        
-        # Default streaming config (merged with user-provided overrides)
-        config = {
-            'prefetch_distance': 4,
-            'max_cached_layers': 4,
-            'warmup_layers': 0,
-            'verbose': False,
-        }
-        config.update(streaming_config)
 
-        # Ensure model.layers is accessible when layer_infos is present (for WSM integration)
-        if hasattr(self.model, "layer_infos"):
-            try:
-                blocks = [info.block for info in self.model.layer_infos if info.block is not None]
-                if blocks and not hasattr(self.model, "layers"):
-                    self.model.layers = blocks
-            except Exception:
-                # Swallow silently to preserve original behavior
-                pass
+        config = {'prefetch_distance': 4, 'max_cached_layers': 4, 'warmup_layers': 2, 'verbose': True}
+        config.update(streaming_config or {})
 
-        # Place small/core components on target device (kept resident in HBM)
+        # 小模块常驻 HBM，并保证 RoPE 等设备/精度就位
         self._configure_core_components()
 
-        self.streams = get_streams(self.args.device) 
+        # 6 流
+        self.streams = get_streams(self.args.device)
 
-        # Create and wire up the WeightStreamingManager
+        # 建立 WSM 并注入到层（attn/ffn）
         wsm = WeightStreamingManager(
-            self.model,
-            device=self.args.device,
-            prefetch_distance=config['prefetch_distance'],
-            max_cached_layers=config['max_cached_layers'],
-            warmup_layers=config['warmup_layers'],
-            verbose=True,  # force verbose to help verify integration
-        )
-
-        # Store WSM reference for later access
-        self.weight_streaming_manager = wsm
-
-        # Integrate WSM hooks into layers (attn/ffn)
-        self._integrate_wsm_to_layers(wsm, self.streams)
-
-        # Configure KV streams if offloaders exist
-        self._configure_kv_streams()
-
-        # Verify and fix device placements to avoid accidental CPU/GPU mismatches
-        self._verify_and_fix_device_placement()
-
-        # Optional diagnostics
-        try:
-            first_blk = getattr(self.model, "layers", [None])[0]
-            if first_blk is not None:
-                print("[CHECK] first block param device:", next(first_blk.parameters()).device)
-        except Exception:
-            pass
-
-        print("✅ Weight streaming enabled (activations on GPU, weights streamed per-layer).")
-        print("⚙️  Running on GPU")
-        return wsm
-
-    def _configure_ssd_streaming(self, ssd_config: dict):
-        """
-        Enable SSD-backed hybrid weight streaming: SSD -> CPU cache -> GPU streaming.
-        """
-        from pathlib import Path
-        print("🚀 Configuring SSD Hybrid Streaming...")
-
-        # Local imports intentionally kept
-        from .weight_streaming_manager import WeightStreamingManager
-        import llama3.layers
-        from llama3 import stream_mnt
-
-        # Default config
-        config = {
-            'ssd_manifest_path': None,      # required: runtime_manifest.json (or shapes_meta.json, see below)
-            'prefetch_distance': 2,
-            'max_cached_layers': 4,
-            'cpu_cache_layers': 50,
-            'staging_mb': 64,
-            'warmup_layers': 0,
-            'verbose': True,
-            'check_dram_capacity': True,
-        }
-        config.update(ssd_config)
-
-        if not str(self.args.device).startswith("cuda"):
-            raise RuntimeError("SSD streaming requires a CUDA device")
-
-        if config['ssd_manifest_path'] is None:
-            raise ValueError("ssd_manifest_path is required (runtime_manifest.json or shapes_meta.json)")
-
-        mp = str(config['ssd_manifest_path'])
-        if not Path(mp).exists():
-            raise FileNotFoundError(f"SSD manifest not found: {mp}")
-
-        # Optional: if a shapes_meta.json is provided, build runtime manifest on the fly.
-        if mp.endswith(".shapes_meta.json"):
-            try:
-                from .weights_io_ssd_dram import build_runtime_manifest
-                out_path = "/dev/shm/runtime_manifest.json"
-                build_runtime_manifest(mp, out_path)
-                config['ssd_manifest_path'] = out_path
-                print(f"[SSD] Built runtime manifest → {out_path}")
-            except Exception as e:
-                raise RuntimeError(f"Failed to build runtime manifest from shapes_meta: {e}")
-
-        # Ensure model.layers accessible
-        if hasattr(self.model, "layer_infos"):
-            try:
-                blocks = [info.block for info in self.model.layer_infos if info.block is not None]
-                if blocks and not hasattr(self.model, "layers"):
-                    self.model.layers = blocks
-            except Exception:
-                pass
-
-        # Keep small/core modules on HBM
-        self._configure_core_components()
-
-        # Mark streaming mode
-        if getattr(self, "_streaming_mode", None) not in (None, "ssd"):
-            raise RuntimeError(f"Another streaming mode already active: {self._streaming_mode}")
-        self._streaming_mode = "ssd"
-
-        # Create streams for SSD mode
-        self.streams = stream_mnt.get_streams(self.args.device)
-
-        # Normalize staging bytes (WSM will align to device block size)
-        staging_bytes = max(1, int(config['staging_mb'])) * 1024 * 1024
-
-        # Create WSM with SSD backend
-        wsm = WeightStreamingManager(
-            self.model,
-            device=self.args.device,
+            self.model, device=self.args.device,
             prefetch_distance=config['prefetch_distance'],
             max_cached_layers=config['max_cached_layers'],
             warmup_layers=config['warmup_layers'],
             verbose=config['verbose'],
-            # SSD backend
+        )
+        self.weight_streaming_manager = wsm
+        self._integrate_wsm_to_layers(wsm, self.streams)
+
+        # 🔥 Warm up a few groups (non-blocking) to hide first-layer H2D
+        try:
+            if hasattr(wsm, "warmup_groups_prefetch"):
+                wsm.warmup_groups_prefetch(layers=config.get('warmup_layers', 2), blocking_first=False)
+        except Exception as _e:
+            print(f"[GEN] warmup_groups_prefetch skipped: {_e}")
+
+        # KV 流
+        self._configure_kv_streams()
+
+        # 再次检查各组件设备一致性（避免 CPU/GPU 混放）
+        self._verify_and_fix_device_placement()
+        print("✅ Weight streaming enabled.")
+        return wsm
+
+    def _configure_ssd_streaming(self, ssd_config: dict):
+        """
+        SSD → CPU(pinned) → GPU 的混合 streaming 管线；同样激活 6 条流并注入层与 KV。
+        """
+        print("🚀 Configuring SSD Hybrid Streaming...")
+        from pathlib import Path
+        from .weight_streaming_manager import WeightStreamingManager
+        import llama3.stream_mnt as stream_mnt
+
+        config = {
+            'ssd_manifest_path': None, 'prefetch_distance': 2, 'max_cached_layers': 4,
+            'cpu_cache_layers': 50, 'staging_mb': 64, 'warmup_layers': 2, 'verbose': True,
+        }
+        config.update(ssd_config or {})
+        if not config['ssd_manifest_path'] or not Path(config['ssd_manifest_path']).exists():
+            raise FileNotFoundError("ssd_manifest_path missing or not exists")
+
+        # 小模块常驻 HBM
+        self._configure_core_components()
+
+        # 6 流
+        self.streams = stream_mnt.get_streams(self.args.device)
+
+        # 创建 WSM（SSD backend）
+        wsm = WeightStreamingManager(
+            self.model, device=self.args.device,
+            prefetch_distance=config['prefetch_distance'],
+            max_cached_layers=config['max_cached_layers'],
+            warmup_layers=config['warmup_layers'],
+            verbose=config['verbose'],
             ssd_manifest_path=config['ssd_manifest_path'],
             cpu_cache_layers=config['cpu_cache_layers'],
             staging_mb=config['staging_mb'],
         )
-
-        # Store WSM reference for later access
         self.weight_streaming_manager = wsm
-
-        # Integrate WSM hooks into layers
         self._integrate_wsm_to_layers(wsm, self.streams)
 
-        # KV streams
-        self._configure_kv_streams()
-
-        # Verify placements
-        self._verify_and_fix_device_placement()
-        
-        # Keep args.device consistent with the actual compute device
-        self.args.device = str(self.model.embed_tokens.weight.device)
-        # 统一下游设备标志，避免后续再把 token 建在 CPU
+        # 🔥 Warm up a few groups (non-blocking) to hide first-layer H2D
         try:
-            self.model.device = torch.device(self.args.device)
-        except Exception:
-            pass
-        if hasattr(self.model, "layers"):
-            for blk in self.model.layers:
-                for m in (blk, blk.attention, blk.feed_forward):
-                    if hasattr(m, "device"):
-                        m.device = torch.device(self.args.device)
-
-
-        # Print status
-        stats = wsm.get_ssd_stats()
-        print("✅ SSD Hybrid Streaming enabled:")
-        print(f"   📦 CPU cache: {stats.get('cpu_cache_max', config['cpu_cache_layers'])} layers")
-        print(f"   🎯 GPU cache: {config['max_cached_layers']} layers")
-        print(f"   🔄 Prefetch distance: {config['prefetch_distance']} layers")
-        print(f"   💾 Staging buffer: {config['staging_mb']} MB")
-        print("⚙️  Pipeline: SSD → CPU (pinned) → GPU (HBM)")
+            if hasattr(wsm, "warmup_groups_prefetch"):
+                wsm.warmup_groups_prefetch(layers=config.get('warmup_layers', 2), blocking_first=False)
+        except Exception as _e:
+            print(f"[GEN] warmup_groups_prefetch skipped: {_e}")
+        self._configure_kv_streams()
+        self._verify_and_fix_device_placement()
+        print("✅ SSD Hybrid Streaming enabled.")
         return wsm
+
+    # def _configure_weight_streaming(self, streaming_config: dict):
+    #     """
+    #     Enable weight streaming (keep activations on GPU, stream per-layer weights).
+    #     NOTE: Intentionally keeps local imports to avoid circular deps and heavy eager imports.
+    #     """
+    #     print("🔧 Configuring Weight Streaming...")
+
+    #     # Local imports intentionally kept (avoid circular imports / heavy startup)
+    #     from .weight_streaming_manager import WeightStreamingManager
+    #     # from .layers import .
+    #     from .stream_mnt import get_streams
+        
+    #     # Default streaming config (merged with user-provided overrides)
+    #     config = {
+    #         'prefetch_distance': 4,
+    #         'max_cached_layers': 4,
+    #         'warmup_layers': 2,
+    #         'verbose': False,
+    #     }
+    #     config.update(streaming_config)
+
+    #     # Ensure model.layers is accessible when layer_infos is present (for WSM integration)
+    #     if hasattr(self.model, "layer_infos"):
+    #         try:
+    #             blocks = [info.block for info in self.model.layer_infos if info.block is not None]
+    #             if blocks and not hasattr(self.model, "layers"):
+    #                 self.model.layers = blocks
+    #         except Exception:
+    #             # Swallow silently to preserve original behavior
+    #             pass
+
+    #     # Place small/core components on target device (kept resident in HBM)
+    #     self._configure_core_components()
+
+    #     self.streams = get_streams(self.args.device) 
+
+    #     # Create and wire up the WeightStreamingManager
+    #     wsm = WeightStreamingManager(
+    #         self.model,
+    #         device=self.args.device,
+    #         prefetch_distance=config['prefetch_distance'],
+    #         max_cached_layers=config['max_cached_layers'],
+    #         warmup_layers=config['warmup_layers'],
+    #         verbose=True,  # force verbose to help verify integration
+    #     )
+
+    #     # Store WSM reference for later access
+    #     self.weight_streaming_manager = wsm
+
+    #     # Integrate WSM hooks into layers (attn/ffn)
+    #     self._integrate_wsm_to_layers(wsm, self.streams)
+
+    #     # Configure KV streams if offloaders exist
+    #     self._configure_kv_streams()
+
+    #     # Verify and fix device placements to avoid accidental CPU/GPU mismatches
+    #     self._verify_and_fix_device_placement()
+
+    #     # Optional diagnostics
+    #     try:
+    #         first_blk = getattr(self.model, "layers", [None])[0]
+    #         if first_blk is not None:
+    #             print("[CHECK] first block param device:", next(first_blk.parameters()).device)
+    #     except Exception:
+    #         pass
+
+    #     print("✅ Weight streaming enabled (activations on GPU, weights streamed per-layer).")
+    #     print("⚙️  Running on GPU")
+    #     return wsm
+
+    # def _configure_ssd_streaming(self, ssd_config: dict):
+    #     """
+    #     Enable SSD-backed hybrid weight streaming: SSD -> CPU cache -> GPU streaming.
+    #     """
+    #     from pathlib import Path
+    #     print("🚀 Configuring SSD Hybrid Streaming...")
+
+    #     # Local imports intentionally kept
+    #     from .weight_streaming_manager import WeightStreamingManager
+    #     import llama3.layers
+    #     from llama3 import stream_mnt
+
+    #     # Default config
+    #     config = {
+    #         'ssd_manifest_path': None,      # required: runtime_manifest.json (or shapes_meta.json, see below)
+    #         'prefetch_distance': 2,
+    #         'max_cached_layers': 4,
+    #         'cpu_cache_layers': 50,
+    #         'staging_mb': 64,
+    #         'warmup_layers': 2,
+    #         'verbose': True,
+    #         'check_dram_capacity': True,
+    #     }
+    #     config.update(ssd_config)
+
+    #     if not str(self.args.device).startswith("cuda"):
+    #         raise RuntimeError("SSD streaming requires a CUDA device")
+
+    #     if config['ssd_manifest_path'] is None:
+    #         raise ValueError("ssd_manifest_path is required (runtime_manifest.json or shapes_meta.json)")
+
+    #     mp = str(config['ssd_manifest_path'])
+    #     if not Path(mp).exists():
+    #         raise FileNotFoundError(f"SSD manifest not found: {mp}")
+
+    #     # Optional: if a shapes_meta.json is provided, build runtime manifest on the fly.
+    #     if mp.endswith(".shapes_meta.json"):
+    #         try:
+    #             from .weights_io_ssd_dram import build_runtime_manifest
+    #             out_path = "/dev/shm/runtime_manifest.json"
+    #             build_runtime_manifest(mp, out_path)
+    #             config['ssd_manifest_path'] = out_path
+    #             print(f"[SSD] Built runtime manifest → {out_path}")
+    #         except Exception as e:
+    #             raise RuntimeError(f"Failed to build runtime manifest from shapes_meta: {e}")
+
+    #     # Ensure model.layers accessible
+    #     if hasattr(self.model, "layer_infos"):
+    #         try:
+    #             blocks = [info.block for info in self.model.layer_infos if info.block is not None]
+    #             if blocks and not hasattr(self.model, "layers"):
+    #                 self.model.layers = blocks
+    #         except Exception:
+    #             pass
+
+    #     # Keep small/core modules on HBM
+    #     self._configure_core_components()
+
+    #     # Mark streaming mode
+    #     if getattr(self, "_streaming_mode", None) not in (None, "ssd"):
+    #         raise RuntimeError(f"Another streaming mode already active: {self._streaming_mode}")
+    #     self._streaming_mode = "ssd"
+
+    #     # Create streams for SSD mode
+    #     self.streams = stream_mnt.get_streams(self.args.device)
+
+    #     # Normalize staging bytes (WSM will align to device block size)
+    #     staging_bytes = max(1, int(config['staging_mb'])) * 1024 * 1024
+
+    #     # Create WSM with SSD backend
+    #     wsm = WeightStreamingManager(
+    #         self.model,
+    #         device=self.args.device,
+    #         prefetch_distance=config['prefetch_distance'],
+    #         max_cached_layers=config['max_cached_layers'],
+    #         warmup_layers=config['warmup_layers'],
+    #         verbose=config['verbose'],
+    #         # SSD backend
+    #         ssd_manifest_path=config['ssd_manifest_path'],
+    #         cpu_cache_layers=config['cpu_cache_layers'],
+    #         staging_mb=config['staging_mb'],
+    #     )
+
+    #     # Store WSM reference for later access
+    #     self.weight_streaming_manager = wsm
+
+    #     # Integrate WSM hooks into layers
+    #     self._integrate_wsm_to_layers(wsm, self.streams)
+
+    #     # KV streams
+    #     self._configure_kv_streams()
+
+    #     # Verify placements
+    #     self._verify_and_fix_device_placement()
+        
+    #     # Keep args.device consistent with the actual compute device
+    #     self.args.device = str(self.model.embed_tokens.weight.device)
+    #     # 统一下游设备标志，避免后续再把 token 建在 CPU
+    #     try:
+    #         self.model.device = torch.device(self.args.device)
+    #     except Exception:
+    #         pass
+    #     if hasattr(self.model, "layers"):
+    #         for blk in self.model.layers:
+    #             for m in (blk, blk.attention, blk.feed_forward):
+    #                 if hasattr(m, "device"):
+    #                     m.device = torch.device(self.args.device)
+
+
+    #     # Print status
+    #     stats = wsm.get_ssd_stats()
+    #     print("✅ SSD Hybrid Streaming enabled:")
+    #     print(f"   📦 CPU cache: {stats.get('cpu_cache_max', config['cpu_cache_layers'])} layers")
+    #     print(f"   🎯 GPU cache: {config['max_cached_layers']} layers")
+    #     print(f"   🔄 Prefetch distance: {config['prefetch_distance']} layers")
+    #     print(f"   💾 Staging buffer: {config['staging_mb']} MB")
+    #     print("⚙️  Pipeline: SSD → CPU (pinned) → GPU (HBM)")
+    #     return wsm
 
     def _configure_core_components(self):
         """
@@ -508,6 +601,8 @@ class LLaMA:
         """
         device = self.args.device
         model = self.model
+
+        print(f"[_configure_core_components] Target device: {device}")
 
         # ★ 立即规定目标设备/精度（一次性做，不会搬大权重）
         if device.startswith("cuda"):
@@ -520,6 +615,11 @@ class LLaMA:
         model.embed_tokens = model.embed_tokens.to(device)
         model.norm = model.norm.to(device)
         model.output = model.output.to(device)
+
+        # ⭐ Sanity check：打印核心模块设备
+        print(f"[_configure_core_components] embed_tokens.weight.device: {model.embed_tokens.weight.device}")
+        print(f"[_configure_core_components] norm.weight.device: {model.norm.weight.device}")
+        print(f"[_configure_core_components] output.weight.device: {model.output.weight.device}")
 
         # Handle RoPE frequencies tensor/device placement
         self._handle_freqs_complex(device)
@@ -535,6 +635,7 @@ class LLaMA:
         if hasattr(model, "freqs_complex"):
             try:
                 model.freqs_complex = model.freqs_complex.to(device)
+                print(f"[_handle_freqs_complex] freqs_complex moved to {model.freqs_complex.device}")
             except Exception as e:
                 print(f"⚠️ Warning: Failed to move freqs_complex to {device}: {e}")
                 self._recreate_freqs_complex(device)
@@ -633,10 +734,31 @@ class LLaMA:
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
 
+            # ⭐⭐⭐ 强制把 embedding / norm / output 固定在 CUDA，并做断言式校验
+            print("🔒 Forcing critical modules to CUDA with assertion validation...")
+            m = self.model
+            dev = torch.device(device)
+
+            # 1) 强制常驻 CUDA 的小模块（确保即使前面有失败，这里也会重试）
+            m.embed_tokens = m.embed_tokens.to(dev)
+            m.norm         = m.norm.to(dev)
+            m.output       = m.output.to(dev)
+
+            # 2) 断言式校验（出问题直接抛，早失败）
+            assert m.embed_tokens.weight.is_cuda, \
+                f"embed_tokens.weight must be on CUDA, got {m.embed_tokens.weight.device}"
+
+            for name, mod in (("norm", m.norm), ("output", m.output)):
+                for pname, p in mod.named_parameters(recurse=True):
+                    assert p.is_cuda, \
+                        f"{name}.{pname} must be on CUDA, got {p.device}"
+
+            print("✅ All critical modules (embed_tokens, norm, output) are on CUDA and validated")
             print("✅ All layer components synchronized to target device")
         except Exception as e:
             print(f"⚠️ Error during device synchronization: {e}")
-            
+            raise  # Re-raise to fail-fast if critical modules can't be placed on CUDA
+
         # 取得真实计算设备（embed_tokens 已在 CUDA）
         gpu_dev = str(self.model.embed_tokens.weight.device)  # e.g. "cuda:0"
         self.args.device = gpu_dev            # 让后续逻辑看到一致的设备
@@ -656,7 +778,7 @@ class LLaMA:
                             off._ssd_buffer = None  # 若之前按 CPU 创过，丢弃，待下一次按 CUDA 重建
                 if hasattr(layer, "feed_forward"):
                     layer.feed_forward.device = gpu_dev
-
+            
 
     # ---------- Build ----------
     @staticmethod
@@ -798,6 +920,12 @@ class LLaMA:
             from .stream_mnt import get_streams
             llama.streams = get_streams(device)
             llama._integrate_wsm_to_layers(wsm, llama.streams)
+            # 🔥 Initial non-blocking warmup of first few groups
+            try:
+                if hasattr(wsm, 'warmup_groups_prefetch'):
+                    wsm.warmup_groups_prefetch(layers=cfg.get('warmup_layers', 2), blocking_first=False)
+            except Exception as _e:
+                print(f"[GEN] warmup_groups_prefetch skipped: {_e}")
 
             # Configure KV streams
             llama._configure_kv_streams()
@@ -1020,8 +1148,8 @@ class LLaMA:
                 # eos_mask = torch.zeros(bsz, dtype=torch.bool, device=self.args.device)  # track finished sequences
                 # prompt_mask = tokens != pad_id  # True where original prompt tokens exist
 
-                # dev = self.model.embed_tokens.weight.device
-                # dev = getattr(self.model, "device", self.args.device)
+                # ⭐⭐⭐ 强烈建议：tokens 在入口就上卡，避免后面 CPU tensor 走到 forward
+                # 使用 embed_tokens 的实际设备（已在 _verify_and_fix_device_placement 中确保在 CUDA）
                 dev = getattr(self.model, "device", None)
                 if dev is None:
                     try:
@@ -1029,16 +1157,29 @@ class LLaMA:
                     except Exception:
                         dev = self.args.device
                 dev = str(dev)
+
+                # ⭐ 关键：直接在目标设备上创建 tokens，non_blocking=True
                 tokens = torch.full(
                     size=(bsz, total_len),
                     fill_value=pad_id,
                     dtype=torch.long,
-                    device=dev,
-                    )
+                    device=dev,  # 直接在 CUDA 上创建
+                )
+
+                # ⭐ 写入 prompt tokens 时也确保在 CUDA 上
                 for i, tok in enumerate(batch_prompts):
-                    tokens[i, : len(tok)] = torch.tensor(tok, device=dev)
+                    # 直接在目标设备上创建 tensor，避免 CPU->GPU 拷贝
+                    tokens[i, : len(tok)] = torch.tensor(tok, dtype=torch.long, device=dev)
+
                 eos_mask = torch.zeros(bsz, dtype=torch.bool, device=dev)
                 prompt_mask = tokens != pad_id
+
+                # ⭐ 入口断言：确保 tokens 在 CUDA 上（早失败）
+                if not tokens.is_cuda:
+                    raise RuntimeError(
+                        f"[text_completion] tokens must be on CUDA, got {tokens.device}. "
+                        f"Check device placement in _verify_and_fix_device_placement."
+                    )
 
             except torch.cuda.OutOfMemoryError as e:
                 print(f"❌ CUDA OOM during batch {batch_idx + 1} tensor allocation: {e}")
@@ -1074,7 +1215,34 @@ class LLaMA:
                         nvtx.range_pop()  # prefill_phase (error case)
                         raise
                 nvtx.range_pop()  # prefill_phase
-            
+
+            # ========= Prefill→Decode 切换：原子切换到 decoder 模式 =========
+            # 旧版实现：仅调用 prime_decode_window() 来预热解码窗口
+            # 新版实现：调用 enter_decode_mode() 进行原子切换，包括：
+            #   1) 切换 prefetch distance（从 prefill 阶段的值切到 decoder 阶段的值）
+            #   2) 设置保护窗口（保护前 N 层，避免被 wrap-around 驱逐逻辑立刻踢出）
+            #   3) 启用 CPU 环窗模式（若使用 SSD 流式，确保始终有下一批层在 CPU 中准备）
+            #   4) 调用 prime_decode_window 预热解码窗口（同时启动 attn/ffn 双路 H2D）
+            # 这样可避免"刚 prime 就被驱逐"或"CPU 层还在路上"导致的首 token 抖动
+            if hasattr(self.model, 'weight_streaming_manager') and self.model.weight_streaming_manager is not None:
+                try:
+                    wsm = self.model.weight_streaming_manager
+                    # 1) 优先使用新版原子切换方法
+                    if hasattr(wsm, 'enter_decode_mode'):
+                        import os
+                        # WSM_DECODER_PROTECT_LAYERS: 保护前 N 层不被驱逐（默认 6 层）
+                        protect = int(os.getenv("WSM_DECODER_PROTECT_LAYERS", "6"))
+                        # WSM_PRIME_WINDOW: 预热窗口大小（默认 6 层）
+                        prime_w = int(os.getenv("WSM_PRIME_WINDOW", "6"))
+                        wsm.enter_decode_mode(first_layer=0, protect_layers=protect, prime_window=prime_w)
+                    else:
+                        # 2) 兼容旧版：如果 enter_decode_mode 不存在，回退到仅调用 prime_decode_window
+                        if hasattr(wsm, 'prime_decode_window'):
+                            import os
+                            wsm.prime_decode_window(first_layer=0, window=int(os.getenv("WSM_PRIME_WINDOW", "6")))
+                except Exception as e:
+                    if getattr(self.model.weight_streaming_manager, 'verbose', False):
+                        print(f"[WSM][enter_decode] failed: {e}")
 
             # Build progress bar description with global tracker if available
             try:
@@ -1093,6 +1261,11 @@ class LLaMA:
 
             # ========= ② Decode：从 prefill_len 开始单步生成 =========
             start_decode = prefill_len  # 第一轮 decode 读的是 tokens[:, prefill_len-1:prefill_len]
+
+            # 重置 CUDA 峰值内存统计（用于监控 batch=2 的显存峰值）
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
             # ---- Token-by-token decode loop ----
             for cur_pos in tqdm(range(start_decode, total_len), desc=desc):
                 nvtx.range_push(f"token_{cur_pos}_generation")
@@ -1144,6 +1317,13 @@ class LLaMA:
                         raise
 
                 nvtx.range_pop()  # token_generation
+
+                # ---- GPU 内存峰值监控（每 10 步或首/末步输出）----
+                step = cur_pos - start_decode
+                if torch.cuda.is_available() and (step % 10 == 0 or step == 0 or cur_pos == total_len - 1):
+                    alloc = torch.cuda.max_memory_allocated() / (1024**2)
+                    reserv = torch.cuda.max_memory_reserved() / (1024**2)
+                    print(f"[mem] step={step} alloc={alloc:.1f} MiB, reserved={reserv:.1f} MiB")
 
                 # ---- KV profile (rough estimate, same as original logic) ----
                 kv_re_time = sum(self.model.kv_times)

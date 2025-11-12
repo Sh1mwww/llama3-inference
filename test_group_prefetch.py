@@ -89,7 +89,8 @@ def test_grouped_mode_attributes():
             "_layer_prefetch_distance": hasattr(wsm, "_layer_prefetch_distance"),
             "_group_prefetch_distance": hasattr(wsm, "_group_prefetch_distance"),
             "gpu_max_groups": hasattr(wsm, "gpu_max_groups"),
-            "_gpu_group_lru": hasattr(wsm, "_gpu_group_lru"),
+            "_gpu_groups": hasattr(wsm, "_gpu_groups"),
+            "num_gpu_groups": hasattr(wsm, "num_gpu_groups"),
         }
 
         print("\n属性检查:")
@@ -286,14 +287,14 @@ def test_gpu_oom_protection():
             print("\n测试LRU淘汰机制:")
             if hasattr(wsm, '_evict_one_group_from_gpu'):
                 # 模拟添加一些组到LRU
-                wsm._gpu_group_lru = [(0, 'attn'), (1, 'attn'), (2, 'attn')]
-                print(f"  添加测试数据到LRU: {wsm._gpu_group_lru}")
+                wsm._gpu_groups = [(0, 'attn'), (1, 'attn'), (2, 'attn')]
+                print(f"  添加测试数据到环: {wsm._gpu_groups}")
 
                 # 尝试淘汰
                 result = wsm._evict_one_group_from_gpu(exclude=set())
                 if result:
                     print(f"  ✓ 成功淘汰一个组")
-                    print(f"  LRU状态: {wsm._gpu_group_lru}")
+                    print(f"  环状态: {wsm._gpu_groups}")
                 else:
                     print(f"  ⚠ 淘汰失败")
             else:

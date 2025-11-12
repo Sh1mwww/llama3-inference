@@ -126,46 +126,75 @@ class Transformer(nn.Module):
 
     def _forward_pipelined(self, tokens: torch.Tensor, start_pos: int) -> torch.Tensor:
         """
-        使用 EncoderBlock.forward_async() 的非阻塞接口。
-        注意：由于 L+1 依赖 L 的 out，这里仍是顺序等待上一个 Future，
-        但层内 MHA/FFN 与跨层 H2D 已被重叠，且接口对上层是异步友好的。
+        跨层事件串接：全程异步提交 + 仅在最后等待。
+
+        改进点：
+        1) 使用 forward_async() 返回 (out, done_evt)
+        2) L+1 的 forward_async 在提交时对 prev_done_evt 做 wait_event
+        3) CPU 不在每层同步，而是在所有层排完后再等待最后一个事件
+        4) 这样即使下一层不能提前算（数据依赖），CPU 也能提前把权重 H2D 挂到计算流
         """
-        dev = str(self.args.device)
+        # ⭐ 关键修复：使用 embed_tokens 的设备（已在 _verify_and_fix_device_placement 中确保在 CUDA）
+        # 而不是 self.args.device（可能还是字符串 "cuda" 或被错误设置为 "cpu"）
+        embed_dev = self.embed_tokens.weight.device
+        if not embed_dev.type.startswith("cuda"):
+            raise RuntimeError(
+                f"embed_tokens.weight must be on CUDA, got {embed_dev}. "
+                f"This should have been caught by _verify_and_fix_device_placement."
+            )
+
+        dev = embed_dev  # 使用实际的 CUDA device 对象，而不是字符串
         dtype = getattr(self, "param_dtype", torch.bfloat16)
 
         # 1) embed：确保 tokens 与 embedding 在同一设备（与原实现一致）
-        embed_dev = self.embed_tokens.weight.device
         if tokens.device != embed_dev:
             if tokens.device.type == "cpu" and not tokens.is_pinned():
                 tokens = tokens.pin_memory()
             tokens = tokens.to(embed_dev, non_blocking=True)
         if tokens.dtype != torch.long:
             tokens = tokens.long()
-        h = self.embed_tokens(tokens)
 
-        # 确保后续计算设备/精度
+        # 2) 执行 embedding
+        h = self.embed_tokens(tokens)  # 与权重同设备（必然是 CUDA）
+
+        # 3) 如有不一致，迁移到目标计算设备 + 统一 dtype
+        # ⭐ 安全网：即便 embedding 权重在 CPU，激活也会被立刻转回 CUDA，不会让后面崩掉
+        # （但由于上面已经检查了 embed_dev 必须是 CUDA，这里理论上不会触发设备转换）
         if h.device != dev or h.dtype != dtype:
             h = h.to(device=dev, dtype=dtype, non_blocking=True)
 
         # 2) freqs 只在设备不一致时搬一次（沿用缓存逻辑）
-        if getattr(self, "_freqs_cached_dev", None) != dev:
+        freqs_dev_key = str(dev)  # 用字符串作为缓存键
+        if getattr(self, "_freqs_cached_dev", None) != freqs_dev_key:
             self._freqs_cached = self.freqs_complex.to(dev, non_blocking=True)
-            self._freqs_cached_dev = dev
+            self._freqs_cached_dev = freqs_dev_key
         freqs = self._freqs_cached
 
-        # 3) 逐层，但用 forward_async()（层内与跨层 H2D 重叠已在层内完成）
-        futures = []
+        # 3) 跨层事件串接：逐层调用 forward_async，传递前一层的 done_evt
+        prev_done = None
         for idx, info in enumerate(self.layer_infos):
             blk = info["block"]
-            # 启动本层的异步执行（立即返回 Future）
-            f = blk.forward_async(h, start_pos, freqs)
-            # 由于下一层的输入依赖当前层的 out（数学依赖），此处必须拿结果
-            h = f.result()
-            futures.append(f)
+            # forward_async 返回 (out, done_evt)
+            # wait_on=prev_done 让 GPU 自动建立依赖，CPU 不阻塞
+            h, prev_done = blk.forward_async(h, start_pos, freqs, wait_on=prev_done)
 
             # 更新性能统计（与原 forward 一致）
             self.kv_times[idx] = blk.attention.kv_elapsed_time
             self.attn_times[idx] = blk.attention.attn_time
+
+        # 4) 到真正要用输出时再等待最后一层事件（同步点）
+        # ⭐ 使用 with torch.cuda.device(dev) 避免隐式同步（PyTorch 解析字符串设备时可能触发同步）
+        if prev_done is not None:
+            with torch.cuda.device(dev):
+                torch.cuda.current_stream(dev).wait_event(prev_done)
+            # 释放最后一层的事件（可选：如果 stream_mnt 需要）
+            try:
+                from llama3 import stream_mnt
+                # 注意：forward_async 中只释放了 mha_evt，ffn_evt 由这里释放
+                # 但我们无法拿到 ffn_eid，所以这里只做 wait_event
+                # 真正的 release 可以在 stream_mnt 中实现自动清理
+            except Exception:
+                pass
 
         h = self.norm(h)
         out = self.output(h).float()
@@ -188,26 +217,17 @@ class Transformer(nn.Module):
         # === 原 forward 的安全版（保持现有逻辑；如需保留，可继续使用）===
         bsz, seqlen = tokens.shape
 
-        if hasattr(self.args, 'device') and self.args.device and not self.args.device.startswith('meta'):
-            # 优先使用配置的设备
-            dev = torch.device(self.args.device)
-        elif len(self.layer_infos) > 0:
-            # 从第一个 layer 的任意参数推断计算设备（适用于 streaming）
-            first_layer = self.layer_infos[0]["block"]
-            # 尝试从 attention.wq 获取设备
-            if hasattr(first_layer, 'attention') and hasattr(first_layer.attention, 'wq'):
-                if hasattr(first_layer.attention.wq, 'weight'):
-                    dev = first_layer.attention.wq.weight.device
-                else:
-                    # meta 或未初始化，回退到 embed_tokens
-                    dev = self.embed_tokens.weight.device
-            else:
-                dev = self.embed_tokens.weight.device
-        else:
-            # 回退到 embed_tokens
-            dev = self.embed_tokens.weight.device
+        # ⭐ 关键修复：使用 embed_tokens 的设备（已在 _verify_and_fix_device_placement 中确保在 CUDA）
+        # 而不是 self.args.device（可能还是字符串 "cuda" 或被错误设置为 "cpu"）
+        embed_dev = self.embed_tokens.weight.device
+        if not embed_dev.type.startswith("cuda"):
+            raise RuntimeError(
+                f"embed_tokens.weight must be on CUDA, got {embed_dev}. "
+                f"This should have been caught by _verify_and_fix_device_placement."
+            )
 
-        dtype = getattr(self, "param_dtype", torch.bfloat16)   # ★ 统一的参数/激活 dtype
+        dev = embed_dev  # 使用实际的 CUDA device 对象，而不是字符串
+        dtype = getattr(self, "param_dtype", torch.bfloat16)
 
         # 首次调用时打印设备信息（调试用）
         if not hasattr(self, '_device_info_printed'):
@@ -219,23 +239,6 @@ class Transformer(nn.Module):
                     print(f"[DEVICE] layer[0].attention.wq.device: {first_attn.wq.weight.device}")
             self._device_info_printed = True
 
-        # ★ 处理 embed_tokens：它可能在 CPU（resident）或 GPU
-        # tokens 必须先转到 embed_tokens.weight 所在设备（满足 nn.Embedding 要求）
-        embed_dev = self.embed_tokens.weight.device
-        if embed_dev.type == "cuda":
-            dev = embed_dev
-        else:
-            # 退化到 args.device 或第一层可用权重的设备
-            dev = torch.device(str(getattr(self.args, "device", embed_dev)))
-            
-        dtype = getattr(self, "param_dtype", torch.bfloat16)
-        print(f"[DEVICE] 计算设备: {dev}")
-        print(f"[DEVICE] embed_tokens.weight.device: {self.embed_tokens.weight.device}")
-        try:
-            print(f"[DEVICE] layer[0].attention.wq.device: {self.layers[0].attention.wq.weight.device}")
-        except Exception:
-            pass
-
         # ★ 设备一致性检查：input tokens 必须与 embed.weight 在同一设备
         # nn.Embedding/F.embedding 要求：input 和 weight 必须在同一设备（CPU 或同一块 GPU）
         if tokens.device != embed_dev:
@@ -246,11 +249,11 @@ class Transformer(nn.Module):
             tokens = tokens.long()
 
         # 2) 执行 embedding 查表：此时 tokens 和 weight 已在同一设备
-        h = self.embed_tokens(tokens)  # -> 与 embedding 同设备
+        h = self.embed_tokens(tokens)  # -> 与 embedding 同设备（必然是 CUDA）
 
-        # 3) 验证 embedding 输出设备并确保在正确设备上
-        # 注意：h 的设备取决于 embed_tokens.weight 的设备，而 dev 是我们期望的计算设备
-        # 如果 embed_tokens 在 CPU，但我们需要在 GPU 上计算，必须转换
+        # 3) 如有不一致，迁移到目标计算设备 + 统一 dtype
+        # ⭐ 安全网：即便 embedding 权重在 CPU，激活也会被立刻转回 CUDA，不会让后面崩掉
+        # （但由于上面已经检查了 embed_dev 必须是 CUDA，这里理论上不会触发设备转换）
         if h.device != dev or h.dtype != dtype:
             # 打印调试信息（首次调用时）
             if not hasattr(self, '_device_warning_printed'):
@@ -261,9 +264,10 @@ class Transformer(nn.Module):
             h = h.to(device=dev, dtype=dtype, non_blocking=True)
 
         # 2) freqs 只在设备不一致时搬一次，避免每步重复 .to()
-        if getattr(self, "_freqs_cached_dev", None) != dev:
+        freqs_dev_key = str(dev)  # 用字符串作为缓存键
+        if getattr(self, "_freqs_cached_dev", None) != freqs_dev_key:
             self._freqs_cached = self.freqs_complex.to(dev, non_blocking=True)
-            self._freqs_cached_dev = dev
+            self._freqs_cached_dev = freqs_dev_key
         freqs = self._freqs_cached
 
         # 3) 运行时防呆：任何层若把激活搬回 CPU 立即报错（早失败）

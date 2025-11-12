@@ -1,5 +1,5 @@
 from __future__ import annotations
-import threading, time, collections, math
+import threading, time, collections, math, os
 from queue import Empty, Queue, Full
 from typing import List, Iterable, Tuple, Union, Optional
 import numpy as np
@@ -364,7 +364,9 @@ class KVOffloader:
         mirror_on_push: bool = True
         self._prefetch_lock = threading.Lock()
         self._prefetch_map = {}  # key: (layer, tuple(blocks), bsz) -> {'evt': evt, 'k': [..], 'v': [..]}
-        self.prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        # ✅ 增加 worker 数量：环境变量可配置，默认提高到 8（与 H2D backlog 配合）
+        kv_prefetch_workers = int(os.getenv("KV_PREFETCH_WORKERS", "8"))
+        self.prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=kv_prefetch_workers)
         
         # 轻量 GPU 暂存（仅保存“当前窗口”的块，跨调用可复用）
         self.gpu_k = [[None for _ in range(self.n_blocks)] for _ in range(self.layers)]
@@ -387,9 +389,17 @@ class KVOffloader:
                 except Empty:
                     continue
                 try:
+                    # ✅ 轻量轮询：避免阻塞线程在 synchronize()
                     if d2h_evt is not None:
-                        # 等待本块 D2H 完成（只等这个事件，不同步整条流）
-                        d2h_evt.synchronize()
+                        if not d2h_evt.query():
+                            # 事件未就绪：把任务放回队尾，稍后再试，避免阻塞整个线程
+                            try:
+                                self._pack_queue.put((L, B, d2h_evt), block=False)
+                            except Full:
+                                pass  # 队列满则丢弃（已有限流保护）
+                            time.sleep(0.001)  # 让出 CPU
+                            continue
+
                     kc = self.k_cpu[L][B]
                     vc = self.v_cpu[L][B]
                     if kc is None or vc is None:
@@ -459,9 +469,15 @@ class KVOffloader:
                 # 检查是否是 CUDA Event，如果是则等待完成后再打包
                 if isinstance(token, torch.cuda.Event):
                     try:
-                        token.synchronize()  # 背景线程等待，不阻塞主线程
+                        # ✅ 轻量轮询：避免后台写线程阻塞
+                        t0 = time.time()
+                        while not token.query():
+                            if time.time() - t0 > 5.0:  # 5秒超时
+                                print(f"[WARN] Event timeout @L{layer} B{blk}")
+                                break
+                            time.sleep(0.001)
                     except Exception as e:
-                        print(f"[WARN] Event sync failed @L{layer} B{blk}: {e}")
+                        print(f"[WARN] Event poll failed @L{layer} B{blk}: {e}")
                         continue
                     # 事件完成后，从 CPU pinned 内存打包 KV
                     if self.k_cpu[layer][blk] is None or self.v_cpu[layer][blk] is None:
@@ -477,8 +493,11 @@ class KVOffloader:
                     # 优先使用回你已有的 write_async；如不可用可退回 write()
                     if hasattr(self.ssd, "write_async"):
                         self.ssd.write_async(layer, blk, kv_cpu, sync=False)
+                        self.on_ssd[layer][blk] = True
                     else:
                         self.ssd.write(layer, blk, kv_cpu)
+                        self.on_ssd[layer][blk] = True  # mirror complete: SSD has a copy
+
                     self._win_bytes.append((time.time(), nbytes))
                     self._win_sum += nbytes
                 except Exception as e:
@@ -620,7 +639,12 @@ class KVOffloader:
             local_blks, local_tensors = [], []
             for e, B in zip(events, ev_blks):
                 try:
-                    e.synchronize()
+                    # ✅ 轻量轮询：避免 spill 线程阻塞
+                    t0 = time.time()
+                    while not e.query():
+                        if time.time() - t0 > 5.0:  # 5秒超时
+                            break
+                        time.sleep(0.001)
                 except Exception:
                     pass
                 kv_pack = torch.cat([self.k_cpu[layer][B], self.v_cpu[layer][B]], dim=-1).contiguous()
@@ -638,12 +662,8 @@ class KVOffloader:
                             self._v_raw_buf[layer][BB] = None
                         self.k_cpu[layer][BB] = self.v_cpu[layer][BB] = None
                         self.on_ssd[layer][BB] = True
-                try:
                     fut.add_done_callback(_on_done)
-                except Exception:
-                    fut.result(timeout=None)
-                    _on_done(None)
-        threading.Thread(target=_spill_job, daemon=True).start()
+        threading.Thread(target=_spill_job, name="kv_spill", daemon=True).start()
 
         # 在 KVOffloader 类中追加
     def prefetch_for_next_layer(self, *, current_layer: int, start_pos: int, seqlen: int,
@@ -788,7 +808,12 @@ class KVOffloader:
         # 1) SSD->DRAM 走后台线程；完成后在同线程里继续排 H2D
         def _task():
             # 1.1 拉回仍在 SSD 的块到 DRAM
-            need = [b for b in uniq if self.on_ssd[layer][b]]
+            # need = [b for b in uniq if self.on_ssd[layer][b]]
+            need = []
+            for b in uniq:
+                if self.on_ssd[layer][b] and (self.k_cpu[layer][b] is None or self.v_cpu[layer][b] is None):
+                    need.append(b)
+
             for b in need:
                 try:
                     self._load_from_ssd(layer, b)
@@ -858,11 +883,11 @@ class KVOffloader:
         if not torch.cuda.is_available():
             return
 
-        # 选流：优先调用方传入；否则用 offloader 的 kv_h2d（如有）
-        s = stream or getattr(self.streams, "kv_h2d", None) if hasattr(self, 'streams') else None
+        s = stream
+        if s is None and hasattr(self, "streams"):
+            s = getattr(self.streams, "kv_h2d", None)
         if s is None:
-            # 退化到当前流也可工作，但建议总是传入 kv_h2d
-            s = torch.cuda.current_stream()
+            raise RuntimeError("kv_h2d stream is required for async prefetch (no fallback).")
 
         # 兼容已有 prefetch_async()（它内部会创建/记录 block 事件到 self._kv_ready_events）
         try:
@@ -1141,6 +1166,7 @@ class KVOffloader:
 
         # Actual write: concat K and V on the last dim
         self.ssd.write(L, B, torch.cat([self.k_cpu[L][B], self.v_cpu[L][B]], dim=-1))
+        
 
         # 释放底层 buffer 回全局池
         if self._k_raw_buf[L][B] is not None:
@@ -1198,7 +1224,9 @@ class KVOffloader:
         self._alloc_block(L, B)
         self.k_cpu[L][B].copy_(k_gpu.cpu())
         self.v_cpu[L][B].copy_(v_gpu.cpu())
-        self.on_ssd[L][B] = False
+        # self.on_ssd[L][B] = False
+        self.on_ssd[L][B] = True  # SSD 仍保留副本；DRAM 是否存在看 k_cpu/v_cpu
+
 
 
     def throttle_writes_for(self, ms: int):
