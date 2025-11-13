@@ -1235,11 +1235,22 @@ class LLaMA:
                         # WSM_PRIME_WINDOW: 预热窗口大小（默认 6 层）
                         prime_w = int(os.getenv("WSM_PRIME_WINDOW", "6"))
                         wsm.enter_decode_mode(first_layer=0, protect_layers=protect, prime_window=prime_w)
+
+                        # ⭐ 解码前的"首层屏障"：显式确保 L0 事件已就绪
+                        # 这能把"偶发行程波动"变成确定性等待
+                        if hasattr(wsm, 'wait_group_ready'):
+                            wsm.wait_group_ready(0, 'attn')  # wait_group_ready 内部已取模
+                            wsm.wait_group_ready(0, 'ffn')
                     else:
                         # 2) 兼容旧版：如果 enter_decode_mode 不存在，回退到仅调用 prime_decode_window
                         if hasattr(wsm, 'prime_decode_window'):
                             import os
                             wsm.prime_decode_window(first_layer=0, window=int(os.getenv("WSM_PRIME_WINDOW", "6")))
+
+                            # ⭐ 解码前的"首层屏障"（兼容旧版）
+                            if hasattr(wsm, 'wait_group_ready'):
+                                wsm.wait_group_ready(0, 'attn')
+                                wsm.wait_group_ready(0, 'ffn')
                 except Exception as e:
                     if getattr(self.model.weight_streaming_manager, 'verbose', False):
                         print(f"[WSM][enter_decode] failed: {e}")

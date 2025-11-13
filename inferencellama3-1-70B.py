@@ -641,12 +641,13 @@ def main():
         probe("after runtime clamp")
 
     # 2) WSM（SSD 流式）构造参数
+    PRIME_WINDOW = int(os.getenv("WSM_PRIME_WINDOW", "6"))  # 从环境变量读取，默认6
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
         "max_cached_layers": 8,                     # 保险
         "cpu_cache_layers": CPU_CAP_VALUE,          # CPU 环形容量
-        "warmup_layers": 2,                         # ⚠️ Fix: 预热前 2 层到 GPU（避免首层竞态）
+        "warmup_layers": PRIME_WINDOW,              # ✅ Fix: 必须与 prime_window 一致，确保L0-L5都预热
         "staging_mb": 64,
         "verbose": True,
     }

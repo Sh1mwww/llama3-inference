@@ -594,7 +594,7 @@ class WeightStreamingManager:
         self.pair_ahead_layers = int(os.getenv("WSM_PAIR_AHEAD", "2"))           # 就近层数，优先同层→i+1→i+2
         self.kind_ahead_cap = int(os.getenv("WSM_KIND_AHEAD_CAP", "2"))          # 单一类型最多前瞻距离
 
-
+    
         # --- within WeightStreamingManager.__init__ ---
         # ❌ 删除第三次重复赋值：gpu_max_groups 已在前面统一设置
         self.target_gpu_groups   = int(os.getenv("WSM_TARGET_GPU_GROUPS", str(self.gpu_max_groups)))
@@ -1338,11 +1338,17 @@ class WeightStreamingManager:
         return L0, L1
 
     def _layer_in_cpu_window(self, layer_idx: int) -> bool:
-        """判断指定层是否仍在当前 CPU 缓存目标窗口内。"""
-        if self.n_layers <= 0:
-            return False
-        L0, L1 = self._target_cpu_window()
-        return L0 <= int(layer_idx) <= L1
+        """
+        环形或线性 CPU 窗口判定：
+        - cpu_ring_mode=True 时，用环形区间 [base, base+cap) 判定；
+        - 否则退回到线性 [L0, L1] 判定。
+        """
+        if getattr(self, "cpu_ring_mode", False):
+            base = int(getattr(self, "cpu_win_base", 0))
+            cap  = int(getattr(self, "cpu_cache_cap", getattr(self, "cpu_cache_layers", 40)))
+            return self._ring_contains(base, int(layer_idx), cap)  # 利用 ((L-base)%n)<cap【turn22file16†weight_streaming_manager.py†L5-L10】
+        L0, L1 = self._target_cpu_window()  # 线性窗口仍保留【turn23file5†weight_streaming_manager.py†L1-L18】
+        return (int(layer_idx) >= L0) and (int(layer_idx) <= L1)
 
     def _ensure_cpu_window(self):
         """
@@ -1593,7 +1599,7 @@ class WeightStreamingManager:
             print(f"[WSM DEBUG] _load_layer_to_cpu skipping layer {layer_idx}: ssd_enabled={self.ssd_enabled}, in_cache={layer_idx in self.cpu_cache}")
             return
 
-        # ★ 修复 5: 去重 - 检查是否已在加载中
+        #  去重 - 检查是否已在加载中
         with self._inflight_lock:
             if layer_idx in self._inflight_cpu_layers:
                 if self.verbose:
@@ -4112,7 +4118,9 @@ class WeightStreamingManager:
 
             # 快速检查：如果不在窗口内，直接跳过
             with self._cpu_lock:
-                if not self._layer_in_cpu_window(layer_idx):
+                in_win = self._layer_in_cpu_window(layer_idx)
+                in_protect = (int(layer_idx) in getattr(self, "_cpu_protect_set", set()))
+                if not (in_win or in_protect):
                     self._inflight_cpu_layers.discard(layer_idx)
                     self._cpu_pf_q.task_done()
                     continue
@@ -4131,12 +4139,15 @@ class WeightStreamingManager:
         使用线程私有的 staging buffer 避免数据竞争。
         """
         # 过期保护
+        layer_idx = self._wrap(int(layer_idx))     # 统一环形层号
         with self._cpu_lock:
             if epoch != self._epoch:
                 self._inflight_cpu_layers.discard(layer_idx)
                 self._cpu_pf_q.task_done()
                 return
-            if not self._layer_in_cpu_window(layer_idx):
+            in_win = self._layer_in_cpu_window(layer_idx)
+            in_protect = (int(layer_idx) in getattr(self, "_cpu_protect_set", set()))
+            if not (in_win or in_protect):
                 self._inflight_cpu_layers.discard(layer_idx)
                 self._cpu_pf_q.task_done()
                 return
@@ -4213,14 +4224,14 @@ class WeightStreamingManager:
                     print(f"[WSM] Failed to trigger GPU prefetch for ({layer_idx}, {g}): {e}")
 
         # 可选：顺带触发窗口顶补，填实 GPU 预算
-        if wants:
-            try:
-                # 使用最近执行的层作为锚点，或者使用刚就绪的层
-                anchor = getattr(self, "_last_executed_layer", layer_idx)
-                self.rebalance_and_topoff(anchor)
-            except Exception as e:
-                if self.verbose:
-                    print(f"[WSM] rebalance_and_topoff failed in cpu_ready callback: {e}")
+        # if wants:
+        #     try:
+        #         # 使用最近执行的层作为锚点，或者使用刚就绪的层
+        #         anchor = getattr(self, "_last_executed_layer", layer_idx)
+        #         self.rebalance_and_topoff(anchor)
+        #     except Exception as e:
+        #         if self.verbose:
+        #             print(f"[WSM] rebalance_and_topoff failed in cpu_ready callback: {e}")
                     
         # 回调末尾顺手把 CPU 填到目标
         try:
