@@ -1,5 +1,5 @@
 from __future__ import annotations
-import threading, time, collections, math, os
+import threading, time, collections, math, os, gc
 from queue import Empty, Queue, Full
 from typing import List, Iterable, Tuple, Union, Optional
 import numpy as np
@@ -22,10 +22,13 @@ class DRAMPool:
     """
     全局 DRAM 池，支持预分配和懒分配两种模式
     Global DRAM pool supporting both preallocate and lazy allocation modes
+
+    温和改造版本：在空闲期自动回收多余的 pinned 内存到 OS（牺牲少量吞吐换取更低的 RSS）
+    Gentle refactor: automatically reclaim excess pinned memory to OS during idle periods
     """
     def __init__(self, bytes_limit_gb: float, block_bytes: int,
                  preallocate: bool = False, lazy_init: bool = True,
-                 verbose: bool = True):
+                 verbose: bool = True, trim_backoff: float = 0.9):
         self.bytes_limit = int(bytes_limit_gb * (1 << 30))
         self.block_bytes = int(block_bytes)
         # ★ 向上对齐到 4KiB（与后续可能的 O_DIRECT 对接安全）
@@ -35,6 +38,11 @@ class DRAMPool:
         self.lazy_init = lazy_init
         self.used = 0
         self.lock = threading.Lock()
+
+        # 温和改造：空闲内存回收参数
+        # Gentle refactor: idle memory reclaim parameters
+        self.trim_backoff = trim_backoff  # e.g., 0.9：当池空闲超过 10% 时尝试把老块真正释放给 OS
+        self._last_trim_ts = 0.0  # 上次 trim 的时间戳（避免频繁 GC）
 
         # 懒分配池：可复用 pinned 块的栈 & 活跃集合（用 data_ptr 跟踪）
         self.lazy_free = []
@@ -119,7 +127,7 @@ class DRAMPool:
             for i, t in enumerate(self.lazy_free):
                 if t.numel() == need_bytes:
                     blk = self.lazy_free.pop(i)
-                    self.lazy_live.add(blk.storage().data_ptr())
+                    self.lazy_live.add(blk.untyped_storage().data_ptr())
                     self.used += need_bytes
                     return blk
 
@@ -138,6 +146,9 @@ class DRAMPool:
         """
         释放一个由 alloc_block 产生的块（支持两种模式）
         Free a block produced by alloc_block (supports both modes)
+
+        温和改造：释放后尝试回收多余的空闲块
+        Gentle refactor: after freeing, attempt to reclaim excess idle blocks
         """
         with self.lock:
             if self.dram_buf is not None:
@@ -154,6 +165,50 @@ class DRAMPool:
                     self.lazy_live.remove(ptr)
                     self.lazy_free.append(buf)
                     self.used -= buf.numel()
+                    # 温和改造：尝试回收多余空闲块
+                    self._maybe_trim()
+
+    def _maybe_trim(self):
+        """
+        温和改造：当空闲块的总字节数超过 limit_bytes * (1 - trim_backoff) 时，真正释放一部分
+        Gentle refactor: when free blocks exceed limit_bytes * (1 - trim_backoff), release some to OS
+
+        注意：
+        - 只在懒分配模式下有效（预分配模式已提前分配整块内存）
+        - 节流限制：至少间隔 0.5 秒才执行一次 trim（避免频繁 GC）
+        - PyTorch 的 pinned allocator 也会做缓存，这个改造只能尽力推低 OS 看到的 RSS
+
+        Notes:
+        - Only effective in lazy allocation mode (preallocate mode already allocated entire buffer)
+        - Throttle: execute trim at most once every 0.5 seconds (avoid frequent GC)
+        - PyTorch's pinned allocator also caches, this can only try to reduce OS-visible RSS
+        """
+        # 只在懒分配模式下执行 trim
+        if self.dram_buf is not None:
+            return
+
+        # 节流：至少间隔 0.5 秒
+        now = time.time()
+        if now - self._last_trim_ts < 0.5:
+            return
+
+        # 计算当前空闲块的总字节数
+        free_bytes = sum(b.numel() for b in self.lazy_free)
+        target_free = int(self.bytes_limit * (1 - self.trim_backoff))
+
+        if free_bytes > target_free:
+            bytes_to_release = free_bytes - target_free
+            released = 0
+            # 从末尾释放（LIFO，释放最老的空闲块）
+            while self.lazy_free and released < bytes_to_release:
+                t = self.lazy_free.pop()
+                released += t.numel()
+                # 通过丢弃 Tensor 引用把 pinned 内存交还给上层 allocator
+                del t
+            # 请求 Python 层回收（温和：不强制 CUDA 同步）
+            gc.collect()
+
+        self._last_trim_ts = now
 
     def stats_str(self) -> str:
         """返回池的统计信息字符串"""
@@ -180,6 +235,7 @@ def _pool_cfg_tuple():
         int(KVCacheArgs.block_bytes),
         bool(getattr(KVCacheArgs, "preallocate", False)),
         bool(getattr(KVCacheArgs, "lazy_init", True)),
+        float(getattr(KVCacheArgs, "trim_backoff", 0.9)),
     )
 
 
@@ -197,6 +253,7 @@ def _get_or_create_pool(verbose: bool = True) -> DRAMPool:
             preallocate=cfg[2],
             lazy_init=cfg[3],
             verbose=verbose,
+            trim_backoff=cfg[4],
         )
         _GLOBAL_POOL_CFG = cfg
     return _GLOBAL_DRAM_POOL
@@ -365,7 +422,7 @@ class KVOffloader:
         self._prefetch_lock = threading.Lock()
         self._prefetch_map = {}  # key: (layer, tuple(blocks), bsz) -> {'evt': evt, 'k': [..], 'v': [..]}
         # ✅ 增加 worker 数量：环境变量可配置，默认提高到 8（与 H2D backlog 配合）
-        kv_prefetch_workers = int(os.getenv("KV_PREFETCH_WORKERS", "8"))
+        kv_prefetch_workers = int(os.getenv("KV_PREFETCH_WORKERS", "3"))
         self.prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=kv_prefetch_workers)
         
         # 轻量 GPU 暂存（仅保存“当前窗口”的块，跨调用可复用）
@@ -525,24 +582,21 @@ class KVOffloader:
 
             # 从全局池中分配 K 块
             k_buf = self.pool.alloc_block(single_kv_bytes)
-            if k_buf is None:
-                # 达到 DRAM 配额，回退到直接分配或报错
-                print(f"[KVOffloader][WARN] DRAM pool exhausted, cannot allocate K block for L{layer} B{blk}")
-                # 回退：直接分配（不受池管理）
-                self.k_cpu[layer][blk] = torch.zeros(shape, dtype=torch.float16, pin_memory=True)
-                self.v_cpu[layer][blk] = torch.zeros_like(self.k_cpu[layer][blk])
-                return
+            while k_buf is None:
+                freed = self._maybe_evict(force=True)  # 需要让 _maybe_evict 支持返回是否释放了块
+                if not freed:
+                    time.sleep(0.001)
+                k_buf = self.pool.alloc_block(single_kv_bytes)
+            self.k_cpu[layer][blk] = k_buf
 
             # 从全局池中分配 V 块
             v_buf = self.pool.alloc_block(single_kv_bytes)
-            if v_buf is None:
-                # V 分配失败，释放已分配的 K 块
-                self.pool.free_block(k_buf)
-                print(f"[KVOffloader][WARN] DRAM pool exhausted, cannot allocate V block for L{layer} B{blk}")
-                # 回退：直接分配
-                self.k_cpu[layer][blk] = torch.zeros(shape, dtype=torch.float16, pin_memory=True)
-                self.v_cpu[layer][blk] = torch.zeros_like(self.k_cpu[layer][blk])
-                return
+            while v_buf is None:
+                freed = self._maybe_evict(force=True)  # 需要让 _maybe_evict 支持返回是否释放了块
+                if not freed:
+                    time.sleep(0.001)
+                v_buf = self.pool.alloc_block(single_kv_bytes)
+            self.v_cpu[layer][blk] = v_buf
 
             # 将 uint8 缓冲区 view 为 float16 并 reshape 到所需形状
             k_view = k_buf[:single_kv_bytes].view(torch.float16).reshape(shape)
@@ -662,8 +716,103 @@ class KVOffloader:
                             self._v_raw_buf[layer][BB] = None
                         self.k_cpu[layer][BB] = self.v_cpu[layer][BB] = None
                         self.on_ssd[layer][BB] = True
-                    fut.add_done_callback(_on_done)
+                fut.add_done_callback(_on_done)
         threading.Thread(target=_spill_job, name="kv_spill", daemon=True).start()
+
+    def eager_spill_decode_window(self, upto_token: int, keep_tail_blocks: int = 1,
+                                   include_partial: bool = False, layers: Optional[List[int]] = None):
+        """
+        Decode 阶段边走边"落 SSD"：保持"尾窗"在 DRAM，其余立即下放。
+
+        在每生成若干 token 后调用，把"窗口之外"的老 block（完整块）下放到 SSD 并释放 DRAM。
+        这样 DRAM 中始终只保留"最近 keep_tail_blocks 个 block"的 KV，历史 block 进入 SSD。
+
+        Args:
+            upto_token: 当前已生成到的 token 位置（start_pos + seqlen）
+            keep_tail_blocks: 保留在 DRAM 中的尾部 block 数量（默认 1 个 block = 256 tokens）
+            include_partial: 是否包含未填满的 partial block（默认 False，只写完整块）
+            layers: 要处理的层列表（None = 处理所有层）
+
+        调用示例（在 SelfAttention.decode 的每步或每 N 步）：
+            offloader.eager_spill_decode_window(start_pos + seqlen, keep_tail_blocks=1, include_partial=False)
+        """
+        if self.ssd is None:
+            return  # 无 SSD 时不执行下放
+
+        # 计算要下放的 block 范围：[0, end_blk]
+        # end_blk = (upto_token // BLOCK) - keep_tail_blocks
+        end_blk = (int(upto_token) // BLOCK) - int(keep_tail_blocks)
+        if end_blk < 0:
+            return  # 还没有足够的 block 需要下放
+
+        # 确定要处理的层
+        target_layers = layers if layers is not None else list(range(self.layers))
+
+        # 遍历每一层，下放窗口外的 block
+        for L in target_layers:
+            for B in range(0, end_blk + 1):
+                # 跳过不在 DRAM 的块
+                if self.k_cpu[L][B] is None:
+                    continue
+
+                # 判断是否为完整块（根据 importance 或 access_count > 0）
+                is_full = self._is_full_block(L, B, upto_token)
+
+                # 根据 include_partial 决定是否下放
+                if include_partial or is_full:
+                    self._spill_to_ssd(L, B)
+
+    def _is_full_block(self, layer: int, blk: int, upto_token: int) -> bool:
+        """
+        判断一个 block 是否已完整填充。
+
+        完整块的定义：该 block 覆盖的 token 范围 [B*BLOCK, (B+1)*BLOCK) 都已写入。
+        简化判断：如果 upto_token > (B+1)*BLOCK，则该块必定完整。
+
+        Args:
+            layer: 层索引
+            blk: block 索引
+            upto_token: 当前已生成到的 token 位置
+
+        Returns:
+            True 表示该 block 已完整填充
+        """
+        block_end_token = (blk + 1) * BLOCK
+        return upto_token >= block_end_token
+
+    def append_token_to_gpu(self, layer: int, blk: int, t_in_blk: int,
+                            k: torch.Tensor, v: torch.Tensor):
+        """
+        增量 H2D：只把"新增的那个 token"复制到 GPU，避免整块 H2D。
+
+        在 decode 阶段，每生成一个新 token，只需要把该 token 的 KV 增量复制到 GPU 缓冲区，
+        而不是每次都整块拷贝。这样可以大幅减少 H2D 带宽占用。
+
+        Args:
+            layer: 层索引
+            blk: block 索引
+            t_in_blk: token 在 block 内的偏移（0..BLOCK-1）
+            k: 当前 token 的 K，形状 (bsz, n_kv_heads, head_dim)
+            v: 当前 token 的 V，形状 (bsz, n_kv_heads, head_dim)
+
+        调用示例（在 SelfAttention.forward 的 decode 分支）：
+            t_in_blk = int(start_pos) % BLOCK
+            offloader.append_token_to_gpu(self.layer_id, cur_blk, t_in_blk, k_curr, v_curr)
+        """
+        bsz = int(k.size(0))
+        shape = (bsz, self.heads, BLOCK, self.dim)
+
+        # 如果 GPU 缓冲区不存在或形状不匹配，则分配新缓冲区
+        if self.gpu_k[layer][blk] is None or tuple(self.gpu_k[layer][blk].shape) != shape:
+            self.gpu_k[layer][blk] = torch.empty(shape, dtype=k.dtype, device=self.device)
+            self.gpu_v[layer][blk] = torch.empty(shape, dtype=v.dtype, device=self.device)
+
+        # 使用 H2D 流进行增量复制（只复制一个 token 的数据）
+        s = self.h2d_stream or torch.cuda.current_stream()
+        with torch.cuda.stream(s):
+            # 只复制 t_in_blk 这一帧（slice assignment，高效）
+            self.gpu_k[layer][blk][:bsz, :, t_in_blk, :].copy_(k, non_blocking=True)
+            self.gpu_v[layer][blk][:bsz, :, t_in_blk, :].copy_(v, non_blocking=True)
 
         # 在 KVOffloader 类中追加
     def prefetch_for_next_layer(self, *, current_layer: int, start_pos: int, seqlen: int,
@@ -756,24 +905,40 @@ class KVOffloader:
         k_parts, v_parts = [], []
 
         # 1) 先补齐还在 SSD 的块到 DRAM
-        need_load = [b for b in uniq if self.on_ssd[layer][b]]
+        need_load = [b for b in uniq if (self.k_cpu[layer][b] is None or self.v_cpu[layer][b] is None)]
         for b in need_load:
             self._load_from_ssd(layer, b)
 
-        # 2) H2D（优先复用 GPU 暂存；缺失才 .to()）
+        # 2) H2D（优先复用 GPU 暂存；缺失才 .to()，并更新 GPU 缓存）
         stream = self.h2d_stream or torch.cuda.current_stream()
         with torch.cuda.stream(stream):
             for b in uniq:
                 kg = self.gpu_k[layer][b]
                 vg = self.gpu_v[layer][b]
+
+                # ⭐ Fast path: GPU 缓存命中，直接复用（增量 H2D 的收益体现）
                 if kg is not None and vg is not None and kg.size(0) >= use_bsz:
                     k_parts.append(kg[:use_bsz])
                     v_parts.append(vg[:use_bsz])
                 else:
+                    # ⭐ Slow path: GPU 缓存未命中，需要整块 CPU → GPU 拷贝
+                    # 但拷贝后立即缓存到 gpu_k/gpu_v，下次可命中 fast path
                     kc = self.k_cpu[layer][b][:use_bsz]
                     vc = self.v_cpu[layer][b][:use_bsz]
-                    k_parts.append(kc.to(self.device, non_blocking=True))
-                    v_parts.append(vc.to(self.device, non_blocking=True))
+
+                    # 检查是否需要分配新的 GPU 缓冲区
+                    shape = (use_bsz, self.heads, BLOCK, self.dim)
+                    if kg is None or tuple(kg.shape) != shape:
+                        self.gpu_k[layer][b] = torch.empty(shape, dtype=kc.dtype, device=self.device)
+                        self.gpu_v[layer][b] = torch.empty(shape, dtype=vc.dtype, device=self.device)
+                        kg = self.gpu_k[layer][b]
+                        vg = self.gpu_v[layer][b]
+
+                    # 整块拷贝并缓存（这是首次访问的代价，后续 decode 步将命中 fast path）
+                    kg.copy_(kc, non_blocking=True)
+                    vg.copy_(vc, non_blocking=True)
+                    k_parts.append(kg)
+                    v_parts.append(vg)
 
         if stream is not torch.cuda.current_stream():
             torch.cuda.current_stream().wait_stream(stream)
@@ -1179,13 +1344,20 @@ class KVOffloader:
         self.k_cpu[L][B] = self.v_cpu[L][B] = None
         self.on_ssd[L][B] = True
 
-    def _maybe_evict(self):
+    def _maybe_evict(self, force: bool = False) -> bool:
         """
         If DRAM usage (hot blocks) exceeds limit, evict the globally least-important block.
         """
         hot_cnt = sum(x is not None for lay in self.k_cpu for x in lay)
-        if hot_cnt < self.dram_limit_blk:
-            return
+        over_quota = (hot_cnt >= self.dram_limit_blk)
+                
+        # 2) 字节压力：用“实际 pinned 每块字节（按 max_batch）”做硬保护
+        per_blk_pinned = 2 * self.max_batch * self.heads * BLOCK * self.dim * self.dtype_bytes
+        per_blk_pinned = int(math.ceil(per_blk_pinned / 4096) * 4096)
+        hard_pressure = (self.pool.used + per_blk_pinned) > int(self.pool.bytes_limit * getattr(KVCacheArgs, "trim_backoff", 0.9))
+
+        if not (over_quota or hard_pressure or force):
+            return False
 
         # Candidate with minimal global importance
         cand = [
@@ -1194,36 +1366,82 @@ class KVOffloader:
             for B in range(self.n_blocks)
             if self.k_cpu[L][B] is not None
         ]
+        
+        if not cand:
+            return False
         _, L, B = min(cand)
         self._spill_to_ssd(L, B)
+        return True
 
     def _load_from_ssd(self, L: int, B: int):
         """
         Load a spilled block from SSD → DRAM.
         从 SSD 加载已溢出的块 → DRAM。
-        Reuses a GPU buffer for read I/O and then copies back to pinned CPU.
-        重用 GPU 缓冲区进行读取 I/O，然后复制回固定 CPU。
+
+        **Zero-copy path (when enabled)**:
+        - Read directly from SSD into pinned uint8 buffer (no GPU intermediate)
+        - View as float16 and split K/V in-place
+        - Single copy: pinned→pinned (fast)
+        零拷贝路径：SSD → pinned uint8 → view float16 → 分割 K/V
+
+        **Legacy path (GPU buffer)**:
+        - Reuses a GPU buffer for read I/O and then copies back to pinned CPU.
+        旧路径：SSD → GPU → CPU pinned (两次拷贝)
         """
-        shape = (self.max_batch, self.heads, BLOCK, self.dim * 2)
-
-        # Reuse GPU buffer to avoid churn / 重用 GPU 缓冲区以避免频繁分配
-        if not hasattr(self, "_ssd_buffer") or self._ssd_buffer is None or tuple(self._ssd_buffer.shape) != shape:
-            self._ssd_buffer = torch.empty(shape, dtype=torch.float16, device=self.device)
-
         if self.ssd is None:
             # DRAM-only mode: data is lost → allocate empty block
             # 仅 DRAM 模式：数据丢失 → 分配空块
             self._alloc_block(L, B)
             return
 
-        # SSD read into GPU buffer → split → copy back to pinned CPU
-        # SSD 读取到 GPU 缓冲区 → 分割 → 复制回固定 CPU
-        self.ssd.read(L, B, self._ssd_buffer)
-        k_gpu, v_gpu = self._ssd_buffer.split(self.dim, dim=-1)
+        # ===== Zero-copy path: read directly into pinned uint8 buffer =====
+        USE_ZERO_COPY = os.getenv("KV_USE_ZERO_COPY_READ", "1") == "1"
 
-        self._alloc_block(L, B)
-        self.k_cpu[L][B].copy_(k_gpu.cpu())
-        self.v_cpu[L][B].copy_(v_gpu.cpu())
+        if USE_ZERO_COPY and hasattr(self.ssd, 'stride') and hasattr(self.ssd, 'blk_bytes'):
+            # Allocate aligned pinned buffer for SSD read
+            stride = self.ssd.stride
+            blk_bytes = self.ssd.blk_bytes
+
+            # Create pinned uint8 buffer (aligned to 4KiB)
+            # Reuse buffer if possible to reduce allocation overhead
+            if not hasattr(self, "_ssd_pinned_buffer") or self._ssd_pinned_buffer is None or self._ssd_pinned_buffer.numel() < stride:
+                self._ssd_pinned_buffer = torch.empty(stride, dtype=torch.uint8, pin_memory=True)
+
+            # Direct read from SSD → pinned memory (zero-copy, using os.preadv)
+            self.ssd.read(L, B, self._ssd_pinned_buffer)
+
+            # View effective bytes as float16 (in-place, no copy)
+            kv_flat = torch.frombuffer(
+                self._ssd_pinned_buffer[:blk_bytes].numpy(),
+                dtype=torch.float16
+            ).reshape(self.max_batch, self.heads, BLOCK, self.dim * 2)
+
+            # Split K/V (views, no copy)
+            k_view = kv_flat[..., :self.dim]
+            v_view = kv_flat[..., self.dim:]
+
+            # Allocate target blocks and copy (pinned→pinned, fast)
+            self._alloc_block(L, B)
+            self.k_cpu[L][B].copy_(k_view)
+            self.v_cpu[L][B].copy_(v_view)
+
+        else:
+            # ===== Legacy path: read via GPU buffer =====
+            shape = (self.max_batch, self.heads, BLOCK, self.dim * 2)
+
+            # Reuse GPU buffer to avoid churn / 重用 GPU 缓冲区以避免频繁分配
+            if not hasattr(self, "_ssd_buffer") or self._ssd_buffer is None or tuple(self._ssd_buffer.shape) != shape:
+                self._ssd_buffer = torch.empty(shape, dtype=torch.float16, device=self.device)
+
+            # SSD read into GPU buffer → split → copy back to pinned CPU
+            # SSD 读取到 GPU 缓冲区 → 分割 → 复制回固定 CPU
+            self.ssd.read(L, B, self._ssd_buffer)
+            k_gpu, v_gpu = self._ssd_buffer.split(self.dim, dim=-1)
+
+            self._alloc_block(L, B)
+            self.k_cpu[L][B].copy_(k_gpu.cpu())
+            self.v_cpu[L][B].copy_(v_gpu.cpu())
+
         # self.on_ssd[L][B] = False
         self.on_ssd[L][B] = True  # SSD 仍保留副本；DRAM 是否存在看 k_cpu/v_cpu
 

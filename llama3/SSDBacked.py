@@ -186,32 +186,65 @@ class RawBlockKVBackend:
             self.write_batch(layer, slots, tensors, sync=sync)
         return self.pool.submit(_task)
 
-    # ---------- sync read to GPU tensor ----------
-    def read(self, layer:int, slot:int, t_gpu:torch.Tensor):
+    # ---------- sync read to destination buffer (zero-copy path) ----------
+    def read(self, layer:int, slot:int, dst:torch.Tensor):
         """
-        读取一个 block 单元, 只copy有效 self.blk_bytes 长度
+        读取一个 block 单元到目标缓冲区（pinned uint8 tensor 或可转换的 tensor）。
+
+        **零拷贝路径（推荐）**：
+        - dst 是 pinned uint8 tensor，contiguous，满足 4KiB 对齐且 numel() >= self.stride
+        - 使用 os.preadv (或回退到 pread) 直接读取到 pinned 内存
+        - 调用方负责在 dst[:self.blk_bytes] 上做 dtype/shape 转换
+
+        **兼容路径（旧API）**：
+        - dst 是 GPU tensor (float16/bfloat16 等)
+        - 回退到临时 aligned buffer + copy 路径
+
+        Args:
+            layer: 层索引
+            slot: slot 索引
+            dst: 目标 tensor
+                - 零拷贝：torch.uint8 pinned, contiguous, numel() >= self.stride, 4KiB aligned
+                - 兼容：任意 GPU tensor，将从临时 buffer 拷贝
         """
+        # 零拷贝路径：dst 是 pinned uint8 tensor
+        if dst.dtype == torch.uint8 and dst.is_pinned() and dst.is_contiguous():
+            if dst.numel() >= self.stride:
+                arr = dst.numpy()[:self.stride]
+                ptr = arr.ctypes.data
+                if (ptr % ALIGN) == 0:
+                    # 直接读取到 pinned 内存，无拷贝
+                    if self._has_preadv:
+                        nread = os.preadv(self.fd, [arr], self._offset(layer, slot))
+                        if nread != self.stride:
+                            raise IOError(f"preadv read {nread} bytes, expected {self.stride}")
+                    else:
+                        raw_bytes = os.pread(self.fd, self.stride, self._offset(layer, slot))
+                        arr[:len(raw_bytes)] = np.frombuffer(raw_bytes, dtype=np.uint8)
+                    # 注意：调用方需要从 dst[:self.blk_bytes] 做 view/reshape
+                    return self.stride
+
+        # 兼容路径：dst 是 GPU tensor（旧API）
         buf = aligned_array((self.stride,), np.uint8)
-        # os.pread signature: pread(fd, length, offset)
         raw_bytes = os.pread(self.fd, self.stride, self._offset(layer, slot))
-        # Copy into aligned buffer
         buf[:len(raw_bytes)] = np.frombuffer(raw_bytes, dtype=np.uint8)
-        # Extract effective bytes and convert to float16 tensor
         effective_data = buf[:self.blk_bytes]
         h_tmp = torch.from_numpy(effective_data.copy()).view(torch.float16)
-        t_gpu.copy_(h_tmp.reshape(t_gpu.shape), non_blocking=True)
+        dst.copy_(h_tmp.reshape(dst.shape), non_blocking=True)
 
     # ---------- batch read ----------
-    def read_batch(self, layer:int, slots:list, gpu_tensors:list):
+    def read_batch(self, layer:int, slots:list, dst_tensors:list):
         """
         批量读取多个blocks，利用连续I/O提高效率
 
         Args:
             layer: 层索引
             slots: slot索引列表 (升序排列以实现顺序I/O)
-            gpu_tensors: 对应的GPU tensor列表 (每个都已分配好空间)
+            dst_tensors: 目标 tensor 列表
+                - 零拷贝：每个都是 pinned uint8 tensor (numel() >= stride, 4KiB aligned)
+                - 兼容：GPU tensors (将使用临时 buffer)
         """
-        if not slots or len(slots) != len(gpu_tensors):
+        if not slots or len(slots) != len(dst_tensors):
             return
 
         # 检查是否连续
@@ -220,20 +253,33 @@ class RawBlockKVBackend:
         if is_contiguous and len(slots) > 1:
             # 连续读取优化：单次大I/O
             total_size = self.stride * len(slots)
-            merged_buf = aligned_array((total_size,), np.uint8)
-            # os.pread signature: pread(fd, length, offset)
-            raw_bytes = os.pread(self.fd, total_size, self._offset(layer, slots[0]))
-            merged_buf[:len(raw_bytes)] = np.frombuffer(raw_bytes, dtype=np.uint8)
 
-            # 分拆到各个tensor
-            for i, t_gpu in enumerate(gpu_tensors):
-                offset = i * self.stride
-                h_tmp = torch.from_numpy(merged_buf[offset:offset + self.blk_bytes].copy()).view(torch.float16)
-                t_gpu.copy_(h_tmp.reshape(t_gpu.shape), non_blocking=True)
+            # 尝试零拷贝路径（如果所有 dst 都是 pinned uint8）
+            all_pinned_u8 = all(
+                t.dtype == torch.uint8 and t.is_pinned() and t.is_contiguous() and t.numel() >= self.stride
+                for t in dst_tensors
+            )
+
+            if all_pinned_u8:
+                # 检查是否可以用单个大 preadv（如果 tensors 在内存中连续）
+                # 这里为简单起见，逐个读取（未来可优化为 preadv 多个 iovec）
+                for i, (slot, dst) in enumerate(zip(slots, dst_tensors)):
+                    self.read(layer, slot, dst)
+            else:
+                # 兼容路径：使用临时 buffer
+                merged_buf = aligned_array((total_size,), np.uint8)
+                raw_bytes = os.pread(self.fd, total_size, self._offset(layer, slots[0]))
+                merged_buf[:len(raw_bytes)] = np.frombuffer(raw_bytes, dtype=np.uint8)
+
+                # 分拆到各个tensor
+                for i, t_gpu in enumerate(dst_tensors):
+                    offset = i * self.stride
+                    h_tmp = torch.from_numpy(merged_buf[offset:offset + self.blk_bytes].copy()).view(torch.float16)
+                    t_gpu.copy_(h_tmp.reshape(t_gpu.shape), non_blocking=True)
         else:
             # 非连续则使用独立读取
-            for slot, t_gpu in zip(slots, gpu_tensors):
-                self.read(layer, slot, t_gpu)
+            for slot, dst in zip(slots, dst_tensors):
+                self.read(layer, slot, dst)
 
     def __del__(self):
         try:

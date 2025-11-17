@@ -428,8 +428,10 @@ class SelfAttention(nn.Module):
         if wm is None:
             return
         if hasattr(wm, "wait_group_ready"):
-            compute_stream = getattr(self.streams, "compute_attn", None)
+            compute_stream = getattr(self.streams, "compute_mha", None)
             wm.wait_group_ready(self.layer_id, "attn", compute_stream=compute_stream)
+            if os.getenv("WSM_ASSERT_AFTER_WAIT", "0") == "1":
+                assert self.wq.weight.is_cuda and self.wq.weight.numel() > 0, "L{self.layer_id}.wq still stub"
 
     def _allocate_buffers(self, batch_size: int, seq_len: int, max_kv_len: int):
         """
@@ -537,7 +539,7 @@ class SelfAttention(nn.Module):
             print(f"[ATTN] Layer {self.layer_id} forward starting...")
 
         # ============================================================
-        # 1) 只用事件、不阻塞：标记组使用 + 等待组 ready 事件
+        # 1) ⭐⭐⭐ P0 FIX: 先预取(异步) → 再等待(事件依赖)，实现IO/计算overlap
         # ============================================================
         wm = getattr(self, "weight_manager", None)
         in_use = False
@@ -546,25 +548,35 @@ class SelfAttention(nn.Module):
                 wm._mark_group_in_use(self.layer_id, "attn")
                 in_use = True
 
-            # ⭐ 只用事件等待，不做同步阻塞
-            # 在 compute_mha 流上等待 attn 组的 ready 事件（非阻塞式，只让流依赖事件）
-            if wm is not None and hasattr(wm, "wait_group_ready"):
-                #  额外保护：在 ATTN 开始时预 pin 同层 FFN，避免缝隙被逐出
+            # ⭐⭐⭐ STEP 1: 立即发起异步预取（不等待，让H2D与后续计算overlap）
+            # 这是关键优化：预取必须在wait_event之前，否则零overlap
+            try:
+                if wm is not None and hasattr(wm, "prefetch_group_async"):
+                    # (1) 配对预取：当前层的 FFN（将与当前attn计算overlap）
+                    wm.prefetch_group_async(self.layer_id, "ffn", reason="pair")
+                    # (2) 向前预取：L+1 .. L+D 的 ATTN（将与后续计算overlap）
+                    D  = max(1, int(os.getenv("WSM_GROUP_PREFETCH_DEPTH", "3")))
+                    nL = getattr(wm, "n_layers", 0)
+                    for off in range(1, min(D+1, nL - self.layer_id)):
+                        wm.prefetch_group_async(self.layer_id + off, "attn", reason="ahead")
+            except Exception:
+                pass
+
+            # ⭐⭐⭐ STEP 2: 获取当前attn权重就绪事件（不阻塞主线程）
+            attn_ready_event = None
+            if wm is not None and hasattr(wm, "get_group_ready_event"):
+                attn_ready_event = wm.get_group_ready_event(self.layer_id, "attn")
+
+                # 额外保护：在 ATTN 开始时预 pin 同层 FFN，避免缝隙被逐出
                 if hasattr(wm, "pin_group"):
                     try: wm.pin_group(self.layer_id, "ffn", reason="pair")
                     except Exception: pass
-                wm.wait_group_ready(self.layer_id, "attn", compute_stream=self.compute_stream)
 
-                # ✨ Stub 兜底检查：确保权重已真正加载（非空 stub）
-                if self.wq.weight.numel() == 0:
-                    # WSM 承诺的权重未到位，强制同步回退一次
-                    print(f"[ATTN][L{self.layer_id}][ERROR] wq.weight is still stub after wait_group_ready!")
-                    # 尝试强制同步加载（阻塞）
-                    if hasattr(wm, "_group_is_resident"):
-                        if not wm._group_is_resident(self.layer_id, "attn", wait_for_event=True):
-                            raise RuntimeError(f"[ATTN][L{self.layer_id}] Cannot load weights: still stub after sync wait")
-                    else:
-                        raise RuntimeError(f"[ATTN][L{self.layer_id}] Cannot load weights: stub detected (no resident check)")
+            # ⭐⭐⭐ STEP 3: 在计算流中等待当前attn权重就绪（流依赖，非CPU阻塞）
+            # 此时预取已发起，H2D可以在后台与当前计算并行
+            if attn_ready_event is not None:
+                stream = self.compute_stream or torch.cuda.current_stream()
+                stream.wait_event(attn_ready_event)
 
             # ⭐ 可选：等待 KV 块 ready 事件（如果有预取）
             # 在 decode 阶段（start_pos > 0），等待本层所需的 KV 块 H2D 完成
@@ -586,20 +598,10 @@ class SelfAttention(nn.Module):
 
             if _verbose:
                 print(f"[ATTN] Layer {self.layer_id} starting computation...")
-            
-            # ⭐⭐⭐ Background prefetch (compute-overlapped)
+
+            # ⭐ KV prefetch (仅保留 KV offloading 相关的预取)
             try:
-                wm = getattr(self, "weight_manager", None)
-
-                # --- 组级权重预取：本层 FFN + 后续 D 层 ATTn ---
-                # 说明：prefetch_group_async 幂等；若该组已在 GPU 或正在 H2D，会被 WSM 跳过
-                if wm is not None and hasattr(wm, "prefetch_group_async"):
-                    # 1) ⭐ 先把"本层 FFN"挂起并 PIN（防止在 MHA→FFN 缝隙中被淘汰）
-                    wm.prefetch_group_async(self.layer_id, "ffn", pin=True, reason="pair")
-                    # 2) 顶补延后：由 compute-done 回调触发（避免前向路径同步收缩/补齐）
-                    #    见：wm.notify_group_compute_done() 的后台线程
-
-                # --- KV：为“下一层注意力”预拉最近窗口的历史 KV 到 HBM（仅 decode 阶段） ---
+                # --- KV：为"下一层注意力"预拉最近窗口的历史 KV 到 HBM（仅 decode 阶段） ---
                 # 注意：start_pos==0 为 prefill，此时下一层当前块可能尚不存在，故跳过
                 if (start_pos > 0) and getattr(self, "offloader", None) is not None:
                     # 该方法会：必要时先 SSD->DRAM，再在 kv_h2d 流发起 DRAM->HBM；并记录事件，fetch() 将命中
@@ -612,8 +614,9 @@ class SelfAttention(nn.Module):
                     )
             except Exception as e:
                 # 非致命：任何预取异常都不影响主计算路径
-                if getattr(wm, "verbose", False):
-                    print(f"[ATTN][L{self.layer_id}] background prefetch skipped: {e}")
+                wm = getattr(self, "weight_manager", None)
+                if wm and getattr(wm, "verbose", False):
+                    print(f"[ATTN][L{self.layer_id}] KV prefetch skipped: {e}")
 
             # 预期形状
             exp_q = (self.n_heads_q * self.head_dim, x.size(-1))
@@ -706,6 +709,7 @@ class SelfAttention(nn.Module):
                 for seq_idx in range(seqlen):
                     blk_idx   = (start_pos + seq_idx) // self.block_sz
                     token_idx =  start_pos + seq_idx
+                    t_in_blk  = token_idx % self.block_sz
 
                     # 保持 (bsz, heads, dim) —— 切勿 squeeze，否则 heads 会被误当 batch
                     k_curr = k[:, seq_idx, :, :]    # (bsz, n_kv_heads, head_dim)
@@ -721,10 +725,23 @@ class SelfAttention(nn.Module):
                         batch_idx=batch_idx,
                     )
 
+                    # ⭐ 增量 H2D：在 decode 阶段（seqlen==1），立即把新 token 追加到 GPU 缓冲
+                    # 这样 fetch() 可以命中 GPU 快取，避免从 CPU 整块 .to()
+                    if start_pos > 0 and seqlen == 1:
+                        self.offloader.append_token_to_gpu(
+                            layer=self.layer_id,
+                            blk=blk_idx,
+                            t_in_blk=t_in_blk,
+                            k=k_curr,
+                            v=v_curr
+                        )
+
             # ------------------------- (B) 选择并取回需要的 blocks -------------------------
-            blk_idx = start_pos // self.block_sz 
-        
-            # 获取Top-K blocks (如果有 offloader)
+            blk_idx = start_pos // self.block_sz
+
+            # ⭐ Decode 取块策略：使用"尾窗"而非 Top-K
+            # 原因：Flash Attention 不返回 attention weights，无法更新真实的 importance scores
+            # 改用确定性的"最近 N tokens"窗口策略，更稳定且可预测
             nvtx.range_push(f"layer_{self.layer_id}_kv_fetch")
             with cuda_timer("kv_fetch_us", self.layer_id):
                 do_profile_gpu = bool(self.enable_profiling and x.is_cuda)
@@ -734,15 +751,23 @@ class SelfAttention(nn.Module):
                     fetch_evt_start.record()
 
                 if getattr(self, "offloader", None) is not None:
-                    blocks = self.offloader.topk_blocks(self.layer_id, self.topk_blk, batch_idx=batch_idx)
-                    # 保证当前 block 在列表内
-                    if blk_idx not in blocks:
-                        blocks = sorted(set(blocks + [blk_idx]))
-                        # 简单截断到 topk，避免过度复杂的距离计算
-                        if len(blocks) > self.topk_blk:
-                            blocks = blocks[:self.topk_blk]
-                    else:
+                    # ⭐ 使用尾窗策略代替 Top-K
+                    # 配置窗口大小（默认使用环境变量，回退到 topk_blk 配置）
+                    window_tokens = int(os.getenv("KV_DECODE_WINDOW_TOKENS", str(self.topk_blk * BLOCK)))
+
+                    # 计算尾窗覆盖的 blocks
+                    blocks = self.offloader.plan_tail_window_blocks(
+                        start_pos=start_pos,
+                        seqlen=seqlen,
+                        window_tokens=window_tokens
+                    )
+
+                    # 确保当前 block 一定在列表内（防御性编程）
+                    cur_blk = int((start_pos + seqlen - 1) // BLOCK)
+                    if cur_blk not in blocks:
+                        blocks.append(cur_blk)
                         blocks = sorted(blocks)
+
                     needed = torch.tensor(blocks, device=x.device, dtype=torch.long)
                     k_full, v_full = self.offloader.fetch(
                         self.layer_id, needed, batch_idx=batch_idx, bsz=bsz
@@ -853,33 +878,46 @@ class SelfAttention(nn.Module):
 
             if compute_stream:
                 with torch.cuda.stream(compute_stream):
-                    with cuda_timer("attn_us", self.layer_id):
-                        # mha
-                        if do_profile_gpu:
-                            attn_evt_start = torch.cuda.Event(enable_timing=True)
-                            attn_evt_end = torch.cuda.Event(enable_timing=True)
-                            attn_evt_start.record()
+                    # 仅保留事件计时，避免与 cuda_timer 重复；且不在热路径同步
+                    if do_profile_gpu:
+                        attn_evt_start = torch.cuda.Event(enable_timing=True)
+                        attn_evt_end = torch.cuda.Event(enable_timing=True)
+                        attn_evt_start.record()
 
-                        # 避免物化 [B,H,T,T] 的 scores/attn_weights
-                        with sdpa_ctx:
-                            out = torch.nn.functional.scaled_dot_product_attention(
-                                q, k_full, v_full, attn_mask=None, dropout_p=0.0, is_causal=is_causal
-                            )
-                        # 🚀 立刻释放不再需要的中间激活，降低峰值内存
-                        del q
-                        del k
-                        del v
-                        del k_full
-                        del v_full
+                    with sdpa_ctx:
+                        out = torch.nn.functional.scaled_dot_product_attention(
+                            q, k_full, v_full, attn_mask=None, dropout_p=0.0, is_causal=is_causal
+                        )
 
-                        if do_profile_gpu:
-                            attn_evt_end.record()
-                            if not attn_evt_end.query():
-                                attn_evt_end.synchronize()
-                            self.attn_time = attn_evt_start.elapsed_time(attn_evt_end) * 1000
-                            PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
-                        else:
-                            self.attn_time = 0
+                    # 立即释放确定存在的中间激活
+                    del q, k_full, v_full
+                    try: del k
+                    except NameError: pass
+                    try: del v
+                    except NameError: pass
+
+                    if do_profile_gpu:
+                        attn_evt_end.record()
+                        PERF_TRACKER.add_event_pair(self.layer_id, "attn_us_evt", attn_evt_start, attn_evt_end)
+
+                    # ✅ 后处理仍在同一流: [B,H,Tq,D] -> [B,Tq,H,D] -> [B,Tq,feat]
+                    out = out.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+                    feat = self.n_heads_q * self.head_dim
+                    assert out.size(-1) == feat
+
+                    # 线性层: 2D -> Linear -> 3D
+                    w = self.wo.weight
+                    out2d = out.view(-1, feat).contiguous()
+                    if out2d.dtype != w.dtype:
+                        out2d = out2d.to(w.dtype)
+                    if out2d.device != w.device:
+                        out2d = out2d.to(w.device, non_blocking=True)
+
+                    res2d = self.wo(out2d)
+                    result = res2d.view(bsz, seqlen, -1).contiguous()
+                    del out, out2d, res2d
+
+                nvtx.range_pop()  # attention_compute
             else:
                 with cuda_timer("attn_us", self.layer_id):
                     # mha
@@ -907,20 +945,20 @@ class SelfAttention(nn.Module):
                         PERF_TRACKER.add_layer_stat(self.layer_id, "attn_us", self.attn_time)
                     else:
                         self.attn_time = 0
-            nvtx.range_pop()  # attention_compute
 
-            # 转换回 [B, T, H, D] 格式
-            out = out.transpose(1, 2).contiguous()
+                nvtx.range_pop()  # attention_compute
 
-            # --- 统计信息（若有） ---
-            stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
-            self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
-            self.attn_time       = stats.get("attn_us",     0)
+                # 转换回 [B, T, H, D] 格式
+                out = out.transpose(1, 2).contiguous()
 
+                # --- 统计信息（若有） ---
+                stats = PERF_TRACKER.layer_stats.get(self.layer_id, {})
+                self.kv_elapsed_time = stats.get("kv_fetch_us", 0)
+                self.attn_time       = stats.get("attn_us",     0)
 
-            feat = self.n_heads_q * self.head_dim  # = dim
-            B, Tq = bsz, seqlen
-            w = self.wo.weight
+                feat = self.n_heads_q * self.head_dim  # = dim
+                B, Tq = bsz, seqlen
+                w = self.wo.weight
         
             # ⚠️ 注意：使用 Flash Attention 后，attn_weights 不再物化
             # 重要度统计功能已被禁用，因为 scaled_dot_product_attention 不返回权重矩阵
@@ -1014,6 +1052,26 @@ class SelfAttention(nn.Module):
                     upto_token=start_pos + seqlen,
                     async_write=True
                 )
+
+            # ============================================================
+            # 3.3) Decode 阶段边走边"落 SSD"：保持"尾窗"在 DRAM，其余立即下放
+            # 在 decode 阶段（start_pos > 0），每生成若干 token 就主动下放老 block
+            # ============================================================
+            if start_pos > 0 and getattr(self, "offloader", None) is not None:
+                # 每隔 N 个 token 调用一次（避免过于频繁；可配置）
+                spill_interval = int(os.getenv("KV_DECODE_SPILL_INTERVAL", "256"))  # 默认每个 block 下放一次
+                current_token = start_pos + seqlen
+
+                # 简单策略：当 current_token 是 spill_interval 的倍数时触发下放
+                if current_token % spill_interval == 0:
+                    # 保留最近 1 个 block 在 DRAM，其余下放到 SSD
+                    keep_tail_blocks = int(os.getenv("KV_DECODE_KEEP_TAIL_BLOCKS", "1"))
+                    self.offloader.eager_spill_decode_window(
+                        upto_token=current_token,
+                        keep_tail_blocks=keep_tail_blocks,
+                        include_partial=False,  # 只下放完整块，避免反复写
+                        layers=[self.layer_id]  # 只下放当前层
+                    )
 
             return result
         finally:
@@ -1190,26 +1248,30 @@ class FeedForward(nn.Module):
         try:
             compute_stream = getattr(self.streams, "compute_ffn", None)
 
-            # ⭐ 只用事件等待，不做同步阻塞
-            if wm is not None and hasattr(wm, "wait_group_ready"):
-                wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
+            # # ⭐⭐⭐ STEP 1: 先预取下一层（异步，与FFN计算overlap）
+            # try:
+            #     if wm is not None and hasattr(wm, "prefetch_group_async"):
+            #         D  = max(1, int(os.getenv("WSM_GROUP_PREFETCH_DEPTH", "3")))
+            #         nL = getattr(wm, "n_layers", 0)
+            #         for off in range(1, min(D+1, nL - self.layer_id)):
+            #             wm.prefetch_group_async(self.layer_id + off, "attn", reason="ffn_ahead")
+            # except Exception:
+            #     pass
+
+            # ⭐⭐⭐ STEP 2: 获取FFN权重就绪事件
+            ffn_ready_event = None
+            if wm is not None and hasattr(wm, "get_group_ready_event"):
+                ffn_ready_event = wm.get_group_ready_event(self.layer_id, "ffn")
+
+            # ⭐⭐⭐ STEP 3: 在计算流中等待FFN权重就绪
+            if ffn_ready_event is not None:
+                stream = compute_stream or torch.cuda.current_stream()
+                stream.wait_event(ffn_ready_event)
 
             # ---- Device alignment (no synchronous fallback) ----
             dev = self.w1.weight.device
             if x.device != dev:
                 x = x.to(dev, non_blocking=True)
-
-            # 在 FFN 期间尝试预取下一层 ATTN
-            try:
-                if hasattr(wm, "prefetch_group_async"):
-                    nxt = self.layer_id + 1
-                    if nxt < getattr(self, "n_layer", 1 << 30):
-                        gpu_count = wm.num_gpu_groups()
-                        budget    = int(getattr(wm, "gpu_max_groups", 4))
-                        if gpu_count < budget:
-                            wm.prefetch_group_async(nxt, "attn")
-            except Exception:
-                pass
 
             if compute_stream is not None:
                 with torch.cuda.stream(compute_stream):
@@ -1349,6 +1411,7 @@ class EncoderBlock(nn.Module):
                     streams.compute_mha.wait_stream(freq_copy_stream)
                 if wait_on is not None:
                     streams.compute_mha.wait_event(wait_on)
+
                 attn_in = self.attention_norm(x)
                 attn_out = self.attention(attn_in, start_pos, freqs_complex)
             mha_eid, mha_evt = stream_mnt.record_event_on(streams.compute_mha, device=device)
@@ -1453,12 +1516,17 @@ class EncoderBlock(nn.Module):
                                 compute_stream=getattr(streams, "compute_mha", None))
 
         if streams and streams.compute_mha:
+            # ⭐ 调试日志：验证 MHA 流被使用
+            if os.getenv("DEBUG_STREAM_USAGE", "0") == "1":
+                print(f"[Layer {self.layer_id}] MHA using stream: {streams.compute_mha}")
             with torch.cuda.stream(streams.compute_mha):
                 attn_in  = self.attention_norm(x)
                 attn_out = self.attention(attn_in, start_pos, freqs_complex)
             # 记录 MHA 完成事件
             mha_eid, mha_evt = stream_mnt.record_event_on(streams.compute_mha, device=device)
         else:
+            if os.getenv("DEBUG_STREAM_USAGE", "0") == "1":
+                print(f"[Layer {self.layer_id}] MHA fallback to default stream (streams={streams})")
             attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
             mha_eid, mha_evt = None, None  # 无独立流则不产生命名事件
 
@@ -1479,12 +1547,17 @@ class EncoderBlock(nn.Module):
             streams.compute_ffn.wait_event(mha_evt)
 
         if streams and streams.compute_ffn:
+            # ⭐ 调试日志：验证 FFN 流被使用
+            if os.getenv("DEBUG_STREAM_USAGE", "0") == "1":
+                print(f"[Layer {self.layer_id}] FFN using stream: {streams.compute_ffn}")
             with torch.cuda.stream(streams.compute_ffn):
                 ffn_in   = self.ffn_norm(h)
                 ffn_out  = self.feed_forward(ffn_in)
             # FFN 完成事件
             ffn_eid, ffn_evt = stream_mnt.record_event_on(streams.compute_ffn, device=device)
         else:
+            if os.getenv("DEBUG_STREAM_USAGE", "0") == "1":
+                print(f"[Layer {self.layer_id}] FFN fallback to default stream (streams={streams})")
             ffn_out = self.feed_forward(self.ffn_norm(h))
             ffn_eid, ffn_evt = None, None
 
@@ -1517,287 +1590,7 @@ class EncoderBlock(nn.Module):
 
         return out
     
-    # def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
-    #     forward_start = time.time()
-        
-    #     # dev   = self.device
-    #     dev = str(self.device)
-    #     if not dev.startswith("cuda"):
-    #         try:
-    #             dev = str(self.attention.wq.weight.device)
-    #             self.device = dev  # 缓存，避免每次判断
-    #         except Exception:
-    #             pass
-    #     dtype = getattr(self, "param_dtype", torch.bfloat16)
 
-    #     if x.device != dev or x.dtype != dtype:
-    #         x = x.to(device=dev, dtype=dtype, non_blocking=True)
-    #     if freqs_complex.device != dev or freqs_complex.dtype != dtype:
-    #         freqs_complex = freqs_complex.to(device=dev,  non_blocking=True)
-
-    #     # 告知 WSM：计算前移（驱动 CPU/SSD 滑窗）
-    #     wm = getattr(self, "weight_manager", None)
-    #     if wm is not None and hasattr(wm, "note_compute_advance"):
-    #         wm.note_compute_advance(self.layer_id)
-
-    #     # 入口防呆：输入与归一化权重必须在 CUDA
-    #     if x.device.type != "cuda":
-    #         raise RuntimeError(f"Layer {self.layer_id} EncoderBlock: input x is on {x.device}, but only CUDA is supported")
-    #     if self.attention_norm.weight.device.type != "cuda":
-    #         raise RuntimeError(f"Layer {self.layer_id} EncoderBlock: attention_norm on {self.attention_norm.weight.device}, must be on CUDA")
-    #     if self.ffn_norm.weight.device.type != "cuda":
-    #         raise RuntimeError(f"Layer {self.layer_id} EncoderBlock: ffn_norm on {self.ffn_norm.weight.device}, must be on CUDA")
-
-    #     dev = x.device
-    #     streams = self.streams
-
-    #     nvtx.range_push(f"layer_{self.layer_id}_forward")
-    #     with cuda_timer("total_forward_us", self.layer_id):
-
-    #         # -------- MHA 阶段：只做"事件依赖"，不再阻塞 ensure -----------
-    #         if wm is not None:
-    #             # REMOVED: wm.ensure_group_on_gpu(self.layer_id, "attn")
-    #             if streams and streams.compute_mha and hasattr(wm, "wait_group_ready"):
-    #                 wm.wait_group_ready(self.layer_id, "attn", compute_stream=streams.compute_mha)  # NEW: 纯事件挂载
-    #             elif hasattr(wm, "wait_group_ready"):
-    #                 wm.wait_group_ready(self.layer_id, "attn", compute_stream=None)                # NEW
-
-    #         nvtx.range_push(f"layer_{self.layer_id}_attention")
-    #         if streams and streams.compute_mha:
-    #             torch.cuda.current_stream(dev).wait_stream(streams.compute_mha)  # default 等 MHA 流（安全）
-
-    #             # ⭐⭐⭐ 在计算流中执行 MHA
-    #             with torch.cuda.stream(streams.compute_mha):
-    #                 # 注意：预取逻辑已移至 FFN 阶段（避免重复预取和 OOM）
-    #                 attn_in  = self.attention_norm(x)
-    #                 attn_out = self.attention(attn_in, start_pos, freqs_complex)  # 在 compute_mha 上排队
-    #             # 在 MHA 流记录一个事件，供 FFN 流等待
-    #             mha_eid, mha_evt = None, None
-    #             try:
-    #                 from llama3 import stream_mnt
-    #                 mha_eid, mha_evt = stream_mnt.record_event_on(streams.compute_mha, device=dev)
-    #             except Exception:
-    #                 mha_evt = torch.cuda.Event()
-    #                 mha_evt.record(streams.compute_mha)
-    #         else:
-    #             # 回退到默认流（不推荐，但保证可运行）
-    #             # 注意：预取逻辑已移至 FFN 阶段（避免重复预取和 OOM）
-    #             attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
-
-    #         # 在 MHA 完成之前不要在默认流上消费 attn_out；先做残差也放到 MHA 流里
-    #         if streams and streams.compute_mha:
-    #             with torch.cuda.stream(streams.compute_mha):
-    #                 h = x + attn_out
-    #         else:
-    #             h = x + attn_out
-    #         nvtx.range_pop()  # attention
-
-    #         # -------- FFN 阶段：只做"事件依赖"，同时前置预取 L+1 的 ATTN --------
-    #         if wm is not None:
-    #             # REMOVED: wm.ensure_group_on_gpu(self.layer_id, "ffn")
-    #             if streams and streams.compute_ffn and hasattr(wm, "wait_group_ready"):
-    #                 wm.wait_group_ready(self.layer_id, "ffn", compute_stream=streams.compute_ffn)  # NEW: 纯事件挂载
-    #             elif hasattr(wm, "wait_group_ready"):
-    #                 wm.wait_group_ready(self.layer_id, "ffn", compute_stream=None)                # NEW
-
-    #         # 让 FFN 流等待 MHA 事件（只挂事件，不同步 CPU）
-    #         if streams and streams.compute_ffn and 'mha_evt' in locals():
-    #             streams.compute_ffn.wait_event(mha_evt)
-
-    #         nvtx.range_push(f"layer_{self.layer_id}_ffn")
-    #         if streams and streams.compute_ffn:
-    #             with torch.cuda.stream(streams.compute_ffn):
-
-    #                 # NEW ⭐ 在 L 的 FFN 计算期间，启动 L+1 的 ATTN 预取（高优先级/加 pin）
-    #                 # 但先检查 GPU 剩余容量，避免过度预取导致 OOM
-    #                 if wm is not None and hasattr(wm, "prefetch_group_async"):
-    #                     nxt = self.layer_id + 1
-    #                     if nxt < self.n_layer:
-    #                         # 预算检查：只有在 GPU 未满时才预取
-    #                         gpu_count = len(getattr(wm, "_gpu_group_lru", []))
-    #                         gpu_limit = int(os.getenv("WSM_GPU_MAX_GROUPS", "10"))
-    #                         # 留 2 个位置给当前层 FFN + 未来清理
-    #                         if gpu_count + 2 < gpu_limit:
-    #                             try:
-    #                                 wm.prefetch_group_async(nxt, "attn", pin=True, priority="high")
-    #                             except TypeError:
-    #                                 # 兼容老签名
-    #                                 wm.prefetch_group_async(nxt, "attn")
-
-    #                 # 原 FFN 计算
-    #                 ffn_in  = self.ffn_norm(h)
-    #                 ffn_out = self.feed_forward(ffn_in)   # 在 compute_ffn 上排队
-    #                 out     = h + ffn_out
-
-    #             # 默认流等待 FFN 完成事件（仅事件）
-    #             ffn_evt = torch.cuda.Event()
-    #             ffn_evt.record(streams.compute_ffn)
-    #             torch.cuda.current_stream(dev).wait_event(ffn_evt)
-    #         else:
-    #             # 回退到默认流（不推荐，但保证可运行）
-    #             # 注意：预取逻辑已整合到上方 compute_ffn 分支（避免重复）
-    #             out = h + self.feed_forward(self.ffn_norm(h))
-
-    #         # NEW ⭐ 在 FFN 结束处：预测并预拉"下一层"需要的 KV blocks（异步 H2D）
-    #         try:
-    #             offloader = getattr(self.attention, "offloader", None)
-    #             kv_stream = getattr(self.streams, "kv_h2d", None)
-    #             nxt = self.layer_id + 1
-    #             if (offloader is not None) and (nxt < self.n_layer) and (kv_stream is not None):
-    #                 # window_tokens：优先取 offloader.block_size；否则使用一个安全默认值
-    #                 window = int(getattr(offloader, "block_size", 256))
-    #                 seqlen = int(x.size(1))
-    #                 blocks = offloader.plan_tail_window_blocks(start_pos, seqlen, window_tokens=window)
-    #                 if hasattr(offloader, "prefetch_blocks_async"):
-    #                     offloader.prefetch_blocks_async(nxt, blocks, stream=kv_stream)   # 事件会在 KV H2D 上记录
-    #                 else:
-    #                     # 兼容：用已有的"下一层预取"API
-    #                     offloader.prefetch_for_next_layer(nxt, start_pos, seqlen, D=1)
-    #         except Exception:
-    #             pass
-
-    #         nvtx.range_pop()  # ffn
-
-    #         # 清理 MHA 事件
-    #         if streams and streams.compute_mha and 'mha_eid' in locals() and mha_eid is not None:
-    #             try:
-    #                 from llama3 import stream_mnt
-    #                 stream_mnt.release_event(mha_eid, device=dev)
-    #             except Exception:
-    #                 pass
-
-    #     nvtx.range_pop()  # layer_forward
-
-    #     self.forward_count += 1
-    #     self.total_forward_time += time.time() - forward_start
-
-    #     # 周期性 GC 事件池
-    #     self._gc_counter += 1
-    #     if self._gc_counter % 10 == 0:
-    #         try:
-    #             from llama3 import stream_mnt
-    #             stream_mnt.gc_event_pool(device=dev, force=False)
-    #         except Exception:
-    #             pass
-
-    #     return out
-
-    
-    # def forward_async(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor):
-    #     """
-    #     异步前向：立即返回 Future，不阻塞调用线程。
-    #     语义等价于 forward()，但内部把 MHA/FFN 放在各自 compute 流，并仅用"事件"建立依赖。
-
-    #     Returns:
-    #         Future[torch.Tensor]: 异步结果，调用 .result() 时会等待计算完成
-    #     """
-    #     from concurrent.futures import Future
-
-    #     # ---- 设备与 dtype 协调（复用 forward() 里的逻辑）----
-    #     dev = str(self.device)
-    #     if not dev.startswith("cuda"):
-    #         try:
-    #             dev = str(self.attention.wq.weight.device)
-    #             self.device = dev
-    #         except Exception:
-    #             pass
-    #     dtype = getattr(self, "param_dtype", torch.bfloat16)
-
-    #     if x.device != dev or x.dtype != dtype:
-    #         x = x.to(device=dev, dtype=dtype, non_blocking=True)
-    #     if freqs_complex.device != dev or freqs_complex.dtype != dtype:
-    #         freqs_complex = freqs_complex.to(device=dev, non_blocking=True)
-
-    #     # ---- 通知 WSM：推进 CPU 窗口（滚动模式/环形窗下立即入队缺失层）----
-    #     wm = getattr(self, "weight_manager", None)
-    #     if wm is not None:
-    #         # 轻推进：刷新保留/PD 窗口
-    #         if hasattr(wm, "note_compute_advance"):
-    #             wm.note_compute_advance(self.layer_id)  # 轻量更新+窗口估计
-    #         # 强推进：把缺失层入队到 CPU 预取线程（不在当前线程做 SSD 同步 IO）
-    #         if hasattr(wm, "_advance_cpu_window_by_compute"):
-    #             wm._advance_cpu_window_by_compute(self.layer_id)
-
-    #     streams = getattr(self, "streams", None)
-    #     compute_mha = getattr(streams, "compute_mha", None) if streams else None
-    #     compute_ffn = getattr(streams, "compute_ffn", None) if streams else None
-
-    #     # ---- 1) 在 compute_mha 上排 MHA，并记录事件 ----
-    #     if wm is not None:
-    #         # 保留 ensure_group_on_gpu 以确保权重已加载
-    #         if hasattr(wm, "ensure_group_on_gpu"):
-    #             wm.ensure_group_on_gpu(self.layer_id, "attn")
-    #         if hasattr(wm, "wait_group_ready"):   # 纯事件依赖，绝不 CPU 同步
-    #             wm.wait_group_ready(self.layer_id, "attn", compute_stream=compute_mha)
-
-    #     if compute_mha:
-    #         with torch.cuda.stream(compute_mha):
-    #             attn_in  = self.attention_norm(x)
-    #             attn_out = self.attention(attn_in, start_pos, freqs_complex)
-    #             h = x + attn_out
-    #             mha_done = torch.cuda.Event()
-    #             mha_done.record(compute_mha)
-    #     else:
-    #         attn_in  = self.attention_norm(x)
-    #         attn_out = self.attention(attn_in, start_pos, freqs_complex)
-    #         h = x + attn_out
-    #         mha_done = torch.cuda.Event()
-    #         mha_done.record(torch.cuda.current_stream())
-
-    #     # ---- 趁 MHA/FFN 进行时，异步预取后续组（L+1 的 attn 等）----
-    #     try:
-    #         if wm is not None and hasattr(wm, "prefetch_group_async"):
-    #             nxt = self.layer_id + 1
-    #             if nxt < self.n_layer:
-    #                 # 预算检查：避免 OOM
-    #                 gpu_count = len(getattr(wm, "_gpu_group_lru", []))
-    #                 gpu_limit = int(os.getenv("WSM_GPU_MAX_GROUPS", "10"))
-    #                 if gpu_count + 2 < gpu_limit:
-    #                     wm.prefetch_group_async(nxt, "attn")   # 下一层ATTN
-    #     except Exception:
-    #         pass
-
-    #     # ---- 2) 在 compute_ffn 上排 FFN，等待 MHA 事件 ----
-    #     if wm is not None:
-    #         if hasattr(wm, "ensure_group_on_gpu"):
-    #             wm.ensure_group_on_gpu(self.layer_id, "ffn")
-    #         if hasattr(wm, "wait_group_ready"):
-    #             wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_ffn)
-
-    #     if compute_ffn:
-    #         with torch.cuda.stream(compute_ffn):
-    #             compute_ffn.wait_event(mha_done)
-    #             ffn_in  = self.ffn_norm(h)
-    #             ffn_out = self.feed_forward(ffn_in)
-    #             out     = h + ffn_out
-    #             ffn_done = torch.cuda.Event()
-    #             ffn_done.record(compute_ffn)
-    #     else:
-    #         torch.cuda.current_stream().wait_event(mha_done)
-    #         ffn_in  = self.ffn_norm(h)
-    #         ffn_out = self.feed_forward(ffn_in)
-    #         out     = h + ffn_out
-    #         ffn_done = torch.cuda.Event()
-    #         ffn_done.record(torch.cuda.current_stream())
-
-    #     # ---- 3) 在 FFN 尾部预取下一层的 KV（可选：仅解码阶段有效）----
-    #     try:
-    #         offloader = getattr(self.attention, "offloader", None)
-    #         kv_stream = getattr(self.streams, "kv_h2d", None)
-    #         nxt = self.layer_id + 1
-    #         if (offloader is not None) and (nxt < self.n_layer) and (kv_stream is not None):
-    #             window = int(getattr(offloader, "block_size", 256))
-    #             seqlen = int(x.size(1))
-    #             blocks = offloader.plan_tail_window_blocks(start_pos, seqlen, window_tokens=window)
-    #             if hasattr(offloader, "prefetch_blocks_async"):
-    #                 offloader.prefetch_blocks_async(nxt, blocks, stream=kv_stream)
-    #     except Exception:
-    #         pass
-
-    #     # ---- 4) 返回 Future：在一个轻线程里把"默认流等待FFN事件 + set_result"做完 ----
-    #     fut: Future = _get_executor().submit(self._finalize_and_return,
-    #                                          out, ffn_done, dev)
-    #     return fut
 
     def _finalize_and_return(self, out_tensor: torch.Tensor, done_evt: torch.cuda.Event, device: str):
         """
