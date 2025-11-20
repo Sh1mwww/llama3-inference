@@ -261,3 +261,302 @@ def build_layer_copy_plan(store,    # ParamStore
         plan.params[name] = pcs
 
     return plan
+
+
+# ========================================================================
+# Layer Block Table: 批量读取优化（从 raw device 直接到 CPU pinned）
+# ========================================================================
+
+@dataclass
+class GroupBlockDescriptor:
+    """
+    组级块描述符：描述一个 group（attn/ffn）在 raw device 上的连续块
+    """
+    layer_id: int
+    group: str              # "attn" / "ffn"
+    mode: str               # "block" (可合并) 或 "scatter" (需逐参数)
+
+    # Block 模式字段
+    start_offset: int = 0   # raw device 上的起始 offset
+    total_span: int = 0     # 总跨度（包含间隙）
+    useful_bytes: int = 0   # 实际有效字节数
+    fragmentation: float = 0.0  # 碎片率 [0, 1]
+
+    # 参数元信息（用于从 staging buffer 解包）
+    params: List[dict] = field(default_factory=list)  # manifest 中的参数信息
+
+    def can_merge(self, frag_threshold: float = 0.15) -> bool:
+        """判断是否可以用单次 IO 读取"""
+        return self.mode == "block" and self.fragmentation <= frag_threshold
+
+
+@dataclass
+class LayerBlockTable:
+    """
+    整层的块表：包含 attn 和 ffn 两个组的块描述符
+    """
+    layer_id: int
+    attn_block: GroupBlockDescriptor
+    ffn_block: GroupBlockDescriptor
+
+    def total_ios_current(self) -> int:
+        """当前逐参数 IO 次数"""
+        return len(self.attn_block.params) + len(self.ffn_block.params)
+
+    def total_ios_optimized(self) -> int:
+        """优化后的 IO 次数"""
+        ios = 0
+        ios += 1 if self.attn_block.can_merge() else len(self.attn_block.params)
+        ios += 1 if self.ffn_block.can_merge() else len(self.ffn_block.params)
+        return ios
+
+    def io_reduction(self) -> float:
+        """IO 减少百分比"""
+        current = self.total_ios_current()
+        optimized = self.total_ios_optimized()
+        return (current - optimized) / current if current > 0 else 0.0
+
+
+def build_group_block_descriptor(layer_id: int,
+                                  params: List[dict],
+                                  group: str,
+                                  frag_threshold: float = 0.15) -> GroupBlockDescriptor:
+    """
+    为单个 group 构建块描述符
+
+    Args:
+        layer_id: 层索引
+        params: manifest 中该 group 的参数列表（已过滤 policy=stream）
+        group: "attn" 或 "ffn"
+        frag_threshold: 碎片率阈值，超过则使用 scatter 模式
+
+    Returns:
+        GroupBlockDescriptor
+    """
+    if not params:
+        return GroupBlockDescriptor(
+            layer_id=layer_id,
+            group=group,
+            mode="empty"
+        )
+
+    # 按 offset 排序
+    sorted_params = sorted(params, key=lambda p: p["offset"])
+
+    # 计算起始和结束位置
+    start_offset = sorted_params[0]["offset"]
+    end_offset = sorted_params[-1]["offset"] + sorted_params[-1]["stride"]
+
+    total_span = end_offset - start_offset
+    useful_bytes = sum(p["nbytes"] for p in sorted_params)
+
+    # 碎片率
+    fragmentation = (total_span - useful_bytes) / total_span if total_span > 0 else 0.0
+
+    # 决定模式
+    if fragmentation <= frag_threshold:
+        mode = "block"
+    else:
+        mode = "scatter"
+
+    return GroupBlockDescriptor(
+        layer_id=layer_id,
+        group=group,
+        mode=mode,
+        start_offset=start_offset,
+        total_span=total_span,
+        useful_bytes=useful_bytes,
+        fragmentation=fragmentation,
+        params=sorted_params
+    )
+
+
+def build_layer_block_table(manifest: dict,
+                            layer_id: int,
+                            only_stream: bool = True,
+                            frag_threshold: float = 0.15) -> LayerBlockTable:
+    """
+    为单层构建块表
+
+    Args:
+        manifest: runtime manifest dict
+        layer_id: 层索引
+        only_stream: 是否只包含 policy=stream 的参数
+        frag_threshold: 碎片率阈值
+
+    Returns:
+        LayerBlockTable
+    """
+    # 提取该层的所有参数
+    layer_params = [p for p in manifest.get("params", [])
+                   if p.get("layer") == layer_id]
+
+    if only_stream:
+        layer_params = [p for p in layer_params if p.get("policy") == "stream"]
+
+    # 分组
+    attn_params = [p for p in layer_params if classify_group(p["name"]) == "mha"]
+    ffn_params = [p for p in layer_params if classify_group(p["name"]) == "ffn"]
+
+    # 构建块描述符
+    attn_block = build_group_block_descriptor(layer_id, attn_params, "attn", frag_threshold)
+    ffn_block = build_group_block_descriptor(layer_id, ffn_params, "ffn", frag_threshold)
+
+    return LayerBlockTable(
+        layer_id=layer_id,
+        attn_block=attn_block,
+        ffn_block=ffn_block
+    )
+
+
+def build_all_layer_block_tables(manifest: dict,
+                                 only_stream: bool = True,
+                                 frag_threshold: float = 0.15) -> Dict[int, LayerBlockTable]:
+    """
+    为所有层构建块表
+
+    Returns:
+        {layer_id: LayerBlockTable}
+    """
+    # 找出所有层 ID
+    layer_ids = set(p.get("layer") for p in manifest.get("params", []) if p.get("layer", -1) >= 0)
+
+    tables = {}
+    for layer_id in sorted(layer_ids):
+        tables[layer_id] = build_layer_block_table(manifest, layer_id, only_stream, frag_threshold)
+
+    return tables
+
+
+# ========================================================================
+# Raw Device 批量读取接口（用于 WSM 集成）
+# ========================================================================
+
+def load_group_from_raw_block(block_desc: GroupBlockDescriptor,
+                              dio_file,  # DirectIOFile instance
+                              staging_buffer: torch.Tensor,
+                              block_size: int = 4096) -> Dict[str, torch.Tensor]:
+    """
+    使用块描述符从 raw device 批量读取一个 group 的所有参数
+
+    Args:
+        block_desc: GroupBlockDescriptor
+        dio_file: DirectIOFile 实例（已打开的 raw device）
+        staging_buffer: pinned uint8 tensor，用于暂存读取的数据
+        block_size: raw device 的块大小（用于对齐）
+
+    Returns:
+        {param_name: pinned CPU tensor}
+    """
+    from .weights_io_ssd_dram import DTYPE_MAP
+
+    if block_desc.mode == "empty":
+        return {}
+
+    group_weights = {}
+
+    if block_desc.mode == "block" and block_desc.can_merge():
+        # ===== Block 模式：单次大 IO =====
+        offset = block_desc.start_offset
+        size = block_desc.total_span
+
+        # 确保 staging buffer 足够大
+        if staging_buffer.numel() < size:
+            raise RuntimeError(
+                f"[LBT] staging_buffer too small: need {size} bytes, have {staging_buffer.numel()}"
+            )
+
+        # 单次 pread（已对齐）
+        dio_file.pread_into_tensor(staging_buffer, size, offset)
+
+        # 从 staging buffer 解包各参数
+        for param_info in block_desc.params:
+            param_offset_in_block = param_info["offset"] - offset
+            param_nbytes = param_info["nbytes"]
+            param_name = param_info["name"]
+
+            # 创建目标 tensor
+            param_tensor = torch.empty(
+                param_info["shape"],
+                dtype=DTYPE_MAP[param_info["dtype"]],
+                pin_memory=True
+            )
+
+            # 从 staging buffer 拷贝（字节级复制）
+            param_tensor.view(-1).view(torch.uint8)[:param_nbytes].copy_(
+                staging_buffer[param_offset_in_block:param_offset_in_block + param_nbytes]
+            )
+
+            group_weights[param_name] = param_tensor
+
+    else:
+        # ===== Scatter 模式：逐参数读取（回退路径） =====
+        for param_info in block_desc.params:
+            offset = param_info["offset"]
+            stride = param_info["stride"]
+            nbytes = param_info["nbytes"]
+            param_name = param_info["name"]
+
+            # 确保 staging buffer 足够大
+            if staging_buffer.numel() < stride:
+                raise RuntimeError(
+                    f"[LBT] staging_buffer too small for {param_name}: need {stride} bytes"
+                )
+
+            # 单个参数读取
+            dio_file.pread_into_tensor(staging_buffer, stride, offset)
+
+            # 创建目标 tensor
+            param_tensor = torch.empty(
+                param_info["shape"],
+                dtype=DTYPE_MAP[param_info["dtype"]],
+                pin_memory=True
+            )
+
+            # 拷贝有效字节
+            param_tensor.view(-1).view(torch.uint8)[:nbytes].copy_(
+                staging_buffer[:nbytes]
+            )
+
+            group_weights[param_name] = param_tensor
+
+    return group_weights
+
+
+def load_layer_from_raw_block(layer_block_table: LayerBlockTable,
+                              dio_file,
+                              staging_buffer: torch.Tensor,
+                              block_size: int = 4096,
+                              groups: Optional[List[str]] = None) -> Dict[str, torch.Tensor]:
+    """
+    使用层块表从 raw device 批量读取整层参数
+
+    Args:
+        layer_block_table: LayerBlockTable
+        dio_file: DirectIOFile 实例
+        staging_buffer: pinned uint8 tensor
+        block_size: raw device 块大小
+        groups: 要加载的组列表，默认 ["attn", "ffn"]
+
+    Returns:
+        {param_name: pinned CPU tensor}
+    """
+    if groups is None:
+        groups = ["attn", "ffn"]
+
+    layer_weights = {}
+
+    for group in groups:
+        if group == "attn":
+            block_desc = layer_block_table.attn_block
+        elif group == "ffn":
+            block_desc = layer_block_table.ffn_block
+        else:
+            continue
+
+        group_weights = load_group_from_raw_block(
+            block_desc, dio_file, staging_buffer, block_size
+        )
+        layer_weights.update(group_weights)
+
+    return layer_weights

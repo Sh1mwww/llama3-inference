@@ -344,7 +344,7 @@ def apply_runtime_overrides():
     cfg = load_runtime_config({
         "pinned": {
             "WEIGHT_PINNED_BYTES":      8  << 30,
-            "KV_PINNED_BYTES":          6  << 30,
+            "KV_PINNED_BYTES":          8  << 30,
             "EXTENT_BYTES":             1  << 20,   # 1MiB
             "PINNED_REGISTER_CHUNK":   16  << 20,   # 16MiB
             "PINNED_REGISTER_N":            8,      # 128MiB
@@ -373,7 +373,7 @@ def apply_runtime_overrides():
 # ---------- KV 池：懒分配 + 单块 ≥ 单个 KV 块 ----------
 def configure_kv_pool():
     # DRAM 配置
-    KVCacheArgs.dram_limit_gb     = 24.0
+    KVCacheArgs.dram_limit_gb     = 32.0
     KVCacheArgs.dram_sizing_batch = 32
     KVCacheArgs.block_bytes       = 1 * 1024 * 1024
     KVCacheArgs.preallocate       = False
@@ -383,8 +383,8 @@ def configure_kv_pool():
     KVCacheArgs.mirror_on_push = False
 
     # I/O 节流与写速率配置（与权重 H2D 仲裁）
-    KVCacheArgs.IO_RAW_THROTTLE_MS     = 30
-    KVCacheArgs.NVME_WRITE_TARGET_MBPS = 1200
+    KVCacheArgs.IO_RAW_THROTTLE_MS     = 25
+    KVCacheArgs.NVME_WRITE_TARGET_MBPS = 1500
 
     if hasattr(KVCacheArgs, "prefer_bf16"):
         KVCacheArgs.prefer_bf16 = True
@@ -585,31 +585,31 @@ def main():
     # ⭐⭐⭐ P0 修复: 增加 warmup 层数，确保完整 overlap
     # 单层计算 100ms，可以 overlap 4 组 H2D (每组 25ms)
     # Warmup 至少需要覆盖: 初始层 + 预取深度 = 12 层
-    GPU_AHEAD_LAYERS = 6   # 预取 6 组（3 层）- 适配 11 组容量
+    GPU_AHEAD_LAYERS = 6# 预取 6 组（3 层）- 适配 11 组容量
     GPU_MAX_GROUPS   = 12
-    GPU_WARMUP_LAYERS = 8  # ⭐ 6 → 12 层（24 组），确保前 12 层完全 overlap
-    CPU_CACHE_LAYERS = 40  # CPU 缓存 50 层（79.5GB，安全余量）
+    GPU_WARMUP_LAYERS = 6# ⭐ 6 → 12 层（24 组），确保前 12 层完全 overlap
+    CPU_CACHE_LAYERS = 40# CPU 缓存 50 层（79.5GB，安全余量）
 
     # === H2D 并发控制（⭐⭐⭐ P0 优化：PCIe Gen5 + RTX 5080 高带宽配置） ===
     # PCIe Gen5 x16 带宽: 64GB/s (Gen4的2倍)
     # 70B模型每组权重~1.5GB → Gen5单次H2D只需~25ms（Gen4的一半）
     # 更高带宽意味着需要更高并发度才能饱和PCIe，避免流水线空隙
     os.environ.setdefault("WSM_H2D_BASE_CONCURRENCY",  "8")   # ⭐ 5→16（Gen5高带宽，基础并发）
-    os.environ.setdefault("WSM_H2D_PREFILL_MULT",      "1.5")  # Prefill: 32 并发
-    os.environ.setdefault("WSM_H2D_DECODE_MULT",       "1.2")  # ⭐ 1.0→1.5（Decode: 24 并发）
-    os.environ.setdefault("WSM_MAX_INFLIGHT_GROUPS",   "16")   # ⭐ 16→32（Inflight 上限，匹配并发）
-    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "48")   # ⭐ 48→96（H2D 队列，Gen5需要更深队列）
+    os.environ.setdefault("WSM_H2D_PREFILL_MULT",      "3")  # Prefill: 32 并发
+    os.environ.setdefault("WSM_H2D_DECODE_MULT",       "2")  # ⭐ 1.0→1.5（Decode: 24 并发）
+    os.environ.setdefault("WSM_MAX_INFLIGHT_GROUPS",   "32")   # ⭐ 16→32（Inflight 上限，匹配并发）
+    os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "96")   # ⭐ 48→96（H2D 队列，Gen5需要更深队列）
 
     # === 异步逐出机制 ===
-    os.environ.setdefault("WSM_EVICT_QUEUE_SIZE",      "64")   # 逐出队列容量
-    os.environ.setdefault("WSM_BG_WORKERS",            "6")    # 后台线程池
+    os.environ.setdefault("WSM_EVICT_QUEUE_SIZE",      "96")   # 逐出队列容量
+    os.environ.setdefault("WSM_BG_WORKERS",            "8")    # 后台线程池
 
     # === GPU 窗口配置 ===
     os.environ.setdefault("WSM_GPU_MAX_GROUPS",        str(GPU_MAX_GROUPS))
     os.environ.setdefault("WSM_GPU_AHEAD_GROUPS",      str(GPU_AHEAD_LAYERS))
     # ⭐⭐⭐ P0 修复: 预取深度必须匹配计算时间窗口
     # 单层 100ms 可 overlap 4 组 H2D，设置 8 保证充足流水线
-    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH",  "4")  # ⭐ 6 → 8
+    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH",  "6")  # ⭐ 6 → 8
     os.environ.setdefault("WSM_GPU_AHEAD",             str(GPU_AHEAD_LAYERS))
     os.environ.setdefault("WSM_GPU_BEHIND",            "2")    # 保留最近 2 层
 
@@ -628,12 +628,12 @@ def main():
 
     # === CPU 预取优化（RAM 可容纳 60 层） ===
     os.environ.setdefault("WSM_POOLED_CPU_READ",       "1")
-    os.environ.setdefault("WSM_CPU_PF_WORKERS",        "10")   # CPU 预取线程数（50% CPU）
+    os.environ.setdefault("WSM_CPU_PF_WORKERS",        "12")   # CPU 预取线程数（50% CPU）
     os.environ.setdefault("WSM_REBALANCE_SYNC",        "0")    # 异步重平衡
 
     # === SSD→CPU 流水线 ===
     os.environ.setdefault("WSM_CPU_PREFETCH_DISTANCE", str(CPU_CACHE_LAYERS))   # CPU 预取 50 层
-    os.environ.setdefault("WSM_SSD_CONCURRENCY",       "8")    # SSD 并发读取
+    os.environ.setdefault("WSM_SSD_CONCURRENCY",       "12")    # SSD 并发读取
 
     # === Prefill 特定优化 ===
     os.environ.setdefault("PREFILL_CPU_LAYERS",        str(CPU_CACHE_LAYERS))   # Prefill CPU 缓存 50 层
@@ -654,7 +654,7 @@ def main():
     os.environ.setdefault("WSM_CPU_CACHE_CAP_LAYERS", str(CPU_CACHE_LAYERS))
     os.environ.setdefault("WSM_CPU_CACHE_HWM_LAYERS", str(CPU_CACHE_LAYERS))
     os.environ.setdefault("WSM_CPU_CACHE_LWM_LAYERS", str(max(2, CPU_CACHE_LAYERS - 5)))
-    os.environ.setdefault("WSM_CPU_BACK_MARGIN",   "0")
+    os.environ.setdefault("WSM_CPU_BACK_MARGIN",   "1")
     os.environ.setdefault("WSM_KV_THROTTLE_THRESHOLD", "2")
     os.environ.setdefault("WSM_KV_THROTTLE_MS",        "16")
 
@@ -665,7 +665,7 @@ def main():
     print(f"GPU 预取深度:  {GPU_AHEAD_LAYERS} 组")
     print(f"GPU 组预算:    {GPU_MAX_GROUPS} 组 (最多 ~9GB)")
     print(f"CPU 缓存容量:  {CPU_CACHE_LAYERS} 层 (~79.5GB)")
-    print(f"H2D 并发度:    Prefill 10 | Decode 5")
+    print(f"H2D 并发度:    Prefill 24 | Decode 16")
     print(f"异步逐出队列:  64 任务")
     print(f"后台线程池:    6 workers")
     print(f"CPU 预取线程:  10 workers")
@@ -685,7 +685,7 @@ def main():
         probe("after runtime clamp")
 
     # 2) WSM（SSD 流式）构造参数
-    PRIME_WINDOW = int(os.getenv("WSM_PRIME_WINDOW", "6"))  # 从环境变量读取，默认6
+    PRIME_WINDOW = int(os.getenv("WSM_PRIME_WINDOW", "12"))  # 从环境变量读取，默认6
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
@@ -704,7 +704,7 @@ def main():
             checkpoints_dir=CKPT_DIR,
             load_model=False,           # 不把 checkpoint 全载入 CPU
             device=device,
-            max_seq_len=2048,
+            max_seq_len=4096,
             max_batch_size=32,
             topk_blk=8,
             mode="mixed",

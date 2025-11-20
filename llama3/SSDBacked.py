@@ -14,7 +14,9 @@ def aligned_array(shape, dtype, align=ALIGN):
 class RawBlockKVBackend:
     def __init__(self, dev_path: str, n_layers: int,
                  blk_bytes: int, blk_per_layer: int,
-                 max_concurrent_io: int = 4):
+                 max_concurrent_io: int = None):
+        if max_concurrent_io is None:
+            max_concurrent_io = int(os.getenv("SSD_IO_THREADS", "32"))
         self.fd = None
         try:
             self.fd = os.open(dev_path, os.O_RDWR | os.O_DIRECT)

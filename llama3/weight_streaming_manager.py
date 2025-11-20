@@ -152,7 +152,7 @@ class WeightStreamingManager:
         self.prefill_gpu_layers = max(0, int(os.getenv("PREFILL_GPU_LAYERS", "5")))
 
         self._cpu_protect_set: set[int] = set()
-        self.decoder_protect_layers: int = int(os.getenv("WSM_DECODER_PROTECT_LAYERS", "0"))  # 預設保護前 4 層
+        self.decoder_protect_layers: int = int(os.getenv("WSM_DECODER_PROTECT_LAYERS", "12"))  # 預設保護前 4 層
 
         # ⭐ 统一在初始化早期解析环境变量，避免后续覆盖导致配置漂移
         # 优先级：环境变量 WSM_CPU_CACHE_LAYERS > 构造参数 cpu_cache_layers
@@ -215,7 +215,7 @@ class WeightStreamingManager:
         # PD 自适应参数（滞回 + EMA）
         
         
-        self.max_pinned_groups   = int(os.getenv("WSM_GROUP_PIN_BUDGET", "0"))
+        self.max_pinned_groups   = int(os.getenv("WSM_GROUP_PIN_BUDGET", "4"))
         
         # 统一的组状态机：(L, kind) -> {"CPU","INFLIGHT","RESIDENT","EVICTING"}
         self._group_state: dict[tuple[int,str], str] = {}
@@ -300,6 +300,9 @@ class WeightStreamingManager:
 
         # Verbose mismatch: when enabled, emit detailed logs when event ready but group not resident
         self.verbose_mismatch = (os.getenv("WSM_VERBOSE_MISMATCH", "0") == "1")
+
+        # Event wait timeout in seconds (default 0.5s for faster failure detection)
+        self._evt_wait_timeout_s = float(os.getenv("WSM_EVENT_TIMEOUT", "0.5"))
 
         # SDPA workspace headroom in MB (default 64MB)
         self.attn_workspace_headroom_mb = int(os.getenv("ATTN_WORKSPACE_HEADROOM_MB", "64"))
@@ -762,59 +765,82 @@ class WeightStreamingManager:
 
     def _h2d_dispatch_loop(self):
         """
-        后台线程：从 self._gpf_q 中取任务，将 CPU cache 中就绪的组搬到 GPU。
-        保证：evt 一定被 record 在 h2d_stream 上，然后才发布 host_recorded，再替换占位。
+        后台线程：消费 _gpf_q，完成 CPU→GPU 安装，并保证以下顺序：
+        - 真实事件在 H2D 流上 record()
+        - 再 set host_evt（host 侧“record 完成”）
+        - 再替换占位（若存在）
+        兼容 5 元组/3 元组两种载荷格式。
         """
+        import torch, threading, queue
         while not self._stop_event.is_set():
             try:
-                layer_idx, group, h2d_override = self._gpf_q.get(timeout=0.05)
+                item = self._gpf_q.get(timeout=0.05)
             except queue.Empty:
                 continue
 
-            key = (layer_idx, group)
-
-            # 检查 CPU 是否就绪；若还没到，退回队列并继续
-            if not self._cpu_group_ready(layer_idx, group):
-                # 重新排队，避免忙等
-                self._requeue_gpf(key, h2d_override)
+            # --- 统一解析队列载荷 ---
+            epoch = getattr(self, "_epoch", 0)
+            pin = False; reason = "queued"; h2d_override = None
+            if isinstance(item, tuple) and len(item) >= 5:
+                ep, key, pin, reason, h2d_override = item[:5]
+                if ep != epoch:
+                    # 过期任务直接丢弃
+                    continue
+                layer_idx, group = key
+            elif isinstance(item, tuple) and len(item) == 3:
+                # 兼容旧格式
+                layer_idx, group, h2d_override = item
+            else:
+                # 未知格式，忽略
                 continue
 
-            # 选择 H2D stream
-            h2d_stream = h2d_override or self._select_h2d_stream_for(key)
+            key = (int(layer_idx), 'attn' if group == 'attn' else 'ffn')
 
-            # 预留 GPU 空间/预算，不够则优先清理老的 RESIDENT（禁止驱逐 inflight）
-            if not self._ensure_gpu_headroom(key):
-                # 让出，稍后重试
-                self._requeue_gpf(key, h2d_override)
+            # CPU 未就绪则回投
+            if not self._cpu_group_ready(layer_idx, key[1]):
+                self._requeue_gpf(key, h2d_override, pin, reason="cpu_wait")
                 continue
 
-            # 安装占位（若还没有）
-            if key not in self._group_events:
-                placeholder = torch.cuda.Event(blocking=False)
-                self._group_events[key] = placeholder
-                self._placeholder_keys.add(key)
-                self._group_recorded_host[key] = threading.Event()
+            # 选择 H2D 流
+            if key[1] == "attn":
+                h2d_stream = h2d_override or getattr(self.streams, "weight_h2d_mha", None)
+            else:
+                h2d_stream = h2d_override or getattr(self.streams, "weight_h2d_ffn", None)
+            if h2d_stream is None and torch.cuda.is_available():
+                h2d_stream = torch.cuda.current_stream()
 
-            # ===== 真正的 H2D 搬运：在 h2d_stream 上完成，并记录事件 =====
+            # 确保有事件与 host 标志（占位可能已存在）
+            with self._group_lock:
+                evt = self._group_events.get(key)
+                if evt is None:
+                    evt = torch.cuda.Event(blocking=False)
+                    self._group_events[key] = evt
+                    getattr(self, "_placeholder_keys", set()).add(key)
+                host_evt = self._group_recorded_host.get(key)
+                if host_evt is None:
+                    host_evt = threading.Event()
+                    self._group_recorded_host[key] = host_evt
+                self._set_state(key, "INFLIGHT")
+                self._gpu_group_inflight.add(key)
+
+            # 真正 H2D + 在 H2D 流上记录“同一个”事件
             with torch.cuda.stream(h2d_stream):
-                self._install_group_on_gpu(layer_idx, group)  # 你的原始函数，负责把 CPU tensors 拷到 GPU 并做必要的 param 绑定
-                real_evt = torch.cuda.Event(blocking=False)
-                real_evt.record(h2d_stream)                   # **必须**记录在 h2d_stream 上
-
-            # 发布顺序：先 host_recorded，再替换占位，最后标状态
-            host_evt = self._group_recorded_host.get(key, None)
-            if host_evt is not None:
-                host_evt.set()
-
-            # 替换占位
-            self._group_events[key] = real_evt
-            if key in self._placeholder_keys:
-                self._placeholder_keys.remove(key)
-
-            # 标记 inflight，供窗口推进时判定
-            self._gpu_group_inflight.add(key)
+                self._install_group_on_gpu(layer_idx, key[1], h2d_override=h2d_stream)
+                evt.record(h2d_stream)
 
 
+            
+            with self._group_lock:
+                getattr(self, "_placeholder_keys", set()).discard(key)
+                # 进入 ring（保持 INFLIGHT；由使用时升级为 RESIDENT）
+                try:
+                    if key in self._gpu_group_ring:
+                        self._gpu_group_ring.remove(key)
+                    self._gpu_group_ring.append(key)
+                except ValueError:
+                    self._gpu_group_ring.append(key)
+                    
+            host_evt.set()
 
 
     def _plan_balanced_groups(self, cur_idx: int, budget: int) -> list[tuple[int, str]]:
@@ -1018,7 +1044,11 @@ class WeightStreamingManager:
                 if key in ph:
                     continue  # 占位期，不可删
                 st = self._get_state(key)
+                if st == "INFLIGHT":
+                    continue
                 in_ring = key in self._gpu_group_ring
+                if st == "INFLIGHT":
+                    continue
                 if (not in_ring) or (st == "EVICTING"):
                     self._group_events.pop(key, None)
 
@@ -3057,6 +3087,7 @@ class WeightStreamingManager:
             self._set_state(key, "CPU")
             self._gpu_group_inflight.discard(key)
             self._group_events.pop(key, None)
+            self._group_recorded_host.pop(key, None)  # ✅ 避免残留 host 事件
 
             # 3) 从ring中移除
             if key in self._gpu_group_ring:
@@ -3299,6 +3330,19 @@ class WeightStreamingManager:
 
         return evicted
 
+    def _requeue_gpf(self, key: tuple[int, str], h2d_override=None, pin: bool = False, reason: str = "requeue"):
+        """
+        把组级预取任务按统一 5 元组格式回投到 _gpf_q（避免旧格式导致的 worker 解包错误）
+        """
+        try:
+            # 允许重复回投（会被 _gpf_seen 限制或被 worker 过滤）
+            self._gpf_q.put_nowait((self._epoch, key, bool(pin), reason, h2d_override))
+        except Exception:
+            pass
+        try:
+            self._check_and_throttle_kv()
+        except Exception:
+            pass
 
     def get_group_ready_event(self, layer_idx: int, group: str) -> "torch.cuda.Event|None":
         """
@@ -3343,58 +3387,64 @@ class WeightStreamingManager:
                 return False
         return True
 
-
-
     def wait_group_ready(self, layer_idx: int, group: str, compute_stream=None):
         """
-        等待 (layer_idx, group) 的权重在 GPU 上可用。
-        强约束：
-        1) 仅在 host 侧确认 "record() 已完成" 后才允许 wait_event
-        2) 必须等占位事件被替换为真实事件
-        3) 真实事件必须记录在发起 H2D 的 stream 上
+        严格的“先预取→后等待”：
+        1) 若未调度，触发预取（固定 H2D 流，避免随机化）
+        2) 先等 host 侧确认“record() 已完成”
+        3) 确保占位已被真实事件替换
+        4) 在 compute 流上 wait_event（非阻塞 CPU）
         """
-        key = (layer_idx, group)
-        # 若未曾调度，立即触发一次预取（避免死等）
-        if key not in self._group_events:
-            # 固定走一条可控的 h2d stream，避免被调度线程随机化
-            h2d0 = self.streams.h2d[0] if hasattr(self.streams, "h2d") and self.streams.h2d else None
-            self.prefetch_group_async(layer_idx, group, h2d_override=h2d0)
+        import time, torch
+        key = (int(layer_idx), 'attn' if group == 'attn' else 'ffn')
 
-        # 1) 先等 host 侧确认 "record()" 已完成
-        host_evt = self._group_recorded_host.get(key, None)
+        # 1) 若无事件，触发一次预取（选取与组匹配的 H2D 流）
+        if key not in self._group_events:
+            if group == "attn":
+                h2d0 = getattr(self.streams, "weight_h2d_mha", None)
+            else:
+                h2d0 = getattr(self.streams, "weight_h2d_ffn", None)
+            self.prefetch_group_async(layer_idx, group, h2d_override=h2d0, reason="wait_on_demand")
+
+        # 2) host 侧 record() 完成确认（避免 GPU 等"假事件"）
+        timeout_s = float(getattr(self, "_evt_wait_timeout_s", 2.0))
+        host_evt  = self._group_recorded_host.get(key, None)
         if host_evt is not None:
-            # 给定时，避免无限卡死
-            if not host_evt.wait(timeout=self._evt_wait_timeout_s):
-                # 主动再触发一次 prefetch（可能上次抢占失败/被驱逐）
-                self.prefetch_group_async(layer_idx, group)
-                if not host_evt.wait(timeout=self._evt_wait_timeout_s):
+            if not host_evt.wait(timeout=timeout_s):
+                # 再触发一次预取并重试（处理抢占失败或被驱逐）
+                if self.verbose:
+                    print(f"[WSM WAIT] Timeout waiting for {key}, retrying prefetch...")
+                self.prefetch_group_async(layer_idx, group, reason="wait_retry")
+                if not host_evt.wait(timeout=timeout_s):
+                    if self.verbose:
+                        print(f"[WSM WAIT] Second timeout for {key}, checking CPU readiness...")
+                        cpu_ready = self._cpu_group_ready(layer_idx, group)
+                        print(f"[WSM WAIT] CPU ready for {key}: {cpu_ready}")
                     raise RuntimeError(f"WSM: host record not observed for {key}")
 
-        # 2) 确保 placeholder 已经被替换
-        spin = 0
-        while key in self._placeholder_keys:
-            if spin >= self._evt_spin_max:
+        # 3) 等占位被真实事件替换（轻量自旋，带上限）
+        spin_max = int(getattr(self, "_evt_spin_max", 10000))
+        spins = 0
+        while key in getattr(self, "_placeholder_keys", set()):
+            if spins >= spin_max:
                 raise RuntimeError(f"WSM: placeholder not replaced for {key}")
-            time.sleep(1e-4)
-            spin += 1
+            time.sleep(1e-4); spins += 1
 
-        # 3) 取到“已记录”的真实事件，并在 compute stream 上等待
+        # 4) 在 compute 流上建立事件依赖（非阻塞 CPU）
         evt = self._group_events.get(key, None)
         if evt is None:
-            # 极端情况下被清理/驱逐，重试一次
-            self.prefetch_group_async(layer_idx, group)
+            # 极端兜底：重触发 + 等 host_evt，再拿事件
+            self.prefetch_group_async(layer_idx, group, reason="wait_missing_evt")
             host_evt = self._group_recorded_host.get(key, None)
             if host_evt is not None:
-                host_evt.wait(timeout=self._evt_wait_timeout_s)
+                host_evt.wait(timeout=timeout_s)
             evt = self._group_events.get(key, None)
             if evt is None:
-                raise RuntimeError(f"WSM: missing event after prefetch for {key}")
+                raise RuntimeError(f"WSM: missing CUDA event after prefetch for {key}")
 
         if compute_stream is None:
             compute_stream = torch.cuda.current_stream()
-
-        # 这里的 wait_event 等价于底层 cudaStreamWaitEvent 语义
-        compute_stream.wait_event(evt)
+        compute_stream.wait_event(evt)  # 非阻塞：仅 GPU 侧依赖
 
 
 
@@ -4503,95 +4553,88 @@ class WeightStreamingManager:
         #         print(f"[WSM] cpu-pump on ready failed: {e}")
 
 
-    # --- inside class WeightStreamingManager ---
-    def prefetch_group_async(self, layer_idx: int, group: str, pin: bool = False,
-                            reason: str | None = None, h2d_override: "torch.cuda.Stream|None" = None) -> bool:
+    def prefetch_group_async(self, layer_idx: int, group: str,
+                            pin: bool = False, reason: str | None = None,
+                            h2d_override=None) -> bool:
         """
-        尝试异步把 (layer, group) 搬到 GPU。
-        返回：True 表示已在卡/在途/已入队；False 表示当前没有做任何工作（下次再试）。
+        统一的组级预取入口：
+        - CPU 未就绪：登记等待 + 放占位事件 + 入队后台线程
+        - 无 H2D 配额：放占位事件 + 入队后台线程
+        - 有 H2D 配额：直接在 H2D 流上安装 + 记录真实事件 + set host_evt
+        始终把 5 元组 (epoch, key, pin, reason, h2d_override) 放入 _gpf_q。
         """
-        import torch, queue, threading
-
+        import torch, threading
         key = (int(layer_idx), 'attn' if group == 'attn' else 'ffn')
-        suffixes = ("attention.wq.weight","attention.wk.weight","attention.wv.weight","attention.wo.weight") \
-                if key[1] == "attn" else ("feed_forward.w1.weight","feed_forward.w2.weight","feed_forward.w3.weight")
 
-        # 已在卡或在途
+        # --- 先保证占位事件 & host 事件存在（无论 CPU 是否就绪）---
+        with self._group_lock:
+            evt = self._group_events.get(key)
+            if evt is None:
+                evt = torch.cuda.Event(blocking=False)
+                self._group_events[key] = evt
+                getattr(self, "_placeholder_keys", set()).add(key)
+            host_evt = self._group_recorded_host.get(key)
+            if host_evt is None:
+                host_evt = threading.Event()
+                self._group_recorded_host[key] = host_evt
+
+        # --- 再判定 CPU 是否就绪 ---
+        if not self._cpu_group_ready(layer_idx, key[1]):
+            # ⭐ 主动触发 CPU 加载（避免无限等待）
+            if getattr(self, "ssd_enabled", False):
+                try:
+                    self._cpu_try_enqueue(layer_idx, reason=f"prefetch_{key[1]}")
+                except Exception:
+                    pass
+            # 回投 CPU 等待队列，但我们已经有占位 & host_evt 了
+            self._requeue_gpf(key, h2d_override, pin, reason="cpu_wait")
+            return True  # 表示已提交（占位），让上层能够等待
+        # 状态快速检查与失配修正
         st = self._get_state(key)
-        # 如果标成 RESIDENT/INFLIGHT，但物理上不在卡，则修正状态并继续走预取
         if st == "RESIDENT" and (not self._is_group_physically_resident(layer_idx, key[1])):
             if self.verbose:
-                print(f"[WSM DEBUG] stale RESIDENT -> CPU for {key} (physically missing)")
+                print(f"[WSM] stale RESIDENT -> CPU for {key}")
             with self._group_lock:
                 self._set_state(key, "CPU")
             st = "CPU"
         elif st == "INFLIGHT":
-            # 可选：若长期 INFLIGHT 但无事件/host 标记，也视为失配，降回 CPU
             evt = self._group_events.get(key)
-            host = self._group_recorded_host.get(key)
-            if (evt is None) and (host is None):
+            # host = self._group_recorded_host.get(key)
+            if (evt is None) :
                 if self.verbose:
-                    print(f"[WSM DEBUG] stale INFLIGHT(no evt) -> CPU for {key}")
+                    print(f"[WSM] stale INFLIGHT(no evt) -> CPU for {key}")
                 with self._group_lock:
                     self._set_state(key, "CPU")
+                    self._gpu_group_inflight.discard(key)
+                    self._group_recorded_host.pop(key, None)
                 st = "CPU"
 
-        # 原来的 "if st in ('RESIDENT','INFLIGHT'): return True" 保留，但放在上述修正之后
-        if self.verbose:
-            phys = self._is_group_physically_resident(layer_idx, key[1])
-            print(f"[WSM DEBUG] prefetch_group_async early-check {key}: st={st}, physical={phys}, "
-                  f"in_ring={key in self._gpu_group_ring}, inflight={key in self._gpu_group_inflight}, "
-                  f"evt={'Y' if key in self._group_events else 'N'}")
-
-        if st in ("RESIDENT", "INFLIGHT"):
-            if self.verbose:
-                phys = self._is_group_physically_resident(layer_idx, key[1])
-                print(f"[WSM DEBUG] prefetch_group_async early-exit (st check) {key}: st={st}, physical={phys}, "
-                      f"in_ring={key in self._gpu_group_ring}, inflight={key in self._gpu_group_inflight}, "
-                      f"evt={'Y' if key in self._group_events else 'N'}")
+        # 已在途/常驻：直接返回
+        if st in ("RESIDENT", "INFLIGHT") or key in self._gpu_group_inflight:
             return True
 
-        if st in ("RESIDENT", "INFLIGHT"):
-            if self.verbose:
-                phys = self._is_group_physically_resident(layer_idx, key[1])
-                print(f"[WSM DEBUG] prefetch_group_async early-exit (st check 2) {key}: st={st}, physical={phys}, "
-                      f"in_ring={key in self._gpu_group_ring}, inflight={key in self._gpu_group_inflight}, "
-                      f"evt={'Y' if key in self._group_events else 'N'}")
-            return True
-        if key in self._gpu_group_ring or key in self._gpu_group_inflight:
-            if self.verbose:
-                phys = self._is_group_physically_resident(layer_idx, key[1])
-                print(f"[WSM DEBUG] prefetch_group_async early-exit (ring/inflight check) {key}: st={st}, physical={phys}, "
-                      f"in_ring={key in self._gpu_group_ring}, inflight={key in self._gpu_group_inflight}, "
-                      f"evt={'Y' if key in self._group_events else 'N'}")
-            return True
-        # --- GPU 预算门：只拦机会型预取 ---
+        # 预算门：仅拦“机会型”预取；必需型（get_event/wait）放行
         if not self._gpu_budget_allows_new_group(key, reason):
             return False
-        # ✅ 优化：CPU 未就绪时也创建占位事件，避免上层阻塞
-        # CPU 未就绪：登记"GPU 等待 CPU"，并驱动 CPU 泵
+
+        # ---- 情况 A：CPU 未就绪 → 先占位，入队后台线程 ----
         if getattr(self, "ssd_enabled", False) and not self._cpu_group_ready(layer_idx, key[1]):
             with self._cpu_lock:
                 self._gpu_need_on_cpu_ready.add(key)
+            enq_ok = False
             try:
                 enq_ok = self._cpu_try_enqueue(layer_idx, reason=reason or "prefetch")
             except Exception:
                 enq_ok = False
-
             if not enq_ok:
-                # 入队失败则清理等待标记，避免悬挂
                 with self._cpu_lock:
                     self._gpu_need_on_cpu_ready.discard(key)
-                return False  # 仅在 CPU 入队失败时返回 False
+                return False
 
-            # ✅ 修复: CPU未就绪时也创建占位事件，并入队到 _gpf_q
-            # 这样上层可以立即拿到事件并等待，保持完全异步
             placeholder_evt = torch.cuda.Event(blocking=False)
-            host_evt = threading.Event()  # 未 set，会阻塞 wait()
-
+            host_evt        = threading.Event()
             with self._group_lock:
-                # 占位：让 wait_group_ready 能看见事件
-                self._group_events[key] = placeholder_evt
+                self._group_events[key]        = placeholder_evt
                 self._group_recorded_host[key] = host_evt
                 self._placeholder_keys.add(key)
                 self._set_state(key, "INFLIGHT")
@@ -4601,13 +4644,11 @@ class WeightStreamingManager:
                     if cnt < self.max_pinned_groups:
                         self._pinned_groups[key] = cnt + 1
 
-            # ✅ 关键: 将占位态入队到 _gpf_q，让后台线程处理
+            # 入队（5 元组）
             try:
-                if key not in self._gpf_seen:
-                    self._gpf_q.put_nowait((self._epoch, key, bool(pin), reason or "cpu_wait", h2d_override))
-                    self._gpf_seen.add(key)
-            except queue.Full:
-                # 队列满: 回滚占位状态
+                self._gpf_q.put_nowait((self._epoch, key, bool(pin), reason or "cpu_wait", h2d_override))
+            except Exception:
+                # 回滚占位（极少发生）
                 with self._group_lock:
                     self._group_events.pop(key, None)
                     self._group_recorded_host.pop(key, None)
@@ -4617,40 +4658,27 @@ class WeightStreamingManager:
                         self._set_state(key, "CPU")
                 with self._cpu_lock:
                     self._gpu_need_on_cpu_ready.discard(key)
-                if self.verbose:
-                    print(f"[WSM] CPU-wait backlog full; drop {key}")
                 return False
-
-            # ✅ 返回 True，告诉上层"流水线已建立，可以等事件"
-            if self.verbose:
-                print(f"[WSM] prefetch_group_async: created placeholder for {key} (CPU not ready, enqueued)")
             return True
 
-        # ✅ P0-2: 申请 H2D 并发令牌；如无配额，仅"占位 + 入队"
+        # ---- 情况 B：无 H2D 配额 → 先占位，入队后台线程 ----
         if not self._h2d_acquire_token(timeout=0):
             placeholder_evt = torch.cuda.Event(blocking=False)
             host_evt        = threading.Event()
             with self._group_lock:
-                # 占位：让 wait_group_ready 能看见事件并阻塞在 host_evt
                 self._group_events[key]        = placeholder_evt
                 self._group_recorded_host[key] = host_evt
                 self._placeholder_keys.add(key)
-                # 标记为“在途(queued)”，并计入 inflight 信用
                 self._set_state(key, "INFLIGHT")
                 self._gpu_group_inflight.add(key)
                 if pin:
                     cnt = self._pinned_groups.get(key, 0)
                     if cnt < self.max_pinned_groups:
                         self._pinned_groups[key] = cnt + 1
-            # 入队后台 H2D
             try:
-                if key not in self._gpf_seen:
-                    self._gpf_q.put_nowait((self._epoch, key, bool(pin), reason or "queued", h2d_override))
-                    self._gpf_seen.add(key)
-                # ✅ 改进：已占位 + 已入队，返回 True（表示"流水线已建立"）
+                self._gpf_q.put_nowait((self._epoch, key, bool(pin), reason or "queued", h2d_override))
                 return True
-            except queue.Full:
-                # 回滚占位状态（队列满，无法保障 H2D 会发生）
+            except Exception:
                 with self._group_lock:
                     self._group_events.pop(key, None)
                     self._group_recorded_host.pop(key, None)
@@ -4658,67 +4686,41 @@ class WeightStreamingManager:
                     self._gpu_group_inflight.discard(key)
                     if self._get_state(key) == "INFLIGHT":
                         self._set_state(key, "CPU")
-                if self.verbose:
-                    print(f"[WSM] H2D backlog full; drop {key}")
                 return False
-        # ✨ 修复：立即创建 CUDA 事件和 host-side 事件（不再依赖占位事件）
-        inflight_evt = torch.cuda.Event(blocking=False)
-        recorded_host = threading.Event()
 
-        h2d_stream = h2d_override or self._pick_h2d_stream(key[1])
+        # ---- 情况 C：立即 H2D（有配额） → 直接安装并记录真实事件 ----
         try:
-            # 标记 INFLIGHT + 可选 pin
+            if group == "attn":
+                h2d_stream = h2d_override or getattr(self.streams, "weight_h2d_mha", None)
+            else:
+                h2d_stream = h2d_override or getattr(self.streams, "weight_h2d_ffn", None)
+            if h2d_stream is None and torch.cuda.is_available():
+                h2d_stream = torch.cuda.current_stream()
+
+            inflight_evt = torch.cuda.Event(blocking=False)
+            recorded_host = self._group_recorded_host.get(key) or threading.Event()
             with self._group_lock:
                 self._set_state(key, "INFLIGHT")
                 self._gpu_group_inflight.add(key)
-                # ✨ 提前放入事件表（此时事件尚未 record）
-                self._group_events[key] = inflight_evt
+                self._group_events[key]        = inflight_evt
                 self._group_recorded_host[key] = recorded_host
+                self._placeholder_keys.add(key)
                 if pin:
                     cnt = self._pinned_groups.get(key, 0)
                     if cnt < self.max_pinned_groups:
                         self._pinned_groups[key] = cnt + 1
 
-            # 评估需要的显存并挪腾空间
-            need_bytes = 0
-            with self.cpu_cache_lock:
-                layer_cache = dict(self.cpu_cache.get(layer_idx, {}))
-            for suf in suffixes:
-                pname = f"layers.{layer_idx}.{suf}"
-                t = layer_cache.get(pname)
-                if t is None:
-                    t = self._get_param_from_model(layer_idx, suf)
-                if t is not None:
-                    need_bytes += int(t.numel()) * int(t.element_size())
-            try:
-                self._ensure_gpu_headroom(need_bytes, exclude={key})
-            except Exception:
-                self._shrink_gpu_groups_now(exclude={key})
-
-            # 真正的 H2D：用同一个 h2d_stream，并在末尾 record "同一个"事件
+            # 真正 H2D + 在 H2D 流上 record 同一个事件
             with torch.cuda.stream(h2d_stream):
-                for suf in suffixes:
-                    pname = f"layers.{layer_idx}.{suf}"
-                    # 如果在 CPU cache，拿 pinned CPU；否则回落到模型 param（一般不该走到这里）
-                    with self.cpu_cache_lock:
-                        src = layer_cache.get(pname)
-                    if src is None:
-                        src = self._get_param_from_model(layer_idx, suf)
-                    if src is None:
-                        raise RuntimeError(f"CPU cache/modeled param missing: {pname}")
-                    # ✅ P0-3: 使用带超时和重试的 H2D 传输
-                    gpu_tensor = self._h2d_transfer_with_retry(src, pname, h2d_stream)
-                    # 安装到 GPU（将 GPU 张量赋值给模型参数）
-                    self._install_param_tensor(pname, gpu_tensor)
-
-                # ✨ 修复：在 H2D 流上 record CUDA 事件
+                self._install_group_on_gpu(layer_idx, group, h2d_override=h2d_stream)
                 inflight_evt.record(h2d_stream)
 
-            # ✨ 修复：set host-side 事件（通知 wait_group_ready 可以安全 wait_event）
-            recorded_host.set()
+            # host 侧 OK → 通知 wait_group_ready 可以安全 wait_event
+            
 
             with self._group_lock:
-                # ✅ 保持 INFLIGHT 状态，由 _group_is_resident() 自动升级
+                # 进入 ring，保持 INFLIGHT；RESIDENT 升级由查询+使用时机判定
+                self._placeholder_keys.discard(key)
                 try:
                     if key in self._gpu_group_ring:
                         self._gpu_group_ring.remove(key)
@@ -4726,9 +4728,8 @@ class WeightStreamingManager:
                 except ValueError:
                     self._gpu_group_ring.append(key)
                 self._placeholder_keys.discard(key)
-
+            recorded_host.set()
             return True
-
         finally:
             self._h2d_release_token()
 

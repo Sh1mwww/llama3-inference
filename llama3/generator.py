@@ -778,7 +778,32 @@ class LLaMA:
                             off._ssd_buffer = None  # 若之前按 CPU 创过，丢弃，待下一次按 CUDA 重建
                 if hasattr(layer, "feed_forward"):
                     layer.feed_forward.device = gpu_dev
-            
+          
+    def _prime_kv_for_first_decode_step(self, prefill_len: int, bsz: int):
+        """
+        在进入解码前，给每一层把 (start_pos=prefill_len, seqlen=1) 会命中的 KV blocks 预取一下。
+        这样 L0.attn 的第一步就能 100% 命中 GPU 暂存。
+        """
+        layers = getattr(self.model, "layers", [])
+        for lid, blk in enumerate(layers):
+            attn = getattr(blk, "attention", None)
+            off  = getattr(attn, "offloader", None)
+            if off is None:
+                continue
+            # 计算首步需要的 blocks（默认窗口=BLOCK）
+            blocks = off.plan_tail_window_blocks(prefill_len, 1)  # seqlen=1 for decode step-0
+            if not blocks:
+                continue
+            try:
+                s = getattr(self.streams, "kv_h2d", None)
+                if hasattr(off, "prefetch_blocks_async"):
+                    off.prefetch_blocks_async(lid, blocks, bsz=bsz, stream=s)
+                else:
+                    off.prefetch_async(layer=lid, blocks=blocks, bsz=bsz, device=self.args.device)
+            except Exception:
+                # 预取失败不应阻断推理流程
+                pass
+  
 
     # ---------- Build ----------
     @staticmethod
@@ -1199,7 +1224,17 @@ class LLaMA:
                 nvtx.range_push("prefill_phase")
                 try:
                     with torch.no_grad():
-                        _ = self.model(tokens[:, :prefill_len], start_pos=0)
+                        # _ = self.model(tokens[:, :prefill_len], start_pos=0)
+                        # tchunk = int(os.getenv("PREFILL_T_CHUNK", "0"))
+                        # 仅当环境变量设为正整数时启用分块；默认一次性 prefill
+                        tchunk_env = os.getenv("PREFILL_T_CHUNK", "0").strip()
+                        tchunk = int(tchunk_env) if tchunk_env.isdigit() else 0
+                        if tchunk and prefill_len > tchunk:
+                            for s in range(0, prefill_len, tchunk):
+                                e = min(prefill_len, s + tchunk)
+                                _ = self.model(tokens[:, s:e], start_pos=s)
+                        else:
+                            _ = self.model(tokens[:, :prefill_len], start_pos=0)
                 except torch.cuda.OutOfMemoryError as e:
                     print(f"❌ CUDA OOM during prefill of batch {batch_idx + 1}: {e}")
                     torch.cuda.empty_cache()
@@ -1235,7 +1270,7 @@ class LLaMA:
                         # WSM_PRIME_WINDOW: 预热窗口大小（默认 6 层）
                         prime_w = int(os.getenv("WSM_PRIME_WINDOW", "6"))
                         wsm.enter_decode_mode(first_layer=0, protect_layers=protect, prime_window=prime_w)
-
+                        self._prime_kv_for_first_decode_step(prefill_len=prefill_len, bsz=int(tokens.size(0)))
                         # ⭐ 解码前的"首层屏障"：显式确保 L0 事件已就绪
                         # 这能把"偶发行程波动"变成确定性等待
                         if hasattr(wsm, 'wait_group_ready'):
@@ -1246,7 +1281,7 @@ class LLaMA:
                         if hasattr(wsm, 'prime_decode_window'):
                             import os
                             wsm.prime_decode_window(first_layer=0, window=int(os.getenv("WSM_PRIME_WINDOW", "6")))
-
+                            self._prime_kv_for_first_decode_step(prefill_len=prefill_len, bsz=int(tokens.size(0)))
                             # ⭐ 解码前的"首层屏障"（兼容旧版）
                             if hasattr(wsm, 'wait_group_ready'):
                                 wsm.wait_group_ready(0, 'attn')
