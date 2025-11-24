@@ -425,22 +425,65 @@ class SelfAttention(nn.Module):
         return
     
     def _ensure_weights_cuda(self):
+        """
+        只在需要时，把当前层的 attn 组权重准备到 GPU 上。
+        - 优先通过 get_group_ready_event 拿到 H2D 完成事件，并在 compute stream 上等待该事件
+          （非阻塞 CPU）。
+        - 若事件还没建立，则触发一次 on-demand 预取。
+        - 仅在完全没事件、没预取的极端情况下，才回退到 wait_group_ready 的“阻塞”版本。
+        """
         wm = getattr(self, "weight_manager", None)
         if wm is None:
             return
-        if hasattr(wm, "wait_group_ready"):
-            compute_stream = getattr(self.streams, "compute_mha", None)
+
+        compute_stream = getattr(self.streams, "compute_mha", None)
+        if not torch.cuda.is_available():
+            # CPU 模式直接返回
+            return
+
+        # 优先走事件+流依赖路径（非阻塞 CPU）
+        evt = None
+        if hasattr(wm, "get_group_ready_event"):
+            try:
+                evt = wm.get_group_ready_event(self.layer_id, "attn")
+            except Exception:
+                evt = None
+
+        # 若还没有事件，说明该组可能还没开始 H2D，触发一次 on-demand 预取
+        if evt is None and hasattr(wm, "prefetch_group_async"):
+            try:
+                wm.prefetch_group_async(self.layer_id, "attn", reason="ensure_weights_cuda")
+                evt = wm.get_group_ready_event(self.layer_id, "attn")
+            except Exception:
+                evt = None
+
+        # 如果拿到了事件：只在 compute stream 上等待事件（非阻塞 CPU）
+        if evt is not None:
+            s = compute_stream or torch.cuda.current_stream()
+            try:
+                s.wait_event(evt)
+            except Exception:
+                # 极端情况下 fallback 到阻塞版本
+                evt = None
+
+        # 兜底：完全没有事件时，用老的 wait_group_ready（可能阻塞）
+        if evt is None and hasattr(wm, "wait_group_ready"):
             wm.wait_group_ready(self.layer_id, "attn", compute_stream=compute_stream)
-            if os.getenv("WSM_ASSERT_AFTER_WAIT", "0") == "1":
-                assert self.wq.weight.is_cuda and self.wq.weight.numel() > 0, "L{self.layer_id}.wq still stub"
+
+        if os.getenv("WSM_ASSERT_AFTER_WAIT", "0") == "1":
+            assert self.wq.weight.is_cuda and self.wq.weight.numel() > 0, \
+                f"L{self.layer_id}.wq still stub after _ensure_weights_cuda()"
+
 
     def _kv_gather_after_prefetch(self, blocks, bsz: int, stream=None):
         """
         安全版 KV gather：
-        1) 尝试在 kv_h2d 流上非阻塞预取当前层所需 blocks（如果已有事件则这步几乎是 no-op）
-        2) 等待已有的 block 级 ready 事件（若存在）
-        3) 用 offloader.fetch() 统一取回（命中 GPU 暂存则零拷，未命中则自动 DRAM→HBM 拷贝）
-        返回: (k_full, v_full), 形状与旧实现相同
+        1) 在 kv_h2d 流上异步预取当前层所需 blocks（如果已经预取过，这步是 no-op）
+        2) 在 compute 流上为这些 blocks 挂接已有的 per-block ready 事件（非阻塞 CPU）
+        3) 调用 offloader.fetch()：
+           - 若所有块已在 GPU，直接 zero-copy 拼接
+           - 否则由 fetch 内部按需触发 DRAM→HBM，仍使用事件保证正确性
+        返回: (k_full, v_full)，形状与旧实现相同
         """
         import torch
 
@@ -456,26 +499,31 @@ class SelfAttention(nn.Module):
             blocks = [int(blocks)]
         blocks = [int(b) for b in blocks]
 
-        # (A) 尽早 fire-and-forget 预取（能重叠就重叠；没必要同步）
-        try:
-            if hasattr(off, "prefetch_blocks_async"):
+        if not blocks:
+            raise ValueError("_kv_gather_after_prefetch: empty blocks")
+
+        # 1) 提交预取（异步）：SSD→DRAM→HBM 在线程池 + kv_h2d 流中执行
+        if hasattr(off, "prefetch_blocks_async"):
+            try:
                 off.prefetch_blocks_async(self.layer_id, blocks, bsz=bsz, stream=kv_stream)
-            elif hasattr(off, "prefetch_async"):
-                # 兼容老名字
-                off.prefetch_async(layer=self.layer_id, blocks=blocks, bsz=bsz, device=getattr(self, "device", "cuda"))
-        except Exception:
-            # 预取失败不影响兜底 fetch
-            pass
+            except Exception as e:
+                if os.getenv("KV_VERBOSE", "0") == "1":
+                    print(f"[KV][L{self.layer_id}] prefetch_blocks_async failed: {e}")
 
-        # (B) 如果之前已经记录了 block 级事件，则在当前 compute stream 上等待就绪
-        try:
-            if hasattr(off, "wait_blocks_ready"):
-                off.wait_blocks_ready(self.layer_id, blocks, stream=torch.cuda.current_stream())
-        except Exception:
-            pass
+        # 2) 在 compute 流上挂接已有的 per-block ready 事件（不阻塞 CPU）
+        compute_stream = getattr(self.streams, "compute_mha", None)
+        s = compute_stream or torch.cuda.current_stream()
+        if hasattr(off, "wait_blocks_ready"):
+            try:
+                off.wait_blocks_ready(self.layer_id, blocks, stream=s)
+            except Exception as e:
+                if os.getenv("KV_VERBOSE", "0") == "1":
+                    print(f"[KV][L{self.layer_id}] wait_blocks_ready failed: {e}")
 
-        # (C) 统一走 fetch（命中 GPU 暂存零拷；未命中自动 DRAM→HBM）
-        return off.fetch(layer=self.layer_id, blocks=blocks, bsz=bsz, stream=kv_stream)
+        # 3) fetch：优先走全 GPU 快路径；必要时从 DRAM 拉补到 HBM
+        k_full, v_full = off.fetch(self.layer_id, blocks, bsz=bsz, stream=s)
+        return k_full, v_full
+
 
     def _allocate_buffers(self, batch_size: int, seq_len: int, max_kv_len: int):
         """
@@ -559,7 +607,18 @@ class SelfAttention(nn.Module):
                 logger.error(f"CUDA context error in attention forward: {e}")
                 raise RuntimeError("CUDA context is corrupted") from e
 
-        start_time = time.time()
+        # 使用 CUDA timer 来准确测量计算时间（仅在 PROFILE 模式下）
+        forward_start_event = None
+        forward_end_event = None
+        if PROFILE and torch.cuda.is_available():
+            try:
+                forward_start_event = torch.cuda.Event(enable_timing=True)
+                forward_end_event = torch.cuda.Event(enable_timing=True)
+                forward_start_event.record()
+            except Exception:
+                forward_start_event = None
+                forward_end_event = None
+
         assert x.dim()==3, f"x dim={x.dim()}, shape={x.shape}"
         bsz, seqlen, _ = x.shape
 
@@ -1128,9 +1187,15 @@ class SelfAttention(nn.Module):
             result = res2d.view(B, Tq, -1).contiguous()
             del res2d
 
-            # --- 统计收尾 ---
-            total_time = (time.time() - start_time) * 1e6  # μs
-            PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
+            # --- 统计收尾：使用 CUDA timer 准确测量计算时间 ---
+            if forward_end_event is not None:
+                forward_end_event.record()
+                try:
+                    forward_end_event.synchronize()
+                    total_time = forward_start_event.elapsed_time(forward_end_event) * 1000  # ms -> μs
+                    PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
+                except Exception as e:
+                    logger.warning(f"Failed to record total_forward_us for layer {self.layer_id}: {e}")
             # print(f"[ATTN] Layer {self.layer_id} computation done")
 
             if wm and hasattr(wm, "notify_group_compute_done"):
@@ -1235,85 +1300,6 @@ class FeedForward(nn.Module):
         if hasattr(wm, "wait_group_ready"):
             wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
 
-    # def forward(self, x: torch.Tensor) -> torch.Tensor:
-    #     # --- 设备健康检查（与 SelfAttention 一致） ---
-    #     if x.is_cuda:
-    #         try:
-    #             torch.cuda.current_device()
-    #         except RuntimeError as e:
-    #             raise RuntimeError("CUDA context is corrupted") from e
-
-    #     print(f"[FFN] Layer {self.layer_id} forward starting...")
-
-    #     wm = getattr(self, "weight_manager", None)
-    #     in_use = False
-    #     try:
-    #         # ============================================================
-    #         # 只用事件、不阻塞：标记组使用 + 等待组 ready 事件
-    #         # ============================================================
-    #         if wm and hasattr(wm, "_mark_group_in_use"):
-    #             wm._mark_group_in_use(self.layer_id, "ffn")
-    #             in_use = True
-
-    #         # ⭐ 只用事件等待，不做同步阻塞
-    #         # 在 compute_ffn 流上等待 ffn 组的 ready 事件（非阻塞式，只让流依赖事件）
-    #         compute_stream = getattr(self.streams, "compute_ffn", None)
-    #         if wm is not None and hasattr(wm, "wait_group_ready"):
-    #             wm.wait_group_ready(self.layer_id, "ffn", compute_stream=compute_stream)
-
-    #         print(f"[FFN] Layer {self.layer_id} weights event wait done (non-blocking)")
-
-    #         # ⭐⭐⭐ Background prefetch during FFN compute（后续 D 层 ATTn）
-    #         try:
-    #             if wm is not None and hasattr(wm, "prefetch_group_async"):
-    #                 D = max(1, int(os.getenv("WSM_GROUP_PREFETCH_DEPTH", "2")))
-    #                 nL = getattr(wm, "n_layers", 0)
-    #                 used = getattr(wm, "_gpu_group_lru", [])  # 仅做轻量预算估计
-    #                 budget = max(0, int(os.getenv("WSM_GPU_MAX_GROUPS", "10")) - len(used) - 1)
-    #                 # 只在有预算时推进预取队列
-    #                 depth = min(D, budget) if budget > 0 else 0
-    #                 for off in range(1, depth + 1):
-    #                     nxt = self.layer_id + off
-    #                     if nxt < nL:
-    #                         wm.prefetch_group_async(nxt, "attn")
-    #         except Exception as e:
-    #             if getattr(wm, "verbose", False):
-    #                 print(f"[FFN][L{self.layer_id}] background prefetch skipped: {e}")
-
-    #         # --- FFN 计算 ---
-    #         compute_stream = getattr(self.streams, "compute_ffn", None) 
-    #         if compute_stream:
-    #             with torch.cuda.stream(compute_stream):
-    #                 with cuda_timer("ffn_us", self.layer_id):
-    #                     gate = self.w1(x)         # (B,T,28672)
-    #                     up   = self.w3(x)         # (B,T,28672)
-    #                     gate = F.silu(gate, inplace=True)       # in-place：覆盖 gate
-    #                     up.mul_(gate)             # in-place：up 直接变成 hidden
-    #                     result  = self.w2(up)        # 仅两块大张量存活
-    #         else:
-    #             with cuda_timer("ffn_us", self.layer_id):
-    #                 gate = self.w1(x)         # (B,T,28672)
-    #                 up   = self.w3(x)         # (B,T,28672)
-    #                 gate = F.silu(gate, inplace=True)       # in-place：覆盖 gate
-    #                 up.mul_(gate)             # in-place：up 直接变成 hidden
-    #                 result  = self.w2(up)        # 仅两块大张量存活
-
-    #         # 通知：FFN 组计算完成（便于组级 LRU 收缩/回收）
-    #         if wm and hasattr(wm, "notify_group_compute_done"):
-    #             evt = torch.cuda.Event()
-    #             evt.record(compute_stream if compute_stream is not None else torch.cuda.current_stream())
-    #             wm.notify_group_compute_done(self.layer_id, "ffn", evt)
-
-    #         print(f"[FFN] Layer {self.layer_id} computation done")
-    #         return result
-
-    #     finally:
-    #         # ⭐ 计算收尾：解除 FFN 组的 pin（对称于 ATTN 阶段的 pin）
-    #         if wm is not None and hasattr(wm, "unpin_group"):
-    #             wm.unpin_group(self.layer_id, "ffn")
-    #         # 解除 in_use 标记
-    #         if in_use and hasattr(wm, "_unmark_group_in_use"):
-    #             wm._unmark_group_in_use(self.layer_id, "ffn")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         import torch.nn.functional as F
 
@@ -1321,6 +1307,20 @@ class FeedForward(nn.Module):
             raise RuntimeError(
                 f"[FeedForward L{self.layer_id}] Input tensor must be on CUDA, got {x.device}"
             )
+
+        # ============================================================
+        # 使用 CUDA timer 来准确测量计算时间（仅在 PROFILE 模式下）
+        # ============================================================
+        forward_start_event = None
+        forward_end_event = None
+        if PROFILE and torch.cuda.is_available():
+            try:
+                forward_start_event = torch.cuda.Event(enable_timing=True)
+                forward_end_event = torch.cuda.Event(enable_timing=True)
+                forward_start_event.record()
+            except Exception:
+                forward_start_event = None
+                forward_end_event = None
 
         # ============================================================
         # ⭐ 回绕通知 + 事件等待（彻底不兜底）
@@ -1331,18 +1331,31 @@ class FeedForward(nn.Module):
         if wm is None:
             micro = int(os.getenv("FFN_MICRO_B", "0") or 8)
             bsz = int(x.size(0))
-            if micro <= 0 or micro >= bsz:
-                gate = self.w1(x); up = self.w3(x)
-                gate = F.silu(gate, inplace=True); up.mul_(gate); del gate
-                out = self.w2(up); del up; return out
-            out = torch.empty(bsz, x.size(1), self.w2.out_features,
-                              dtype=x.dtype, device=x.device)
-            for s in range(0, bsz, micro):
-                e = min(bsz, s + micro)
-                xi = x[s:e]
-                g  = self.w1(xi); u = self.w3(xi)
-                g  = F.silu(g, inplace=True); u.mul_(g); del g
-                out[s:e] = self.w2(u); del u
+            with cuda_timer("ffn_us", self.layer_id):
+                if micro <= 0 or micro >= bsz:
+                    gate = self.w1(x); up = self.w3(x)
+                    gate = F.silu(gate, inplace=True); up.mul_(gate); del gate
+                    out = self.w2(up); del up
+                else:
+                    out = torch.empty(bsz, x.size(1), self.w2.out_features,
+                                      dtype=x.dtype, device=x.device)
+                    for s in range(0, bsz, micro):
+                        e = min(bsz, s + micro)
+                        xi = x[s:e]
+                        g  = self.w1(xi); u = self.w3(xi)
+                        g  = F.silu(g, inplace=True); u.mul_(g); del g
+                        out[s:e] = self.w2(u); del u
+
+            # --- 统计收尾：使用 CUDA timer 准确测量计算时间 ---
+            if forward_end_event is not None:
+                forward_end_event.record()
+                try:
+                    forward_end_event.synchronize()
+                    total_time = forward_start_event.elapsed_time(forward_end_event) * 1000  # ms -> μs
+                    PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
+                except Exception as e:
+                    logger.warning(f"Failed to record total_forward_us for FFN layer {self.layer_id}: {e}")
+
             return out
 
         in_use = False
@@ -1410,17 +1423,28 @@ class FeedForward(nn.Module):
             stream_ctx = (torch.cuda.stream(compute_stream)
                           if compute_stream is not None else contextlib.nullcontext())
             with stream_ctx:
-                if 0 < micro < bsz:
-                    for s in range(0, bsz, micro):
-                        e = min(bsz, s + micro)
-                        xi = x[s:e]
-                        g  = self.w1(xi); u = self.w3(xi)
-                        g  = F.silu(g, inplace=True); u.mul_(g); del g
-                        result[s:e] = self.w2(u); del u
-                else:
-                    g = self.w1(x); u = self.w3(x)
-                    g = F.silu(g, inplace=True); u.mul_(g); del g
-                    result = self.w2(u); del u
+                with cuda_timer("ffn_us", self.layer_id):
+                    if 0 < micro < bsz:
+                        for s in range(0, bsz, micro):
+                            e = min(bsz, s + micro)
+                            xi = x[s:e]
+                            g  = self.w1(xi); u = self.w3(xi)
+                            g  = F.silu(g, inplace=True); u.mul_(g); del g
+                            result[s:e] = self.w2(u); del u
+                    else:
+                        g = self.w1(x); u = self.w3(x)
+                        g = F.silu(g, inplace=True); u.mul_(g); del g
+                        result = self.w2(u); del u
+
+            # --- 统计收尾：使用 CUDA timer 准确测量计算时间 ---
+            if forward_end_event is not None:
+                forward_end_event.record()
+                try:
+                    forward_end_event.synchronize()
+                    total_time = forward_start_event.elapsed_time(forward_end_event) * 1000  # ms -> μs
+                    PERF_TRACKER.add_layer_stat(self.layer_id, "total_forward_us", total_time)
+                except Exception as e:
+                    logger.warning(f"Failed to record total_forward_us for FFN layer {self.layer_id}: {e}")
 
             if hasattr(wm, "notify_group_compute_done"):
                 evt = torch.cuda.Event()

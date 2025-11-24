@@ -1,0 +1,214 @@
+INFO:llama3.memory_manager:HBM Manager initialized: 13.91GB available
+INFO:llama3.memory_manager:Memory monitoring started
+INFO:llama3.memory_manager:Global memory limit set to 14.687600708007812GB on cuda:0
+/home/roger/.pyenv/versions/inference_proj/lib/python3.13/contextlib.py:109: FutureWarning: `torch.backends.cuda.sdp_kernel()` is deprecated. In the future, this context manager will be removed. Please see `torch.nn.attention.sdpa_kernel()` for the new context manager, with updated signature.
+  self.gen = func(*args, **kwds)
+================================================================================
+70B 模型单层操作性能测试
+================================================================================
+已禁用 KV cache mirroring 和 verbose logging
+
+
+GPU信息:
+  设备: NVIDIA GeForce RTX 5080
+  显存: 15.46 GB
+
+加载模型配置: /data1/.llama/checkpoints/Llama3.1-70B/params.json
+Auto-set memory limit: 14.7GB (reserved: 0.8GB)
+
+模型配置:
+  dim: 8192
+  n_layers: 80
+  n_heads: 64
+  n_kv_heads: 8
+  vocab_size: 128256
+
+单层权重详情:
+  Attention 参数: 150,994,944 (0.281 GB)
+  FFN 参数: 301,989,888 (0.562 GB)
+  Norm 参数: 16,384 (0.000 GB)
+  总参数: 453,001,216 (0.844 GB)
+  单层大小: 0.844 GB
+  FFN hidden_dim: 12288
+  KV dim: 1024
+
+================================================================================
+测试1a: Prefill计算时间 (seq_len=2048)
+================================================================================
+[KVOffloader] DRAM quota estimation: sizing_batch=1, block=1.00MB, limit=6144 blocks
+[KVOffloader] Auto-enlarge KVCacheArgs.block_bytes → 1.00MB
+[KVOffloader] DRAM pool: mode=Lazy, used=0.00/8.00GB (0.0%), free_blocks=0, live_blocks=0
+Warmup (3 iterations)...
+Benchmarking (10 iterations)...
+  Iteration 1: 172.23 ms
+  Iteration 2: 172.46 ms
+  Iteration 3: 173.58 ms
+  Iteration 4: 173.01 ms
+  Iteration 5: 172.64 ms
+  Iteration 6: 173.02 ms
+  Iteration 7: 173.00 ms
+  Iteration 8: 172.57 ms
+  Iteration 9: 173.40 ms
+  Iteration 10: 173.28 ms
+
+结果:
+  平均时间: 172.92 ms
+  最小时间: 172.23 ms
+  最大时间: 173.58 ms
+  标准差: 0.41 ms
+
+================================================================================
+测试1b: Decode计算时间 (1 token per step, KV cache = 256 tokens)
+================================================================================
+初始化KV cache (prefill 256 tokens)...
+Warmup (3 iterations)...
+Benchmarking (100 iterations)...
+  Iteration 1: 2.46 ms
+  Iteration 2: 2.46 ms
+  Iteration 3: 2.41 ms
+  Iteration 4: 2.39 ms
+  Iteration 5: 2.46 ms
+  Iteration 6: 2.49 ms
+  Iteration 7: 2.47 ms
+  Iteration 8: 2.41 ms
+  Iteration 9: 2.51 ms
+  Iteration 10: 2.42 ms
+  ... (90 more iterations)
+
+结果:
+  平均时间: 2.45 ms
+  最小时间: 2.36 ms
+  最大时间: 2.73 ms
+  标准差: 0.05 ms
+
+================================================================================
+测试2: Pinned Memory -> GPU 传输时间
+================================================================================
+创建 0.84 GB 的 pinned memory tensor...
+Warmup (3 iterations)...
+Benchmarking (20 iterations)...
+  Iteration 1: 20.35 ms
+  Iteration 2: 20.28 ms
+  Iteration 3: 20.30 ms
+  Iteration 4: 20.28 ms
+  Iteration 5: 20.39 ms
+  Iteration 6: 20.36 ms
+  Iteration 7: 20.36 ms
+  Iteration 8: 20.32 ms
+  Iteration 9: 20.30 ms
+  Iteration 10: 20.34 ms
+  Iteration 11: 20.31 ms
+  Iteration 12: 20.31 ms
+  Iteration 13: 20.31 ms
+  Iteration 14: 20.30 ms
+  Iteration 15: 20.37 ms
+  Iteration 16: 20.22 ms
+  Iteration 17: 20.33 ms
+  Iteration 18: 20.26 ms
+  Iteration 19: 20.30 ms
+  Iteration 20: 20.33 ms
+
+结果:
+  平均时间: 20.32 ms
+  最小时间: 20.22 ms
+  最大时间: 20.39 ms
+  标准差: 0.04 ms
+  平均带宽: 41.53 GB/s
+
+================================================================================
+测试3: Raw Block Device -> Pinned Memory 读取时间
+================================================================================
+创建 0.84 GB 的 pinned memory buffer...
+打开块设备: /dev/nvme0n1p4 (O_DIRECT mode)
+Warmup (2 iterations)...
+Benchmarking (10 iterations)...
+  Iteration 1 (offset=0.00GB): 185.08 ms
+  Iteration 2 (offset=0.84GB): 167.60 ms
+  Iteration 3 (offset=1.69GB): 206.89 ms
+  Iteration 4 (offset=2.53GB): 200.05 ms
+  Iteration 5 (offset=3.38GB): 200.86 ms
+  Iteration 6 (offset=4.22GB): 172.24 ms
+  Iteration 7 (offset=5.06GB): 198.15 ms
+  Iteration 8 (offset=5.91GB): 170.01 ms
+  Iteration 9 (offset=6.75GB): 201.77 ms
+  Iteration 10 (offset=7.59GB): 195.22 ms
+
+结果:
+  平均时间: 189.79 ms
+  最小时间: 167.60 ms
+  最大时间: 206.89 ms
+  标准差: 14.06 ms
+  平均带宽: 4.45 GB/s
+
+================================================================================
+测试结果总结
+================================================================================
+
+单层权重大小: 0.844 GB
+
+1a. Prefill计算时间 (1 layer, 2048 tokens):
+   平均: 172.92 ms
+   最小: 172.23 ms
+   最大: 173.58 ms
+
+1b. Decode计算时间 (1 layer, 1 token):
+   平均: 2.45 ms
+   最小: 2.36 ms
+   最大: 2.73 ms
+   Decode比Prefill快: 70.7x
+
+2. Pinned Memory -> GPU 传输时间:
+   平均: 20.32 ms
+   最小: 20.22 ms
+   最大: 20.39 ms
+   带宽: 41.53 GB/s
+
+3. Raw Block Device -> Pinned Memory 读取时间:
+   平均: 189.79 ms
+   最小: 167.60 ms
+   最大: 206.89 ms
+   带宽: 4.45 GB/s
+
+================================================================================
+重叠可行性分析 - Prefill阶段
+================================================================================
+
+串行执行总时间: 383.02 ms
+  计算: 172.92 ms (45.1%)
+  Pin->GPU: 20.32 ms (5.3%)
+  SSD->Pin: 189.79 ms (49.5%)
+
+✓ 计算可以隐藏 Pin->GPU 传输 (计算时间 > 传输时间)
+  节省时间: 20.32 ms
+
+✗ 计算无法完全隐藏 SSD->Pin 读取
+  额外等待: 16.87 ms
+
+理想流水线时间 (完美重叠): 189.79 ms
+理论加速比: 2.02x
+
+预取距离建议:
+  SSD->Pin: 预取距离 = 2 (需要提前 2 层开始读取)
+  Pin->GPU: 预取距离 = 1 (传输可被计算隐藏)
+
+================================================================================
+重叠可行性分析 - Decode阶段
+================================================================================
+
+串行执行总时间: 212.55 ms
+  计算: 2.45 ms (1.2%)
+  Pin->GPU: 20.32 ms (9.6%)
+  SSD->Pin: 189.79 ms (89.3%)
+
+✗ 计算无法隐藏 Pin->GPU 传输 (需要等待 17.87 ms)
+
+✗ 计算无法隐藏 SSD->Pin 读取 (需要等待 187.34 ms)
+
+理想流水线时间 (完美重叠): 189.79 ms
+理论加速比: 1.12x
+
+预取距离建议 (Decode):
+  SSD->Pin: 预取距离 = 78 (需要提前 78 层)
+  Pin->GPU: 预取距离 = 9 (需要提前 9 层)
+
+================================================================================

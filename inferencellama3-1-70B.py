@@ -13,6 +13,7 @@ Llama3.1-70B 推理 + 轻量级 Profiler（JSON/CSV 自动写入固定目录）
 import os
 from pathlib import Path
 import types
+from typing import Any, Dict, List, Optional
 import json, csv, uuid, platform, math, time, re
 from datetime import datetime, timezone
 from contextlib import contextmanager, nullcontext
@@ -25,7 +26,18 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"  # 限制分块�
 # 🔥 WSM 无兜底策略：锁定事件驱动调度，禁用同步兜底 (no-fallback)
 os.environ["WSM_NO_FALLBACK"] = "1"
 
+# 🔥 启用层级性能 profiling（CUDA timer 统计 attn/ffn/kv_fetch 等详细时间）
+os.environ["LLM_PROFILE"] = "1"
+
 import torch
+
+# Optional NVTX for GPU decode-step ranges
+try:
+    import torch.cuda.nvtx as nvtx
+    NVTX_AVAILABLE = True
+except Exception:
+    nvtx = None
+    NVTX_AVAILABLE = False
 
 # ===== 你可以改这里：日志输出目录 & 运行标签（可留空） =====
 LOG_DIR = Path("/home/roger/logs")   # 自动创建
@@ -35,6 +47,10 @@ RUN_TAG = ""                         # 例如 "ablation-a1"；留空则自动仅
 from llama3.generator import LLaMA
 from llama3.config import KVCacheArgs, load_runtime_config, runtime_config_to_dict
 from llama3 import generator as _gen, stream_mnt
+try:
+    from llama3.layers import PERF_TRACKER  # 新增：从 layers.py 拿到全局的性能统计器
+except Exception:
+    PERF_TRACKER = None
 
 # ========== build() 包装：只加日志，不改库 ==========
 _orig_build = _gen.LLaMA.build
@@ -85,6 +101,14 @@ class InferenceProfiler:
         self.forward_events = []      # GPU：[(kind,batch,seqlen,start_ev,end_ev)]
         self.forward_events_cpu = []  # CPU 回退：[(kind,batch,seqlen,dt_ms)]
         self.bookkeep  = {}
+        
+        # 新增：decode step 计数 + 是否启用 NVTX
+        self.decode_step_idx = 0
+        self.use_nvtx = bool(self.cuda and NVTX_AVAILABLE)
+
+        # 供 finalize 合并的 WSM 运行期统计（由 main() 写入）
+        self.wsm_runtime = None
+        
         self.meta      = {
             "started_at_utc": _now_utc(),
             "python": platform.python_version(),
@@ -123,6 +147,10 @@ class InferenceProfiler:
         with self.span("inference_e2e", "inference"):
             yield
         self.active = False
+    
+    def now_ms(self) -> float:
+        """当前相对 t0 的墙钟时间（毫秒），供外部补丁使用。"""
+        return (time.perf_counter_ns() - self.t0_ns) / 1e6
 
     def wrap_model_forward(self, model):
         orig = model.forward
@@ -151,9 +179,26 @@ class InferenceProfiler:
             if self.cuda:
                 s_ev = torch.cuda.Event(enable_timing=True)
                 e_ev = torch.cuda.Event(enable_timing=True)
-                s_ev.record()
-                out = orig(*args, **kwargs)
-                e_ev.record()
+
+                # 新增：decode step 的 NVTX 标记，方便 Nsight 对齐
+                label = None
+                if self.use_nvtx and NVTX_AVAILABLE and kind == "decode":
+                    step_idx = self.decode_step_idx
+                    self.decode_step_idx += 1
+                    b_str = (B if B is not None else 0)
+                    t_str = (T if T is not None else 0)
+                    label = f"decode_step_{step_idx:04d}_B{b_str}_T{t_str}"
+
+                if label is not None:
+                    nvtx.range_push(label)
+                try:
+                    s_ev.record()
+                    out = orig(*args, **kwargs)
+                    e_ev.record()
+                finally:
+                    if label is not None:
+                        nvtx.range_pop()
+
                 self.forward_events.append((kind, B, T, s_ev, e_ev))
                 return out
             else:
@@ -165,15 +210,26 @@ class InferenceProfiler:
 
         model.forward = wrapped
 
+
     # 供 WSM 补丁使用
     def span_if_active(self, name, category, **extras):
         return self.span(name, category, **extras) if self is not None else nullcontext()
 
     def _compute_decode_stats(self, arr):
         if not arr:
-            return {"count": 0}
+            return {
+                "count": 0,
+                "sum_ms": 0.0,
+                "mean_ms": None,
+                "p50_ms": None,
+                "p90_ms": None,
+                "p99_ms": None,
+                "decode_toks_per_s": None,
+            }
         s = sorted(arr)
         q = lambda p: s[int((len(s)-1)*p)]
+        total_s = sum(arr) / 1000.0  # ms to seconds
+        toks_per_s = len(arr) / total_s if total_s > 0 else None
         return {
             "count": len(arr),
             "sum_ms": sum(arr),
@@ -181,68 +237,306 @@ class InferenceProfiler:
             "p50_ms": q(0.50),
             "p90_ms": q(0.90),
             "p99_ms": q(0.99),
+            "decode_toks_per_s": toks_per_s,
         }
 
-    def finalize(self, tokens_in: int | None, tokens_out: int | None, extra_meta: dict | None = None):
-        if extra_meta: self.meta.update(_flatten_extras(extra_meta))
-        # 统一同步后读取 CUDA Event
-        decode_ms = []
-        prefill_total = 0.0
-        if self.cuda and self.forward_events:
-            torch.cuda.synchronize()
-            for kind, B, T, s_ev, e_ev in self.forward_events:
-                dt = float(s_ev.elapsed_time(e_ev))  # ms
-                if kind == "prefill": prefill_total += dt
-                elif kind == "decode": decode_ms.append(dt)
-        elif self.forward_events_cpu:
-            for kind, B, T, dt in self.forward_events_cpu:
-                if kind == "prefill": prefill_total += dt
-                elif kind == "decode": decode_ms.append(dt)
+    def finalize(
+        self,
+        tokens_in: int,
+        tokens_out: int,
+        extra_meta: Optional[Dict[str, Any]] = None,
+        kv_stats: Optional[Dict[str, Any]] = None,
+        wsm_runtime: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        把 timeline + forward_events 汇总成一个结构化结果：
+        - 总体 e2e / prefill / decode 时间
+        - 每 token decode 的耗时统计
+        - WSM 的 IO / 等待时间统计
+        - （新增）每个 decoder layer 的计算时间 & IO 时间
+        - warmup layer 总时间
+        """
+        # -------- 工具函数 --------
+        def _sum_by_name(name: str) -> float:
+            return sum(ev["dur_ms"] for ev in self.timeline if ev["name"] == name)
 
-        inf_span = next((x for x in self.timeline if x["name"]=="inference_e2e"), None)
-        e2e_ms = inf_span["dur_ms"] if inf_span else None
-        first_decode_ms = decode_ms[0] if decode_ms else None
-        ftl_approx = (prefill_total + first_decode_ms) if (first_decode_ms is not None) else None
+        def _mean_or_none(values: List[float]) -> Optional[float]:
+            return sum(values) / len(values) if values else None
 
-        # 分类聚合
-        sum_cat = {}
+        def _sum_io(name: str, group_key: Optional[str] = None) -> Dict[str, Any]:
+            """
+            统计某个 IO 事件的总时间及分组：
+            name: "wsm.ssd_to_cpu_layer" / "wsm.h2d_param"
+            group_key: "phase" / "thread" 等
+            """
+            total = 0.0
+            by_group: Dict[str, float] = {}
+            for ev in self.timeline:
+                if ev["name"] != name:
+                    continue
+                dur = float(ev.get("dur_ms", 0.0))
+                total += dur
+                if group_key is not None:
+                    g = str(ev.get(group_key, "unknown"))
+                    by_group[g] = by_group.get(g, 0.0) + dur
+            return {"total_ms": total, "by_group": by_group}
+
+        # -------- meta / runtime 补充 --------
+        if extra_meta:
+            self.meta.update(extra_meta)
+
+        if wsm_runtime is not None:
+            self.wsm_runtime = wsm_runtime
+        elif self.wsm_runtime is None:
+            self.wsm_runtime = {}
+
+        # -------- prefill / decode token 级别的 GPU 时间（CUDA Event）--------
+        decode_ms: List[float] = []
+        prefill_ms: List[float] = []
+        if torch.cuda.is_available():
+            for ev in self.forward_events:
+                # forward_events 格式: (kind, B, T, start_ev, end_ev)
+                kind, B, T, start_evt, end_evt = ev
+                if start_evt is None or end_evt is None:
+                    continue
+                try:
+                    end_evt.synchronize()  # 确保事件完成
+                    dt_ms = float(start_evt.elapsed_time(end_evt))
+                except Exception:
+                    continue
+
+                if kind == "decode":
+                    decode_ms.append(dt_ms)
+                elif kind == "prefill":
+                    prefill_ms.append(dt_ms)
+
+        # -------- 从 timeline 里抽 prefill / decode / 其它阶段 --------
+        # inference scope 用于包住整个推理
+        infer_spans = [ev for ev in self.timeline if ev["name"] == "inference_e2e"]
+        if infer_spans:
+            t0 = min(ev["t_start_ms"] for ev in infer_spans)
+            t1 = max(ev["t_end_ms"] for ev in infer_spans)
+            e2e_ms = t1 - t0
+        else:
+            e2e_ms = None
+
+        # 统计 prefill 和 decode 阶段的时间（从 CUDA events）
+        prefill_total_ms = sum(prefill_ms) if prefill_ms else 0.0
+        decode_total_ms = sum(decode_ms) if decode_ms else 0.0
+
+        # 预热 GPU decoder window（warmup layer）时间
+        warmup_spans = [ev for ev in self.timeline if ev["name"] == "gpu_window_warmup"]
+        warmup_total_ms = sum(ev["dur_ms"] for ev in warmup_spans)
+        warmup_calls = len(warmup_spans)
+
+        # 分类统计：各个 cat 的总时间
+        #   - prefill, decode
+        by_cat: Dict[str, float] = {}
         for ev in self.timeline:
-            sum_cat.setdefault(ev["cat"], 0.0)
-            sum_cat[ev["cat"]] += float(ev["dur_ms"])
+            cat = ev.get("cat")
+            dur = float(ev.get("dur_ms", 0.0))
+            if not cat or dur <= 0:
+                continue
+            by_cat[cat] = by_cat.get(cat, 0.0) + dur
 
-        def _sum_by_name_prefix(prefix):
-            items = [ev for ev in self.timeline if ev["name"].startswith(prefix)]
-            return {"calls": len(items), "total_ms": sum(float(ev["dur_ms"]) for ev in items)}
-        wsm_stats = {
-            "wait_group_ready": {"calls": _sum_by_name_prefix("wsm.wait_group_ready")["calls"],
-                                 "total_ms": _sum_by_name_prefix("wsm.wait_group_ready")["total_ms"]},
-            "ensure_module_on_gpu": {"calls": _sum_by_name_prefix("wsm.ensure_module_on_gpu")["calls"],
-                                     "total_ms": _sum_by_name_prefix("wsm.ensure_module_on_gpu")["total_ms"]},
+        sum_cat = {
+            "total_ms": sum(by_cat.values()) if by_cat else 0.0,
+            "by_cat_ms": by_cat,
         }
 
-        # 吞吐
-        prefill_tps = (float(tokens_in)/ (prefill_total/1000.0)) if (tokens_in and prefill_total>0) else None
-        decode_tps  = (float(tokens_out)/ (sum(decode_ms)/1000.0)) if (tokens_out and decode_ms) else None
+        # -------- decode token 统计（每 token 耗时分布）--------
+        decode_stats = self._compute_decode_stats(decode_ms)
 
+        # -------- slack_ms 统计（group ready 到使用的时间差）--------
+        slack_times = []
+        for ev in self.timeline:
+            if ev.get("name") == "wsm.wait_group_ready":
+                s = ev.get("slack_ms")
+                if isinstance(s, (int, float)) and s >= 0:
+                    slack_times.append(s)
+
+        slack_stats = self._compute_decode_stats(slack_times) if slack_times else {
+            "count": 0,
+            "sum_ms": 0.0,
+            "mean_ms": None,
+            "p50_ms": None,
+            "p90_ms": None,
+            "p99_ms": None,
+        }
+
+        # -------- WSM 高层统计（等你之前已有的部分）--------
+        wait_total_ms = _sum_by_name("wsm.wait_group_ready")
+        ensure_total_ms = _sum_by_name("wsm.ensure_module_on_gpu")
+
+        # IO 按类型统计（SSD->CPU / CPU->GPU）
+        ssd_io = _sum_io("wsm.ssd_to_cpu_layer", group_key="phase")
+        h2d_io = _sum_io("wsm.h2d_param", group_key="phase")
+
+        w_io = {
+            "ssd_to_cpu_ms": ssd_io,
+            "h2d_param_ms": h2d_io,
+        }
+
+        wsm_stats: Dict[str, Any] = {
+            "wait_group_ready": {"total_ms": wait_total_ms},
+            "ensure_module_on_gpu": {"total_ms": ensure_total_ms},
+            "io": w_io,
+            "slack_time": slack_stats,  # group ready 到使用的时间差统计
+        }
+        if self.wsm_runtime:
+            wsm_stats["runtime"] = self.wsm_runtime
+
+        # --------（新增）每个 decoder layer 的 compute / IO 统计 --------
+        decoder_layers_global: Dict[str, float] = {}
+        decoder_layers_per_layer: Dict[str, Any] = {}
+
+        # 2.1 从 PERF_TRACKER 拿 GPU 计算时间（在 layers.py 里）
+        perf_per_layer: Dict[int, Dict[str, float]] = {}
+        if PERF_TRACKER is not None:
+            try:
+                perf_stats = PERF_TRACKER.get_stats()  # {"global": {...}, "per_layer": {...}}
+                decoder_layers_global = dict(perf_stats.get("global", {}))
+                perf_per_layer = perf_stats.get("per_layer", {}) or {}
+            except Exception:
+                perf_per_layer = {}
+                decoder_layers_global = {}
+
+        # 2.2 从 WSM timeline 按 layer_idx 聚合 IO 时间
+        layer_io: Dict[int, Dict[str, float]] = {}
+        for ev in self.timeline:
+            lid = ev.get("layer_idx")
+            if lid is None:
+                continue
+            name = ev.get("name", "")
+            if not (
+                name.startswith("wsm.ssd_to_cpu_layer")
+                or name.startswith("wsm.h2d_param")
+                or name.startswith("wsm.wait_group_ready")
+            ):
+                continue
+
+            lid = int(lid)
+            entry = layer_io.setdefault(
+                lid,
+                {
+                    "ssd_to_cpu_ms": 0.0,
+                    "h2d_param_ms": 0.0,
+                    "wait_group_ready_ms": 0.0,
+                },
+            )
+            dur = float(ev.get("dur_ms", 0.0))
+            if name.startswith("wsm.ssd_to_cpu_layer"):
+                entry["ssd_to_cpu_ms"] += dur
+            elif name.startswith("wsm.h2d_param"):
+                entry["h2d_param_ms"] += dur
+            elif name.startswith("wsm.wait_group_ready"):
+                entry["wait_group_ready_ms"] += dur
+
+        # 2.3 合并 per-layer compute + IO
+        all_layer_ids = sorted(
+            set(list(perf_per_layer.keys()) + list(layer_io.keys()))
+        )
+        for lid in all_layer_ids:
+            lp = perf_per_layer.get(lid, {})  # 来自 cuda_timer 的各类 us 统计
+            li = layer_io.get(lid, {})
+
+            attn_us = float(lp.get("attn_us", 0.0))
+            ffn_us = float(lp.get("ffn_us", 0.0))
+            total_forward_us = float(lp.get("total_forward_us", 0.0))
+            if not total_forward_us and (attn_us or ffn_us):
+                total_forward_us = attn_us + ffn_us
+
+            kv_fetch_us = float(lp.get("kv_fetch_us", 0.0))
+            mem_us = float(lp.get("memory_alloc_us", 0.0))
+            weights_hbm_us = float(lp.get("weights_hbm_us", 0.0))
+
+            io_total_ms = sum(li.values()) if li else 0.0
+
+            decoder_layers_per_layer[str(lid)] = {
+                "compute_us": {
+                    "attn_us": attn_us,  # CUDA timer: 纯 attention 计算时间
+                    "ffn_us": ffn_us,  # CUDA timer: 纯 FFN 计算时间
+                    "kv_fetch_us": kv_fetch_us,  # CUDA timer: KV cache 获取时间
+                    "total_forward_us": total_forward_us,  # CUDA timer: 整个 forward 的 GPU 计算时间（不含 I/O 等待）
+                    "memory_alloc_us": mem_us,  # CUDA timer: 内存分配时间
+                    "weights_hbm_us": weights_hbm_us,  # CUDA timer: 权重 HBM 传输时间
+                },
+                "io_ms": li,  # WSM timeline: 该层的 I/O 时间（SSD→CPU, CPU→GPU, wait）
+                "summary": {
+                    "compute_ms_pure": (
+                        total_forward_us / 1000.0 if total_forward_us else None
+                    ),  # 纯 GPU 计算时间（毫秒）
+                    "io_ms_total": io_total_ms,  # 总 I/O 时间（毫秒）
+                },
+            }
+
+        decoder_layers = {
+            "global": decoder_layers_global,
+            "per_layer": decoder_layers_per_layer,
+        }
+
+        # -------- 最终 timings / throughput --------
+        # 计算 First Token Latency (FTL): prefill + 第一个 decode token
+        ftl_ms = None
+        if prefill_total_ms and decode_ms:
+            ftl_ms = prefill_total_ms + decode_ms[0]
+        elif prefill_total_ms:
+            ftl_ms = prefill_total_ms
+
+        timings: Dict[str, Any] = {
+            "e2e_ms": e2e_ms,
+            "prefill_total_ms": prefill_total_ms,
+            "first_token_latency_ms": ftl_ms,
+            "decode": decode_stats,
+            "warmup_total_ms": warmup_total_ms,
+            "warmup_calls": warmup_calls,
+            "by_category_ms": sum_cat,
+        }
+
+        throughput = {
+            "prefill_toks_per_s": (
+                tokens_in / (prefill_total_ms / 1000.0)
+                if prefill_total_ms and tokens_in > 0
+                else None
+            ),
+            "decode_toks_per_s": decode_stats.get("decode_toks_per_s"),
+        }
+
+        # -------- 内存峰值统计 --------
+        memory_stats = {}
+        if torch.cuda.is_available():
+            try:
+                memory_stats["gpu_peak_allocated_gb"] = torch.cuda.max_memory_allocated() / (1 << 30)
+                memory_stats["gpu_peak_reserved_gb"] = torch.cuda.max_memory_reserved() / (1 << 30)
+            except Exception:
+                pass
+
+        # -------- 汇总成 result --------
         self.result = {
-            "run": self.meta | {"run_id": self.run_id, "finished_at_utc": _now_utc()},
-            "counts": {"tokens_in": tokens_in, "tokens_out": tokens_out},
-            "timings": {
-                "inference_e2e_ms": e2e_ms,
-                "prefill_total_ms": prefill_total if prefill_total>0 else None,
-                "first_decode_forward_ms": first_decode_ms,
-                "first_token_latency_ms_approx": ftl_approx,
-                "decode_stats": self._compute_decode_stats(decode_ms),
-                "by_category_ms": sum_cat,
+            "run": self.meta
+            | {
+                "run_id": self.run_id,
+                "finished_at_utc": _now_utc(),
             },
-            "throughput": {
-                "prefill_toks_per_s": prefill_tps,
-                "decode_toks_per_s": decode_tps,
+            "counts": {
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
             },
-            "wsm": wsm_stats,
-            "decode_step_ms": decode_ms,   # 完整序列
-            "timeline": self.timeline,     # 方便溯源
+            "timings": timings,  # e2e, prefill, decode 统计，warmup 时间等
+            "throughput": throughput,  # tokens/s 吞吐量
+            "wsm": wsm_stats,  # WSM I/O 和等待时间统计
+            "decoder_layers": decoder_layers,  # 每层的 CUDA 计算时间 + I/O 时间详细分解
+            "decode_step_ms": decode_ms,  # 每个 decode step 的耗时数组（CUDA events）
+            "timeline": self.timeline,  # 完整的事件时间线（用于详细分析）
+            "memory": memory_stats,  # GPU 内存峰值统计
         }
+
+        if kv_stats is not None:
+            self.result["kv_cache"] = kv_stats
+
+        return self.result
+
+
 
     def save(self, path: str):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -423,18 +717,60 @@ def classify_mode(llama) -> str:
     print("[MODE] mixed/unrecognized (check PARAMS dump below)")
     return "unknown"
 
+
 # ===== WSM wait_group_ready 包装（仅添加 Profiler 计时，不改逻辑） =====
 def _wrap_wait_group_ready(original_method):
     """
-    包装 WSM.wait_group_ready，添加 profiler 计时埋点。
-    完全异步的等待逻辑已在 WSM 主类中实现。
+    包装 WSM.wait_group_ready，添加：
+      - profiler 计时埋点；
+      - 从 group ready 到首次 compute 使用的 slack_ms 估计；
+      - pipeline 水位（ring / inflight / in_use 的最大值）。
     """
     def wrapped(self, layer_idx: int, group: str, compute_stream=None):
-        with (PROFILER.span("wsm.wait_group_ready", "wsm", layer_idx=int(layer_idx), group=str(group))
-              if (globals().get("PROFILER") is not None) else nullcontext()):
-            # 调用 WSM 原生的完全异步 wait_group_ready
+        prof = globals().get("PROFILER")
+        extras = {
+            "layer_idx": int(layer_idx),
+            "group": str(group),
+        }
+
+        # 1) slack_ms = 现在时间 - 该 group ready 事件记录时间
+        if prof is not None and hasattr(self, "_group_ready_wallclock"):
+            try:
+                key = (int(layer_idx), str(group))
+                ready_ms = self._group_ready_wallclock.get(key)
+                if isinstance(ready_ms, (int, float)):
+                    now_ms = prof.now_ms()
+                    extras["slack_ms"] = max(0.0, now_ms - float(ready_ms))
+            except Exception:
+                pass
+
+        # 2) pipeline 水位统计（最大 ring/inflight/in_use）
+        if hasattr(self, "_pipeline_watermark"):
+            try:
+                lock = getattr(self, "_group_lock", None)
+                if lock is not None:
+                    with lock:
+                        ring_len     = len(getattr(self, "_gpu_group_ring", []))
+                        inflight_len = len(getattr(self, "_gpu_group_inflight", set()))
+                        in_use_len   = len(getattr(self, "_gpu_group_in_use", {}))
+                else:
+                    ring_len     = len(getattr(self, "_gpu_group_ring", []))
+                    inflight_len = len(getattr(self, "_gpu_group_inflight", set()))
+                    in_use_len   = len(getattr(self, "_gpu_group_in_use", {}))
+
+                wm = self._pipeline_watermark
+                wm["max_gpu_ring"]  = max(wm.get("max_gpu_ring", 0), ring_len)
+                wm["max_inflight"]  = max(wm.get("max_inflight", 0), inflight_len)
+                wm["max_in_use"]    = max(wm.get("max_in_use", 0), in_use_len)
+            except Exception:
+                pass
+
+        ctx = prof.span("wsm.wait_group_ready", "wsm", **extras) if prof is not None else nullcontext()
+        with ctx:
             return original_method(layer_idx, group, compute_stream)
+
     return wrapped
+
 
 
 def _patched_ensure_module_on_gpu(self, m: torch.nn.Module, layer_idx: int | None = None, module_name: str | None = None):
@@ -544,6 +880,265 @@ def _patched_ensure_module_on_gpu(self, m: torch.nn.Module, layer_idx: int | Non
                     b.data = b_gpu
                 except Exception:
                     pass
+                
+def _patch_wsm_for_profiling(wsm):
+    """
+    给 WeightStreamingManager 打补丁，补齐：
+      - SSD -> pinned CPU 读层时间（含字节数）
+      - pinned CPU -> GPU 组级 H2D 时间（含字节数、attn/ffn）
+      - wait_group_ready 事件（保持原来统计）
+    注意：只依赖 run 时的 wsm 实例，不改 wsm 源码。
+    """
+    global PROFILER
+    prof = PROFILER
+    if prof is None:
+        # 没开 profiler 就不打点，保持零开销
+        return
+
+    # ---------- 1) wait_group_ready：保留你现有的等待统计 ----------
+    if hasattr(wsm, "_record_group_ready_event"):
+        orig_rg = wsm._record_group_ready_event
+
+        def _record_group_ready_event_patched(self, layer_idx, group, *args, **kwargs):
+            # 这里只记录 wait 自身的阻塞时间；更细的 slack 你之前已经在 _decode_timeline 里算了
+            s = time.perf_counter_ns()
+            try:
+                return orig_rg(layer_idx, group, *args, **kwargs)
+            finally:
+                e = time.perf_counter_ns()
+                rec = {
+                    "name": "wsm.wait_group_ready",
+                    "cat": "wsm",
+                    "t_start_ms": (s - prof.t0_ns) / 1e6,
+                    "t_end_ms":   (e - prof.t0_ns) / 1e6,
+                    "dur_ms":     (e - s) / 1e6,
+                    "layer_idx":  int(layer_idx),
+                    "group":      str(group),
+                }
+                prof.timeline.append(rec)
+
+        wsm._record_group_ready_event = types.MethodType(_record_group_ready_event_patched, wsm)
+
+    # ---------- 2) SSD -> pinned CPU：按 layer 统计 ----------
+    def _ssd_bytes_for_layer(self, layer_idx: int) -> int:
+        try:
+            params = self.layers_params.get(int(layer_idx), [])
+        except Exception:
+            return 0
+        total = 0
+        for p in params:
+            try:
+                if p.get("policy") == "stream":
+                    total += int(p.get("nbytes", 0))
+            except Exception:
+                pass
+        return int(total)
+
+    if getattr(wsm, "ssd_enabled", False):
+        # 同步版本（可能被 warmup 用到）
+        if hasattr(wsm, "_read_layer_from_ssd"):
+            orig_read = wsm._read_layer_from_ssd
+
+            def _read_layer_from_ssd_patched(self, layer_idx: int):
+                lid = int(layer_idx)
+                total_bytes = _ssd_bytes_for_layer(self, lid)
+                phase = getattr(self, "_phase", None) or "unknown"
+                with prof.span_if_active(
+                    "wsm.ssd_to_cpu_layer",
+                    "io",
+                    layer_idx=lid,
+                    bytes=total_bytes,
+                    phase=phase,
+                    thread="main",
+                ):
+                    return orig_read(lid)
+
+            wsm._read_layer_from_ssd = types.MethodType(_read_layer_from_ssd_patched, wsm)
+
+        # 线程安全版本：真正的 CPU 预取线程走的是这个
+        if hasattr(wsm, "_read_layer_from_ssd_threadsafe"):
+            orig_read_ts = wsm._read_layer_from_ssd_threadsafe
+
+            def _read_layer_from_ssd_threadsafe_patched(self, layer_idx: int):
+                lid = int(layer_idx)
+                total_bytes = _ssd_bytes_for_layer(self, lid)
+                phase = getattr(self, "_phase", None) or "unknown"
+                with prof.span_if_active(
+                    "wsm.ssd_to_cpu_layer",
+                    "io",
+                    layer_idx=lid,
+                    bytes=total_bytes,
+                    phase=phase,
+                    thread="cpu_pf_worker",
+                ):
+                    return orig_read_ts(lid)
+
+            wsm._read_layer_from_ssd_threadsafe = types.MethodType(
+                _read_layer_from_ssd_threadsafe_patched, wsm
+            )
+
+    # ---------- 3) pinned CPU -> GPU：组级 H2D ----------
+    if hasattr(wsm, "_install_group_on_gpu"):
+        orig_install = wsm._install_group_on_gpu
+
+        def _install_group_on_gpu_patched(self, layer_idx: int, group: str, *, h2d_override=None):
+            lid = int(layer_idx)
+            grp = str(group)
+            phase = getattr(self, "_phase", None) or "prefill"
+
+            # 估算这次 H2D 的字节数：只看 CPU cache 里这层当前组的权重
+            total_bytes = 0
+            try:
+                suffixes = ()
+                if grp == "attn":
+                    suffixes = (
+                        "attention.wq.weight",
+                        "attention.wk.weight",
+                        "attention.wv.weight",
+                        "attention.wo.weight",
+                    )
+                elif grp == "ffn":
+                    suffixes = (
+                        "feed_forward.w1.weight",
+                        "feed_forward.w2.weight",
+                        "feed_forward.w3.weight",
+                    )
+
+                if suffixes:
+                    with self.cpu_cache_lock:
+                        layer_data = dict(self.cpu_cache.get(lid, {}))
+
+                    for suf in suffixes:
+                        pname = f"layers.{lid}.{suf}"
+                        t = layer_data.get(pname)
+                        if t is not None and torch.is_tensor(t) and t.numel() > 0:
+                            total_bytes += int(t.numel() * t.element_size())
+            except Exception:
+                total_bytes = 0
+
+            with prof.span_if_active(
+                "wsm.h2d_param",
+                "io",
+                layer_idx=lid,
+                group=grp,
+                bytes=int(total_bytes),
+                phase=phase,
+            ):
+                return orig_install(layer_idx, group, h2d_override=h2d_override)
+
+        wsm._install_group_on_gpu = types.MethodType(_install_group_on_gpu_patched, wsm)
+
+    # ---------- 4) 兼容老路径：_load_layer_to_cpu / _h2d_transfer_with_retry ----------
+    # 这些在你新版 pipeline 中基本不会走到，但留着以防以后 fallback
+    if hasattr(wsm, "_load_layer_to_cpu"):
+        orig_load = wsm._load_layer_to_cpu
+
+        def _load_layer_to_cpu_patched(self, layer_idx: int):
+            lid = int(layer_idx)
+            total_bytes = _ssd_bytes_for_layer(self, lid)
+            phase = getattr(self, "_phase", None) or "unknown"
+            with prof.span_if_active(
+                "wsm.ssd_to_cpu_layer",
+                "io",
+                layer_idx=lid,
+                bytes=total_bytes,
+                phase=phase,
+                thread="fallback_sync",
+            ):
+                return orig_load(lid)
+
+        wsm._load_layer_to_cpu = types.MethodType(_load_layer_to_cpu_patched, wsm)
+
+    if hasattr(wsm, "_h2d_transfer_with_retry"):
+        orig_h2d = wsm._h2d_transfer_with_retry
+
+        def _h2d_transfer_with_retry_patched(self, src_cpu_tensor, param_name, h2d_stream):
+            bytes_ = 0
+            try:
+                if torch.is_tensor(src_cpu_tensor) and src_cpu_tensor.numel() > 0:
+                    bytes_ = int(src_cpu_tensor.numel() * src_cpu_tensor.element_size())
+            except Exception:
+                bytes_ = 0
+
+            pname = str(param_name)
+            if "attention." in pname:
+                grp = "attn"
+            elif "feed_forward." in pname:
+                grp = "ffn"
+            else:
+                grp = "other"
+
+            phase = getattr(self, "_phase", None) or "prefill"
+
+            with prof.span_if_active(
+                "wsm.h2d_param",
+                "io",
+                param=pname,
+                group=grp,
+                bytes=bytes_,
+                phase=phase,
+            ):
+                return orig_h2d(src_cpu_tensor, param_name, h2d_stream)
+
+        wsm._h2d_transfer_with_retry = types.MethodType(
+            _h2d_transfer_with_retry_patched, wsm
+        )
+        
+        
+def extract_kv_cache_stats(llama):
+    """
+    从 LLaMA wrapper 中提取 KV cache 统计信息（如果使用了 KVOffloader）。
+
+    返回示例：
+    {
+        "fetch_blocks_total": 1234,
+        "hits": 1200,
+        "misses": 34,
+        "hit_ratio": 0.9724,
+        "ssd_load_blocks_prefetch": 56,
+        "evictions": 789,
+    }
+    """
+    try:
+        model = getattr(llama, "model", None)
+        if model is None:
+            return None
+
+        # 1) 有些实现会把 offloader 挂在 model 上
+        off = getattr(model, "kv_offloader", None)
+
+        # 2) 否则从第一层 attention 上找 offloader
+        if off is None and hasattr(model, "layers"):
+            for blk in getattr(model, "layers", []):
+                attn = getattr(blk, "attention", None)
+                if attn is None:
+                    continue
+                off = getattr(attn, "offloader", None)
+                if off is not None:
+                    break
+
+        if off is None or not hasattr(off, "get_cache_stats"):
+            return None
+
+        stats = off.get_cache_stats()
+        if not isinstance(stats, dict):
+            return None
+
+        # 清洗成 JSON-friendly 的简单类型
+        cleaned = {}
+        for k, v in stats.items():
+            if isinstance(v, (int, float)) or v is None:
+                cleaned[k] = v
+            else:
+                try:
+                    cleaned[k] = float(v)
+                except Exception:
+                    cleaned[k] = str(v)
+        return cleaned
+
+    except Exception as e:
+        print(f"[KV][WARN] extract_kv_cache_stats() failed: {e}")
+        return None
 
 # ---------- 辅助：固定规则生成 JSON/CSV 路径 ----------
 def _sanitize_for_filename(s: str) -> str:
@@ -588,7 +1183,7 @@ def main():
     GPU_AHEAD_LAYERS = 6# 预取 6 组（3 层）- 适配 11 组容量
     GPU_MAX_GROUPS   = 12
     GPU_WARMUP_LAYERS = 6# ⭐ 6 → 12 层（24 组），确保前 12 层完全 overlap
-    CPU_CACHE_LAYERS = 40# CPU 缓存 50 层（79.5GB，安全余量）
+    CPU_CACHE_LAYERS = 47# CPU 缓存 50 层（79.5GB，安全余量）
 
     # === H2D 并发控制（⭐⭐⭐ P0 优化：PCIe Gen5 + RTX 5080 高带宽配置） ===
     # PCIe Gen5 x16 带宽: 64GB/s (Gen4的2倍)
@@ -596,7 +1191,7 @@ def main():
     # 更高带宽意味着需要更高并发度才能饱和PCIe，避免流水线空隙
     os.environ.setdefault("WSM_H2D_BASE_CONCURRENCY",  "8")   # ⭐ 5→16（Gen5高带宽，基础并发）
     os.environ.setdefault("WSM_H2D_PREFILL_MULT",      "3")  # Prefill: 32 并发
-    os.environ.setdefault("WSM_H2D_DECODE_MULT",       "2")  # ⭐ 1.0→1.5（Decode: 24 并发）
+    os.environ.setdefault("WSM_H2D_DECODE_MULT",       "3")  # ⭐ 1.0→1.5（Decode: 24 并发）
     os.environ.setdefault("WSM_MAX_INFLIGHT_GROUPS",   "32")   # ⭐ 16→32（Inflight 上限，匹配并发）
     os.environ.setdefault("WSM_H2D_GROUP_BACKLOG_MAX", "96")   # ⭐ 48→96（H2D 队列，Gen5需要更深队列）
 
@@ -607,7 +1202,7 @@ def main():
     # === GPU 窗口配置 ===
     os.environ.setdefault("WSM_GPU_MAX_GROUPS",        str(GPU_MAX_GROUPS))
     os.environ.setdefault("WSM_GPU_AHEAD_GROUPS",      str(GPU_AHEAD_LAYERS))
-    # ⭐⭐⭐ P0 修复: 预取深度必须匹配计算时间窗口
+
     # 单层 100ms 可 overlap 4 组 H2D，设置 8 保证充足流水线
     os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH",  "6")  # ⭐ 6 → 8
     os.environ.setdefault("WSM_GPU_AHEAD",             str(GPU_AHEAD_LAYERS))
@@ -722,7 +1317,11 @@ def main():
     # 绑定 WSM 补丁：仅为 profiler 计时，wait_group_ready 的异步逻辑已在 WSM 主类实现
     wsm = getattr(llama, "weight_streaming_manager", None)
     if wsm is not None:
+        # 初始化 pipeline watermark 统计字典
+        wsm._pipeline_watermark = {}
+
         # 包装 wait_group_ready 以添加 profiler 计时
+        _patch_wsm_for_profiling(wsm)
         original_wait = wsm.wait_group_ready
         wsm.wait_group_ready = types.MethodType(_wrap_wait_group_ready(original_wait), wsm)
 
@@ -830,11 +1429,47 @@ def main():
 
     # ==== 汇总与保存 ====
     mode = classify_mode(llama)
+    kv_stats = extract_kv_cache_stats(llama)
+
+    # 新增：从 WSM 对象上采集一次运行期统计，传给 Profiler
+    wsm_runtime = None
+    if hasattr(llama, "weight_streaming_manager"):
+        try:
+            wsm = llama.weight_streaming_manager
+            rt = {}
+
+            # pipeline 水位（来自 _wrap_wait_group_ready / _patch_wsm_for_profiling）
+            pipe = getattr(wsm, "_pipeline_watermark", None)
+            if isinstance(pipe, dict):
+                rt["pipeline"] = dict(pipe)
+
+            # SSD backend 静态 / 运行状态
+            if hasattr(wsm, "get_ssd_stats"):
+                try:
+                    rt["ssd"] = wsm.get_ssd_stats()
+                except Exception:
+                    pass
+
+            # H2D timeout/retry 统计（如果实现了）
+            if hasattr(wsm, "get_h2d_timeout_stats"):
+                try:
+                    rt["h2d"] = wsm.get_h2d_timeout_stats()
+                except Exception:
+                    pass
+
+            if rt:
+                wsm_runtime = rt
+        except Exception:
+            wsm_runtime = None
+
     PROFILER.finalize(
         tokens_in=tokens_in_count,
         tokens_out=tokens_out_count,
-        extra_meta={"llama_mode": mode, "device_str": str(device)}
+        extra_meta={"llama_mode": mode, "device_str": str(device)},
+        kv_stats=kv_stats or None,
+        wsm_runtime=wsm_runtime,
     )
+
 
     # 自动生成 JSON/CSV 路径并各保存一次
     json_path, csv_path = build_output_paths(LOG_DIR, PROFILER.run_id, mode)
@@ -842,6 +1477,32 @@ def main():
     PROFILER.save(str(csv_path))
     print(f"[Profiler] JSON: {json_path}")
     print(f"[Profiler] CSV : {csv_path}")
+    
+    
+    # 控制台摘要，方便直接抄到论文表格
+    summary = PROFILER.result
+    t = summary.get("timings", {})
+    kv = summary.get("kv_cache", {})
+    print(
+        "\n[SUMMARY] e2e_ms={e2e}, warmup_ms={warmup}, "
+        "ftl_ms={ftl}".format(
+            e2e=t.get("e2e_ms"),
+            warmup=t.get("warmup_total_ms"),
+            ftl=t.get("first_token_latency_ms"),
+        )
+    )
+    if kv:
+        print(
+            "[SUMMARY] KV cache: hits={hits}, misses={misses}, "
+            "evictions={evictions}, hit_ratio={ratio}".format(
+                hits=kv.get("hits"),
+                misses=kv.get("misses"),
+                evictions=kv.get("evictions"),
+                ratio=kv.get("hit_ratio"),
+            )
+        )
+    else:
+        print("[SUMMARY] KV cache: <no stats found on llama / kv_cache object>")
 
     # ==== 输出生成文本（不影响计时）====
     print(f"\n========== Generation (batch_size={batch_size}, len={max_gen_len}) ==========")

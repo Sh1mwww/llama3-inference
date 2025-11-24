@@ -15,7 +15,7 @@ from pathlib import Path
 # 添加项目路径
 sys.path.insert(0, str(Path(__file__).parent))
 
-from llama3.config import ModelArgs
+from llama3.config import ModelArgs, KVCacheArgs
 from llama3.layers import EncoderBlock, precompute_theta_pos_frequencies
 
 
@@ -101,6 +101,11 @@ def benchmark_prefill_computation(args: ModelArgs, seq_len: int = 2048, warmup: 
     # 创建一个EncoderBlock
     layer = EncoderBlock(args, layer_id=0).to(device=device, dtype=dtype)
 
+    # 禁用KV offloading以测量纯计算时间
+    if hasattr(layer.attention, 'kv_offloader'):
+        layer.attention.kv_offloader = None
+        print("已禁用 KV offloading (测量纯计算时间)")
+
     # 准备输入
     batch_size = 1
     x = torch.randn(batch_size, seq_len, args.dim, device=device, dtype=dtype)
@@ -169,6 +174,11 @@ def benchmark_decode_computation(args: ModelArgs, warmup: int = 3, iterations: i
 
     # 创建一个EncoderBlock
     layer = EncoderBlock(args, layer_id=0).to(device=device, dtype=dtype)
+
+    # 禁用KV offloading以测量纯计算时间
+    if hasattr(layer.attention, 'kv_offloader'):
+        layer.attention.kv_offloader = None
+        print("已禁用 KV offloading (测量纯计算时间)")
 
     # 预计算位置编码
     freqs = precompute_theta_pos_frequencies(
@@ -391,6 +401,11 @@ def main():
     print("="*80)
     print("70B 模型单层操作性能测试")
     print("="*80)
+
+    # 禁用KV cache mirror以避免干扰纯计算时间测量
+    KVCacheArgs.mirror_on_push = False
+    KVCacheArgs.verbose_pool = False
+    print("已禁用 KV cache mirroring 和 verbose logging\n")
 
     # 检查CUDA
     if not torch.cuda.is_available():

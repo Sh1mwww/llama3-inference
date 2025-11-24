@@ -356,6 +356,16 @@ class KVOffloader:
         self.global_access_count = np.zeros((self.layers, self.n_blocks), dtype=np.int32)
         self.global_time_counter = 0
 
+        # ------- KV cache 命中率统计（按 fetch 维度） -------
+        # 总共在 fetch() 中请求了多少 block（按 uniq block 计数）
+        self._fetch_blocks_total = 0
+        # 在 fetch() 内部，仍需要从 SSD 读取（SSD->DRAM）的 block 数
+        self._fetch_miss_blocks = 0
+        # 在 prefetch_async() 中，从 SSD 读取的 block 数（提前加载）
+        self._prefetch_ssd_load_blocks = 0
+        # spill 到 SSD 的 block 数（包括同步 spill 和异步 batch spill）
+        self._evict_blocks = 0
+        
         # ------- 流 -------
         if streams is not None:
             self.h2d_stream = getattr(streams, "kv_h2d", None)
@@ -385,6 +395,10 @@ class KVOffloader:
             self.ssd = None
 
         self.on_ssd = [[False] * self.n_blocks for _ in range(self.layers)]
+        self.in_dram = [[False] * self.n_blocks for _ in range(self.layers)]
+
+        # SSD staging buffer for zero-copy reads
+        self._ssd_buffer = None
 
         _dram_bytes = int(KVCacheArgs.dram_limit_gb * (1024**3))
         _safety = int(0.25 * _dram_bytes)
@@ -398,6 +412,7 @@ class KVOffloader:
         # 统一 KVCacheArgs.block_bytes 下限（保证至少能容纳一块 K 或 V）
         bytes_per_kv = self.max_batch * self.heads * BLOCK * self.dim
         kv_dtype = getattr(KVCacheArgs, "kv_dtype", torch.float16 if not getattr(KVCacheArgs, "prefer_bf16", False) else torch.bfloat16)
+        self.kv_dtype = kv_dtype  # Store as instance attribute for later use
         elem_size = torch.tensor([], dtype=kv_dtype).element_size()
         bytes_per_kv *= elem_size
         if KVCacheArgs.block_bytes < bytes_per_kv:
@@ -691,6 +706,7 @@ class KVOffloader:
                                 self.pool.free_block(self._v_raw_buf[layer][BB]); self._v_raw_buf[layer][BB] = None
                             self.k_cpu[layer][BB] = self.v_cpu[layer][BB] = None
                             self.on_ssd[layer][BB] = True
+                            self._evict_blocks += 1
                 fut.add_done_callback(_on_done)
         threading.Thread(target=_spill_job, name="kv_spill", daemon=True).start()
 
@@ -748,40 +764,62 @@ class KVOffloader:
         use_bsz = int(bsz) if bsz is not None else self.max_batch
         shape = (use_bsz, self.heads, BLOCK, self.dim)
 
-        # --------- Fast path：全部已在 GPU（只等 per-block 事件） ---------
+        # ---- KV cache 统计：本次 fetch 请求的 block 数（按 uniq 计）----
+        num_blocks = len(uniq)
+        self._fetch_blocks_total += num_blocks
+
+        # -------- 1) 全 GPU 快路径 --------
         all_gpu = True
         for b in uniq:
             with self._blk_locks[layer][b]:
                 kg = self.gpu_k[layer][b]; vg = self.gpu_v[layer][b]
-                if not (kg is not None and vg is not None and kg.device.type == "cuda" and tuple(kg.shape) == shape):
-                    all_gpu = False; break
+                evt = self._blk_ready_evt.get((layer, b))
+            if (kg is None) or (vg is None) or kg.device.type != "cuda" or tuple(kg.shape) != shape:
+                all_gpu = False
+                break
         if all_gpu:
             return self._gather_from_gpu_cache_strict(layer, uniq, use_bsz, stream=stream)
 
-        # --------- Prefetch 组命中：等组事件直接拼接 ---------
-        key = (int(layer), tuple(uniq), int(use_bsz))
+        # -------- 2) 预取组命中（整组在 GPU 上） --------
+        dev = self.device if isinstance(self.device, (str, torch.device)) else torch.device(self.device)
         with self._prefetch_lock:
-            rec = self._prefetch_map.get(key)  # 不 pop，允许重复命中
+            rec = self._prefetch_map.get((int(layer), tuple(uniq), int(use_bsz)))
         if rec is not None:
-            current = stream or torch.cuda.current_stream()
-            current.wait_event(rec["evt"])
-            k_full = torch.cat(rec["k"], dim=2)
-            v_full = torch.cat(rec["v"], dim=2)
-            return k_full, v_full
+            evt_group = rec.get("evt")
+            k_list = rec.get("k") or []
+            v_list = rec.get("v") or []
+            if evt_group is not None:
+                s = stream or torch.cuda.current_stream(device=dev)
+                try:
+                    s.wait_event(evt_group)
+                except Exception:
+                    pass
+            if k_list and v_list:
+                k_full = torch.cat([k[:use_bsz] for k in k_list], dim=2)
+                v_full = torch.cat([v[:use_bsz] for v in v_list], dim=2)
+                if k_full.device.type != "cuda":
+                    k_full = k_full.to(dev, non_blocking=True)
+                if v_full.device.type != "cuda":
+                    v_full = v_full.to(dev, non_blocking=True)
+                return k_full, v_full
 
-        # --------- Fallback：补齐 SSD→DRAM，安排 H2D，并在 compute 流上等待 ---------
-        # 1) SSD→DRAM：缺失才拉
+        # -------- 3) SSD→DRAM（仅对缺失块） + DRAM→HBM --------
         need_load = []
         for b in uniq:
             with self._blk_locks[layer][b]:
                 if self.k_cpu[layer][b] is None or self.v_cpu[layer][b] is None:
                     need_load.append(b)
+
+        # 统计：这次 fetch 中有多少 block 在 CPU 里缺失，需要同步从 SSD 读取
+        if need_load:
+            self._fetch_miss_blocks += len(need_load)
+
         for b in need_load:
             self._load_from_ssd(layer, b)
 
-        # 2) DRAM→HBM：按块判断是否需要拷贝；拷贝后记录 per-block 事件
-        k_parts, v_parts = [], []
+        # 2) DRAM→HBM：逐块拷贝并记录事件
         h2d_stream = stream or self.h2d_stream or torch.cuda.current_stream()
+        k_parts, v_parts = [], []
         with torch.cuda.stream(h2d_stream):
             for b in uniq:
                 with self._blk_locks[layer][b]:
@@ -844,6 +882,10 @@ class KVOffloader:
                 with self._blk_locks[layer][b]:
                     if self.k_cpu[layer][b] is None or self.v_cpu[layer][b] is None:
                         need.append(b)
+                        
+            if need:
+                self._prefetch_ssd_load_blocks += len(need)
+
             for b in need:
                 self._load_from_ssd(layer, b)
 
@@ -1083,6 +1125,12 @@ class KVOffloader:
             # 可选：释放 GPU 缓存，避免显存堆积
             self.gpu_k[L][B] = None; self.gpu_v[L][B] = None
             self._blk_ready_evt.pop((L,B), None)
+            
+            self.k_cpu[L][B] = self.v_cpu[L][B] = None
+            self.on_ssd[L][B] = True
+
+            # 统计：一次 eviction
+            self._evict_blocks += 1
 
     def _maybe_evict(self, force: bool = False) -> bool:
         hot_cnt = sum(x is not None for lay in self.k_cpu for x in lay)
@@ -1109,6 +1157,7 @@ class KVOffloader:
         lock = self._blk_locks[L][B]
         with lock:
             if self.ssd is None:
+                # 没有 SSD backend，直接在 DRAM 里 alloc 一个空块
                 self._alloc_block(L, B)
                 return
 
@@ -1119,33 +1168,48 @@ class KVOffloader:
             USE_ZERO_COPY = False
 
         single_k_bytes = self.max_batch * self.heads * BLOCK * self.dim * self.dtype_bytes
-        blk_bytes = 2 * single_k_bytes
+        blk_bytes = 2 * single_k_bytes  # K+V
 
+        # ---------- 首选：SSD -> pinned uint8 -> DRAM K/V ----------
         if USE_ZERO_COPY and hasattr(self.ssd, "read_into_pinned_aligned"):
             block_size = int(getattr(self.ssd, "block_size", 4096))
             stride = ((blk_bytes + block_size - 1) // block_size) * block_size
+
+            # 临时 pinned 对齐缓冲（只在本函数栈内存活，不污染 DRAMPool）
             buf = alloc_pinned_aligned(stride, block_size)  # uint8 pinned 对齐缓冲
             self.ssd.read_into_pinned_aligned(L, B, buf)
+
             with lock:
-                self._alloc_block(L, B)
-                fuse = buf[:blk_bytes].view(torch.float16).view(self.max_batch, self.heads, BLOCK, self.dim * 2)
+                self._alloc_block(L, B)  # 在 DRAMPool 里申请真正的 K/V 存储
+                fuse = buf[:blk_bytes].view(torch.float16).view(
+                    self.max_batch, self.heads, BLOCK, self.dim * 2
+                )
                 k_cpu, v_cpu = fuse.split(self.dim, dim=-1)
                 self.k_cpu[L][B].copy_(k_cpu, non_blocking=False)
                 self.v_cpu[L][B].copy_(v_cpu, non_blocking=False)
                 self.on_ssd[L][B] = True
             return
 
-        # 回退路径：SSD → GPU → CPU
+        # ---------- 回退路径：SSD → GPU buffer → CPU ----------
         shape = (self.max_batch, self.heads, BLOCK, self.dim * 2)
-        if not hasattr(self, "_ssd_buffer") or self._ssd_buffer is None or tuple(self._ssd_buffer.shape) != shape:
+        if (
+            not hasattr(self, "_ssd_buffer")
+            or self._ssd_buffer is None
+            or tuple(self._ssd_buffer.shape) != shape
+        ):
             self._ssd_buffer = torch.empty(shape, dtype=torch.float16, device=self.device)
+
+        # 这里的 read 仍然是同步的，但如果是通过 prefetch 线程调用，就不会挡住计算
         self.ssd.read(L, B, self._ssd_buffer)
         k_gpu, v_gpu = self._ssd_buffer.split(self.dim, dim=-1)
+
         with lock:
             self._alloc_block(L, B)
             self.k_cpu[L][B].copy_(k_gpu.cpu(), non_blocking=False)
             self.v_cpu[L][B].copy_(v_gpu.cpu(), non_blocking=False)
             self.on_ssd[L][B] = True
+
+
 
     # ---------------- 限速 ----------------
 
@@ -1175,6 +1239,40 @@ class KVOffloader:
             self.global_tracker.print_storage_utilization()
         else:
             print("Global tracker not available")
+            
+    # ---------------- 命中率统计 API ----------------
+
+    def reset_cache_stats(self):
+        """
+        清空 KV cache 统计计数，在一轮新的推理开始前可以调用（可选）。
+        """
+        self._fetch_blocks_total = 0
+        self._fetch_miss_blocks = 0
+        self._prefetch_ssd_load_blocks = 0
+        self._evict_blocks = 0
+
+    def get_cache_stats(self) -> Dict[str, float]:
+        """
+        返回 KV cache 统计信息，字段含义：
+        - fetch_blocks_total: 在 fetch() 里请求的 block 总数（去重后）
+        - hits / misses / hit_ratio: 从 fetch 视角的命中率（是否在 fetch 中触发 SSD 读取）
+        - ssd_load_blocks_prefetch: 预取阶段从 SSD 拉取的 block 数
+        - evictions: spill 到 SSD 的 block 数
+        """
+        total = int(self._fetch_blocks_total)
+        misses = int(self._fetch_miss_blocks)
+        hits = max(total - misses, 0)
+        hit_ratio = float(hits) / float(total) if total > 0 else None
+
+        return {
+            "fetch_blocks_total": total,
+            "hits": hits,
+            "misses": misses,
+            "hit_ratio": hit_ratio,
+            "ssd_load_blocks_prefetch": int(self._prefetch_ssd_load_blocks),
+            "evictions": int(self._evict_blocks),
+        }
+
 
     def __del__(self):
         try:

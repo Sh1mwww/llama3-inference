@@ -1,0 +1,359 @@
+INFO:llama3.memory_manager:HBM Manager initialized: 13.91GB available
+INFO:llama3.memory_manager:Memory monitoring started
+INFO:llama3.memory_manager:Global memory limit set to 14.687600708007812GB on cuda:0
+/home/roger/.pyenv/versions/inference_proj/lib/python3.13/contextlib.py:109: FutureWarning: `torch.backends.cuda.sdp_kernel()` is deprecated. In the future, this context manager will be removed. Please see `torch.nn.attention.sdpa_kernel()` for the new context manager, with updated signature.
+  self.gen = func(*args, **kwds)
+================================================================================
+70B 模型 MHA/FFN 分离性能测试
+================================================================================
+已禁用 KV cache mirroring 和 verbose logging
+
+
+GPU信息:
+  设备: NVIDIA GeForce RTX 5080
+  显存: 15.46 GB
+
+加载模型配置: /data1/.llama/checkpoints/Llama3.1-70B/params.json
+Auto-set memory limit: 14.7GB (reserved: 0.8GB)
+
+模型配置:
+  dim: 8192
+  n_layers: 80
+  n_heads: 64
+  n_kv_heads: 8
+
+MHA权重:
+  参数数量: 150,994,944
+  权重大小: 0.281 GB
+
+FFN权重:
+  参数数量: 301,989,888
+  权重大小: 0.562 GB
+  hidden_dim: 12288
+
+总权重大小: 0.844 GB
+
+================================================================================
+第一部分: 计算时间测试
+================================================================================
+
+================================================================================
+测试: MHA Prefill计算时间 (seq_len=2048)
+================================================================================
+[KVOffloader] DRAM quota estimation: sizing_batch=1, block=1.00MB, limit=6144 blocks
+[KVOffloader] Auto-enlarge KVCacheArgs.block_bytes → 1.00MB
+[KVOffloader] DRAM pool: mode=Lazy, used=0.00/8.00GB (0.0%), free_blocks=0, live_blocks=0
+Warmup (3 iterations)...
+Benchmarking (10 iterations)...
+  Iteration 1: 161.54 ms
+  Iteration 2: 152.78 ms
+  Iteration 3: 144.95 ms
+  Iteration 4: 142.67 ms
+  Iteration 5: 151.96 ms
+  Iteration 6: 144.18 ms
+  Iteration 7: 186.72 ms
+  Iteration 8: 143.69 ms
+  Iteration 9: 151.91 ms
+  Iteration 10: 143.79 ms
+
+结果:
+  平均时间: 152.42 ms
+  最小时间: 142.67 ms
+  最大时间: 186.72 ms
+  标准差: 12.77 ms
+
+================================================================================
+测试: MHA Decode计算时间 (seq_len=1)
+================================================================================
+初始化KV cache (prefill 256 tokens)...
+Warmup (3 iterations)...
+Benchmarking (100 iterations)...
+  Iteration 1: 0.75 ms
+  Iteration 2: 0.74 ms
+  Iteration 3: 0.73 ms
+  Iteration 4: 0.73 ms
+  Iteration 5: 0.73 ms
+  Iteration 6: 0.72 ms
+  Iteration 7: 0.74 ms
+  Iteration 8: 0.71 ms
+  Iteration 9: 0.71 ms
+  Iteration 10: 0.70 ms
+  ... (90 more iterations)
+
+结果:
+  平均时间: 0.68 ms
+  最小时间: 0.65 ms
+  最大时间: 0.91 ms
+  标准差: 0.04 ms
+
+================================================================================
+测试: FFN Prefill计算时间 (seq_len=2048)
+================================================================================
+Warmup (3 iterations)...
+Benchmarking (10 iterations)...
+  Iteration 1: 25.75 ms
+  Iteration 2: 25.75 ms
+  Iteration 3: 26.06 ms
+  Iteration 4: 26.06 ms
+  Iteration 5: 25.86 ms
+  Iteration 6: 26.06 ms
+  Iteration 7: 26.11 ms
+  Iteration 8: 26.01 ms
+  Iteration 9: 25.86 ms
+  Iteration 10: 25.91 ms
+
+结果:
+  平均时间: 25.94 ms
+  最小时间: 25.75 ms
+  最大时间: 26.11 ms
+  标准差: 0.13 ms
+
+================================================================================
+测试: FFN Decode计算时间 (seq_len=1)
+================================================================================
+Warmup (3 iterations)...
+Benchmarking (100 iterations)...
+  Iteration 1: 1.58 ms
+  Iteration 2: 1.57 ms
+  Iteration 3: 1.57 ms
+  Iteration 4: 1.57 ms
+  Iteration 5: 1.57 ms
+  Iteration 6: 1.57 ms
+  Iteration 7: 1.57 ms
+  Iteration 8: 1.57 ms
+  Iteration 9: 1.58 ms
+  Iteration 10: 1.57 ms
+  ... (90 more iterations)
+
+结果:
+  平均时间: 1.57 ms
+  最小时间: 1.57 ms
+  最大时间: 1.58 ms
+  标准差: 0.00 ms
+
+================================================================================
+第二部分: IO时间测试
+================================================================================
+
+================================================================================
+测试: MHA 权重传输时间 (Pinned -> GPU)
+================================================================================
+创建 0.281 GB 的 pinned memory tensor...
+Warmup (3 iterations)...
+Benchmarking (20 iterations)...
+  Iteration 1: 6.73 ms
+  Iteration 2: 6.77 ms
+  Iteration 3: 6.71 ms
+  Iteration 4: 6.75 ms
+  Iteration 5: 6.72 ms
+  Iteration 6: 6.75 ms
+  Iteration 7: 6.72 ms
+  Iteration 8: 6.76 ms
+  Iteration 9: 6.72 ms
+  Iteration 10: 6.74 ms
+  Iteration 11: 6.72 ms
+  Iteration 12: 6.75 ms
+  Iteration 13: 6.71 ms
+  Iteration 14: 6.75 ms
+  Iteration 15: 6.72 ms
+  Iteration 16: 6.76 ms
+  Iteration 17: 6.77 ms
+  Iteration 18: 6.74 ms
+  Iteration 19: 6.72 ms
+  Iteration 20: 6.74 ms
+
+结果:
+  平均时间: 6.74 ms
+  最小时间: 6.71 ms
+  最大时间: 6.77 ms
+  标准差: 0.02 ms
+  平均带宽: 41.74 GB/s
+
+================================================================================
+测试: FFN 权重传输时间 (Pinned -> GPU)
+================================================================================
+创建 0.562 GB 的 pinned memory tensor...
+Warmup (3 iterations)...
+Benchmarking (20 iterations)...
+  Iteration 1: 13.47 ms
+  Iteration 2: 13.56 ms
+  Iteration 3: 13.51 ms
+  Iteration 4: 13.54 ms
+  Iteration 5: 13.51 ms
+  Iteration 6: 13.57 ms
+  Iteration 7: 13.45 ms
+  Iteration 8: 13.59 ms
+  Iteration 9: 13.45 ms
+  Iteration 10: 13.70 ms
+  Iteration 11: 13.55 ms
+  Iteration 12: 13.64 ms
+  Iteration 13: 13.47 ms
+  Iteration 14: 13.57 ms
+  Iteration 15: 13.45 ms
+  Iteration 16: 13.55 ms
+  Iteration 17: 13.47 ms
+  Iteration 18: 13.62 ms
+  Iteration 19: 13.46 ms
+  Iteration 20: 13.58 ms
+
+结果:
+  平均时间: 13.54 ms
+  最小时间: 13.45 ms
+  最大时间: 13.70 ms
+  标准差: 0.07 ms
+  平均带宽: 41.56 GB/s
+
+================================================================================
+测试: MHA SSD读取时间 (SSD -> Pinned)
+================================================================================
+创建 0.281 GB 的 pinned memory buffer...
+打开块设备: /dev/nvme0n1p4 (O_DIRECT mode)
+Warmup (2 iterations)...
+Benchmarking (10 iterations)...
+  Iteration 1 (offset=0.00GB): 64.74 ms
+  Iteration 2 (offset=0.28GB): 56.17 ms
+  Iteration 3 (offset=0.56GB): 64.10 ms
+  Iteration 4 (offset=0.84GB): 68.41 ms
+  Iteration 5 (offset=1.12GB): 67.57 ms
+  Iteration 6 (offset=1.41GB): 59.40 ms
+  Iteration 7 (offset=1.69GB): 64.03 ms
+  Iteration 8 (offset=1.97GB): 67.94 ms
+  Iteration 9 (offset=2.25GB): 69.26 ms
+  Iteration 10 (offset=2.53GB): 60.69 ms
+
+结果:
+  平均时间: 64.23 ms
+  最小时间: 56.17 ms
+  最大时间: 69.26 ms
+  标准差: 4.11 ms
+  平均带宽: 4.38 GB/s
+
+================================================================================
+测试: FFN SSD读取时间 (SSD -> Pinned)
+================================================================================
+创建 0.562 GB 的 pinned memory buffer...
+打开块设备: /dev/nvme0n1p4 (O_DIRECT mode)
+Warmup (2 iterations)...
+Benchmarking (10 iterations)...
+  Iteration 1 (offset=0.00GB): 111.61 ms
+  Iteration 2 (offset=0.56GB): 127.29 ms
+  Iteration 3 (offset=1.12GB): 140.50 ms
+  Iteration 4 (offset=1.69GB): 136.87 ms
+  Iteration 5 (offset=2.25GB): 118.39 ms
+  Iteration 6 (offset=2.81GB): 127.90 ms
+  Iteration 7 (offset=3.38GB): 141.70 ms
+  Iteration 8 (offset=3.94GB): 136.54 ms
+  Iteration 9 (offset=4.50GB): 122.23 ms
+  Iteration 10 (offset=5.06GB): 127.04 ms
+
+结果:
+  平均时间: 129.01 ms
+  最小时间: 111.61 ms
+  最大时间: 141.70 ms
+  标准差: 9.39 ms
+  平均带宽: 4.36 GB/s
+
+================================================================================
+测试结果总结
+================================================================================
+
+权重大小:
+  MHA: 0.281 GB
+  FFN: 0.562 GB
+  总计: 0.844 GB
+
+================================================================================
+计算时间 (纯计算，无IO)
+================================================================================
+
+MHA Prefill (2048 tokens):
+  平均: 152.42 ms
+  最小: 142.67 ms
+  最大: 186.72 ms
+
+FFN Prefill (2048 tokens):
+  平均: 25.94 ms
+  最小: 25.75 ms
+  最大: 26.11 ms
+
+Prefill总计:
+  MHA + FFN = 178.36 ms
+  MHA占比: 85.5%
+  FFN占比: 14.5%
+
+MHA Decode (1 token):
+  平均: 0.68 ms
+  最小: 0.65 ms
+  最大: 0.91 ms
+
+FFN Decode (1 token):
+  平均: 1.57 ms
+  最小: 1.57 ms
+  最大: 1.58 ms
+
+Decode总计:
+  MHA + FFN = 2.26 ms
+  MHA占比: 30.3%
+  FFN占比: 69.7%
+
+================================================================================
+IO时间
+================================================================================
+
+MHA Pinned->GPU:
+  平均: 6.74 ms
+  带宽: 41.74 GB/s
+
+FFN Pinned->GPU:
+  平均: 13.54 ms
+  带宽: 41.56 GB/s
+
+MHA SSD->Pinned:
+  平均: 64.23 ms
+  带宽: 4.38 GB/s
+
+FFN SSD->Pinned:
+  平均: 129.01 ms
+  带宽: 4.36 GB/s
+
+================================================================================
+重叠可行性分析
+================================================================================
+
+Prefill阶段:
+  串行执行总时间: 391.88 ms
+    MHA计算: 152.42 ms (38.9%)
+    FFN计算: 25.94 ms (6.6%)
+    MHA Pin->GPU: 6.74 ms (1.7%)
+    FFN Pin->GPU: 13.54 ms (3.5%)
+    MHA SSD->Pin: 64.23 ms (16.4%)
+    FFN SSD->Pin: 129.01 ms (32.9%)
+
+  层内流水线分析:
+    MHA阶段: max(计算=152.42ms, IO=70.97ms) = 152.42 ms
+    FFN阶段: max(计算=25.94ms, IO=142.54ms) = 142.54 ms
+
+  理想流水线时间: 294.96 ms
+  理论加速比: 1.33x
+
+Decode阶段:
+  串行执行总时间: 215.77 ms
+    MHA计算: 0.68 ms (0.3%)
+    FFN计算: 1.57 ms (0.7%)
+    MHA Pin->GPU: 6.74 ms (3.1%)
+    FFN Pin->GPU: 13.54 ms (6.3%)
+    MHA SSD->Pin: 64.23 ms (29.8%)
+    FFN SSD->Pin: 129.01 ms (59.8%)
+
+  层内流水线分析:
+    MHA阶段: max(计算=0.68ms, IO=70.97ms) = 70.97 ms
+    FFN阶段: max(计算=1.57ms, IO=142.54ms) = 142.54 ms
+
+  理想流水线时间: 213.51 ms
+  理论加速比: 1.01x
+
+  预取距离建议:
+    MHA: 104 层
+    FFN: 91 层
+
+================================================================================
