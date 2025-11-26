@@ -28,7 +28,9 @@ os.environ["WSM_NO_FALLBACK"] = "1"
 
 # 🔥 启用层级性能 profiling（CUDA timer 统计 attn/ffn/kv_fetch 等详细时间）
 os.environ["LLM_PROFILE"] = "1"
-
+CHUNK_SIZE = int(os.environ.setdefault("PREFILL_T_CHUNK", "256"))
+MIRCO_BATCH_SIZE  = os.environ.setdefault("MIRCO_BATCH_SIZE", "4")
+ATTN_MICRO_B = os.environ.setdefault("ATTN_MICRO_B", "4")
 import torch
 
 # Optional NVTX for GPU decode-step ranges
@@ -156,6 +158,11 @@ class InferenceProfiler:
         orig = model.forward
 
         def _classify_args(args, kwargs):
+            """
+            解析出 tokens / B / T / start_pos
+            返回: (kind, B, T, start_pos) 其中 kind: "prefill" or "decode"
+            """
+            # 1) 找到 tokens tensor
             cand = None
             for k in ("tokens", "input_ids"):
                 t = kwargs.get(k, None)
@@ -166,46 +173,84 @@ class InferenceProfiler:
                     if torch.is_tensor(a) and a.dtype in (torch.long, torch.int32, torch.int64) and a.dim() == 2:
                         cand = a; break
             if cand is None:
-                return None, None
+                return "unknown", None, None, None
+
             B, T = int(cand.size(0)), int(cand.size(1))
-            return B, T
+
+            # 2) 尝试解析 start_pos
+            start_pos = kwargs.get("start_pos", None)
+            if start_pos is None and len(args) >= 2:
+                # 可能是位置参数：forward(tokens, start_pos, ...)
+                if isinstance(args[1], int):
+                    start_pos = args[1]
+
+            # 3) 判断 kind
+            kind = None
+            if T is not None and T > 1:
+                # 不管 start_pos 是 0 还是 >0，都当 prefill（包含 chunk prefill）
+                kind = "prefill"
+            elif T == 1:
+                # 单 token，一律认为是 decode
+                kind = "decode"
+            elif start_pos is not None and start_pos > 0:
+                # T 取不到、但 start_pos>0 时再兜底当 decode
+                kind = "decode"
+            else:
+                kind = "unknown"
+
+            return kind, B, T, start_pos
 
         def wrapped(*args, **kwargs):
             if not self.active:
                 return orig(*args, **kwargs)
-            B, T = _classify_args(args, kwargs)
-            kind = "prefill" if (T is not None and T > 1) else ("decode" if T == 1 else "unknown")
+
+            kind, B, T, start_pos = _classify_args(args, kwargs)
+
+            # ---- 统一维护 decode_step_idx（不依赖 NVTX 是否开启）----
+            step_idx = None
+            if kind == "decode":
+                step_idx = self.decode_step_idx
+                self.decode_step_idx += 1
+
+            # 在进入 forward 前，告诉 PERF_TRACKER 当前 phase + step
+            if PERF_TRACKER is not None:
+                # prefill 不需要记录 step，就给 None；decode 给具体 step_idx
+                PERF_TRACKER.set_step_context(kind, step_idx if kind == "decode" else None)
 
             if self.cuda:
                 s_ev = torch.cuda.Event(enable_timing=True)
                 e_ev = torch.cuda.Event(enable_timing=True)
 
-                # 新增：decode step 的 NVTX 标记，方便 Nsight 对齐
                 label = None
                 if self.use_nvtx and NVTX_AVAILABLE and kind == "decode":
-                    step_idx = self.decode_step_idx
-                    self.decode_step_idx += 1
-                    b_str = (B if B is not None else 0)
-                    t_str = (T if T is not None else 0)
-                    label = f"decode_step_{step_idx:04d}_B{b_str}_T{t_str}"
-
-                if label is not None:
+                    # 这里直接用上面算好的 step_idx
+                    label = f"decode_step_{step_idx}_B{B}_T{T}"
                     nvtx.range_push(label)
+
+                s_ev.record()
                 try:
-                    s_ev.record()
                     out = orig(*args, **kwargs)
-                    e_ev.record()
                 finally:
-                    if label is not None:
+                    e_ev.record()
+                    if NVTX_AVAILABLE and label is not None:
                         nvtx.range_pop()
+                    # 退出 forward 后，清掉 step context
+                    if PERF_TRACKER is not None:
+                        PERF_TRACKER.set_step_context(None, None)
 
                 self.forward_events.append((kind, B, T, s_ev, e_ev))
                 return out
             else:
-                s = time.perf_counter_ns()
-                out = orig(*args, **kwargs)
-                e = time.perf_counter_ns()
-                self.forward_events_cpu.append((kind, B, T, (e - s) / 1e6))
+                t0 = time.time()
+                try:
+                    out = orig(*args, **kwargs)
+                finally:
+                    t1 = time.time()
+                    # CPU 版本也结束时清 context
+                    if PERF_TRACKER is not None:
+                        PERF_TRACKER.set_step_context(None, None)
+
+                self.forward_events_cpu.append((kind, B, T, (t1 - t0) * 1000.0))
                 return out
 
         model.forward = wrapped
@@ -215,7 +260,24 @@ class InferenceProfiler:
     def span_if_active(self, name, category, **extras):
         return self.span(name, category, **extras) if self is not None else nullcontext()
 
-    def _compute_decode_stats(self, arr):
+    def _compute_decode_stats(self, arr, batch_size: int = 1):
+        """
+        通用的延迟统计工具。
+
+        参数:
+            arr: 一个包含若干耗时（单位: ms）的列表。
+            batch_size: 每次调用 forward 处理的样本数（用于换算 token/s）。
+
+        返回:
+            统计字典，字段包括:
+              - count: 样本数
+              - sum_ms: 总耗时 (ms)
+              - mean_ms: 平均值 (ms)
+              - p50_ms / p90_ms / p99_ms / p999_ms: 分位数 (ms)
+              - max_ms: 最大值 (ms)
+              - decode_toks_per_s: 如果 batch_size>0，则认为每个样本生成 batch_size 个 token，
+                                   给出对应的 token/s（否则为 None）
+        """
         if not arr:
             return {
                 "count": 0,
@@ -224,21 +286,57 @@ class InferenceProfiler:
                 "p50_ms": None,
                 "p90_ms": None,
                 "p99_ms": None,
+                "p999_ms": None,
+                "max_ms": None,
                 "decode_toks_per_s": None,
             }
+
+        # 过滤非法值并转成 float
+        arr = [float(x) for x in arr if isinstance(x, (int, float))]
+        if not arr:
+            return {
+                "count": 0,
+                "sum_ms": 0.0,
+                "mean_ms": None,
+                "p50_ms": None,
+                "p90_ms": None,
+                "p99_ms": None,
+                "p999_ms": None,
+                "max_ms": None,
+                "decode_toks_per_s": None,
+            }
+
         s = sorted(arr)
-        q = lambda p: s[int((len(s)-1)*p)]
-        total_s = sum(arr) / 1000.0  # ms to seconds
-        toks_per_s = len(arr) / total_s if total_s > 0 else None
+        n = len(s)
+
+        def q(p: float) -> float:
+            if n == 1:
+                return s[0]
+            # 简单按 index 取值即可，足够用于统计
+            idx = int((n - 1) * p)
+            idx = max(0, min(n - 1, idx))
+            return s[idx]
+
+        total_ms = float(sum(s))
+        mean_ms = total_ms / n
+        max_ms = s[-1]
+
+        total_s = total_ms / 1000.0
+        total_tokens = n * max(int(batch_size), 1)
+        toks_per_s = total_tokens / total_s if total_s > 0 else None
+
         return {
-            "count": len(arr),
-            "sum_ms": sum(arr),
-            "mean_ms": sum(arr)/len(arr),
+            "count": n,
+            "sum_ms": total_ms,
+            "mean_ms": mean_ms,
             "p50_ms": q(0.50),
             "p90_ms": q(0.90),
             "p99_ms": q(0.99),
+            "p999_ms": q(0.999),
+            "max_ms": max_ms,
             "decode_toks_per_s": toks_per_s,
         }
+
 
     def finalize(
         self,
@@ -249,38 +347,14 @@ class InferenceProfiler:
         wsm_runtime: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        把 timeline + forward_events 汇总成一个结构化结果：
-        - 总体 e2e / prefill / decode 时间
-        - 每 token decode 的耗时统计
-        - WSM 的 IO / 等待时间统计
-        - （新增）每个 decoder layer 的计算时间 & IO 时间
-        - warmup layer 总时间
+        把 timeline + forward_events 汇总成结构化结果，并补充一组更「论文友好」的指标:
+
+        - TE2E: 端到端延迟 (Time End-to-End)
+        - TTFT: Time To First Token
+        - TBT: Time Between Tokens（稳定阶段，忽略第一个 token）
+        - decode 期间 IO / Compute 的近似 overlap ratio
+        - 每层 decoder 的 compute / IO 汇总
         """
-        # -------- 工具函数 --------
-        def _sum_by_name(name: str) -> float:
-            return sum(ev["dur_ms"] for ev in self.timeline if ev["name"] == name)
-
-        def _mean_or_none(values: List[float]) -> Optional[float]:
-            return sum(values) / len(values) if values else None
-
-        def _sum_io(name: str, group_key: Optional[str] = None) -> Dict[str, Any]:
-            """
-            统计某个 IO 事件的总时间及分组：
-            name: "wsm.ssd_to_cpu_layer" / "wsm.h2d_param"
-            group_key: "phase" / "thread" 等
-            """
-            total = 0.0
-            by_group: Dict[str, float] = {}
-            for ev in self.timeline:
-                if ev["name"] != name:
-                    continue
-                dur = float(ev.get("dur_ms", 0.0))
-                total += dur
-                if group_key is not None:
-                    g = str(ev.get(group_key, "unknown"))
-                    by_group[g] = by_group.get(g, 0.0) + dur
-            return {"total_ms": total, "by_group": by_group}
-
         # -------- meta / runtime 补充 --------
         if extra_meta:
             self.meta.update(extra_meta)
@@ -290,17 +364,20 @@ class InferenceProfiler:
         elif self.wsm_runtime is None:
             self.wsm_runtime = {}
 
-        # -------- prefill / decode token 级别的 GPU 时间（CUDA Event）--------
+        # 从 meta 中获取 batch_size（用于所有 token/s 相关统计）
+        bsz = int(self.meta.get("batch_size") or 1)
+
+        # -------- 1. 从 CUDA events 解析 prefill / decode 每 step 耗时 --------
         decode_ms: List[float] = []
         prefill_ms: List[float] = []
         if torch.cuda.is_available():
             for ev in self.forward_events:
-                # forward_events 格式: (kind, B, T, start_ev, end_ev)
+                # forward_events: (kind, B, T, start_evt, end_evt)
                 kind, B, T, start_evt, end_evt = ev
                 if start_evt is None or end_evt is None:
                     continue
                 try:
-                    end_evt.synchronize()  # 确保事件完成
+                    end_evt.synchronize()
                     dt_ms = float(start_evt.elapsed_time(end_evt))
                 except Exception:
                     continue
@@ -310,27 +387,25 @@ class InferenceProfiler:
                 elif kind == "prefill":
                     prefill_ms.append(dt_ms)
 
-        # -------- 从 timeline 里抽 prefill / decode / 其它阶段 --------
-        # inference scope 用于包住整个推理
-        infer_spans = [ev for ev in self.timeline if ev["name"] == "inference_e2e"]
+        # -------- 2. E2E / prefill / decode 墙钟时间 --------
+        # inference_scope() 用 "inference_e2e" 包裹整个推理
+        infer_spans = [ev for ev in self.timeline if ev.get("name") == "inference_e2e"]
         if infer_spans:
-            t0 = min(ev["t_start_ms"] for ev in infer_spans)
-            t1 = max(ev["t_end_ms"] for ev in infer_spans)
+            t0 = min(float(ev["t_start_ms"]) for ev in infer_spans)
+            t1 = max(float(ev["t_end_ms"]) for ev in infer_spans)
             e2e_ms = t1 - t0
         else:
             e2e_ms = None
 
-        # 统计 prefill 和 decode 阶段的时间（从 CUDA events）
-        prefill_total_ms = sum(prefill_ms) if prefill_ms else 0.0
-        decode_total_ms = sum(decode_ms) if decode_ms else 0.0
+        prefill_total_ms = float(sum(prefill_ms)) if prefill_ms else 0.0
+        decode_total_ms = float(sum(decode_ms)) if decode_ms else 0.0
 
         # 预热 GPU decoder window（warmup layer）时间
-        warmup_spans = [ev for ev in self.timeline if ev["name"] == "gpu_window_warmup"]
-        warmup_total_ms = sum(ev["dur_ms"] for ev in warmup_spans)
+        warmup_spans = [ev for ev in self.timeline if ev.get("name") == "gpu_window_warmup"]
+        warmup_total_ms = sum(float(ev.get("dur_ms", 0.0)) for ev in warmup_spans)
         warmup_calls = len(warmup_spans)
 
-        # 分类统计：各个 cat 的总时间
-        #   - prefill, decode
+        # -------- 3. 按 category 统计各阶段墙钟时间 --------
         by_cat: Dict[str, float] = {}
         for ev in self.timeline:
             cat = ev.get("cat")
@@ -344,31 +419,76 @@ class InferenceProfiler:
             "by_cat_ms": by_cat,
         }
 
-        # -------- decode token 统计（每 token 耗时分布）--------
-        decode_stats = self._compute_decode_stats(decode_ms)
+        # -------- 4. decode per-step 统计（用于 TBT、decode throughput）--------
+        decode_stats = self._compute_decode_stats(decode_ms, batch_size=bsz)
 
-        # -------- slack_ms 统计（group ready 到使用的时间差）--------
-        slack_times = []
+        # TBT 采用「稳定阶段」的 token 间隔，所以跳过第一个 token
+        tbt_stats = None
+        if len(decode_ms) > 1:
+            tbt_stats = self._compute_decode_stats(decode_ms[1:], batch_size=bsz)
+
+        # TTFT: prefill 总时间 + 第一个 decode step
+        # 这和常见文献/文档中“从请求到第一个 token 的延迟”一致
+        ttft_ms = None
+        if prefill_total_ms and decode_ms:
+            ttft_ms = prefill_total_ms + decode_ms[0]
+        elif prefill_total_ms:
+            ttft_ms = prefill_total_ms
+
+        # -------- 5. slack_ms 统计（group ready 到真正使用之间的间隔）--------
+        slack_times: List[float] = []
         for ev in self.timeline:
             if ev.get("name") == "wsm.wait_group_ready":
                 s = ev.get("slack_ms")
                 if isinstance(s, (int, float)) and s >= 0:
-                    slack_times.append(s)
+                    slack_times.append(float(s))
 
-        slack_stats = self._compute_decode_stats(slack_times) if slack_times else {
-            "count": 0,
-            "sum_ms": 0.0,
-            "mean_ms": None,
-            "p50_ms": None,
-            "p90_ms": None,
-            "p99_ms": None,
-        }
+        slack_stats = (
+            self._compute_decode_stats(slack_times)
+            if slack_times
+            else {
+                "count": 0,
+                "sum_ms": 0.0,
+                "mean_ms": None,
+                "p50_ms": None,
+                "p90_ms": None,
+                "p99_ms": None,
+                "p999_ms": None,
+                "max_ms": None,
+                "decode_toks_per_s": None,
+            }
+        )
 
-        # -------- WSM 高层统计（等你之前已有的部分）--------
+        # -------- 6. WSM 维度的总 IO 时间 / 等待时间 --------
+        def _sum_by_name(name: str) -> float:
+            total = 0.0
+            for ev in self.timeline:
+                if ev.get("name") != name:
+                    continue
+                total += float(ev.get("dur_ms", 0.0))
+            return total
+
+        def _sum_io(name: str, group_key: Optional[str] = None) -> Dict[str, Any]:
+            total = 0.0
+            by_group: Dict[str, float] = {}
+            for ev in self.timeline:
+                if ev.get("name") != name:
+                    continue
+                dur = float(ev.get("dur_ms", 0.0))
+                total += dur
+                if group_key is not None:
+                    g = str(ev.get(group_key, "unknown"))
+                    by_group[g] = by_group.get(g, 0.0) + dur
+            out: Dict[str, Any] = {"total_ms": total}
+            if group_key is not None:
+                out["by_group"] = by_group
+            return out
+
+        # -------- 5. WSM 高层统计（和你之前一样）--------
         wait_total_ms = _sum_by_name("wsm.wait_group_ready")
         ensure_total_ms = _sum_by_name("wsm.ensure_module_on_gpu")
 
-        # IO 按类型统计（SSD->CPU / CPU->GPU）
+        # IO 按类型统计（SSD->CPU / CPU->GPU），带 phase 方便看 prefill / decode
         ssd_io = _sum_io("wsm.ssd_to_cpu_layer", group_key="phase")
         h2d_io = _sum_io("wsm.h2d_param", group_key="phase")
 
@@ -381,27 +501,28 @@ class InferenceProfiler:
             "wait_group_ready": {"total_ms": wait_total_ms},
             "ensure_module_on_gpu": {"total_ms": ensure_total_ms},
             "io": w_io,
-            "slack_time": slack_stats,  # group ready 到使用的时间差统计
         }
         if self.wsm_runtime:
             wsm_stats["runtime"] = self.wsm_runtime
 
-        # --------（新增）每个 decoder layer 的 compute / IO 统计 --------
+        # -------- 6. 每个 decoder layer 的 compute / IO / 带宽统计 --------
         decoder_layers_global: Dict[str, float] = {}
         decoder_layers_per_layer: Dict[str, Any] = {}
 
-        # 2.1 从 PERF_TRACKER 拿 GPU 计算时间（在 layers.py 里）
+        # 6.1 GPU 计算时间（layers.py 里的 PERF_TRACKER）
         perf_per_layer: Dict[int, Dict[str, float]] = {}
+        perf_stats: Dict[str, Any] = {}
         if PERF_TRACKER is not None:
             try:
                 perf_stats = PERF_TRACKER.get_stats()  # {"global": {...}, "per_layer": {...}}
                 decoder_layers_global = dict(perf_stats.get("global", {}))
                 perf_per_layer = perf_stats.get("per_layer", {}) or {}
             except Exception:
-                perf_per_layer = {}
+                perf_stats = {}
                 decoder_layers_global = {}
+                perf_per_layer = {}
 
-        # 2.2 从 WSM timeline 按 layer_idx 聚合 IO 时间
+        # 6.2 从 WSM timeline 按 layer_idx 聚合 IO 时间 + 字节数
         layer_io: Dict[int, Dict[str, float]] = {}
         for ev in self.timeline:
             lid = ev.get("layer_idx")
@@ -420,98 +541,203 @@ class InferenceProfiler:
                 lid,
                 {
                     "ssd_to_cpu_ms": 0.0,
+                    "ssd_to_cpu_bytes": 0.0,
                     "h2d_param_ms": 0.0,
+                    "h2d_param_bytes": 0.0,
                     "wait_group_ready_ms": 0.0,
                 },
             )
             dur = float(ev.get("dur_ms", 0.0))
+            b = float(ev.get("bytes", 0.0))
+
             if name.startswith("wsm.ssd_to_cpu_layer"):
                 entry["ssd_to_cpu_ms"] += dur
+                entry["ssd_to_cpu_bytes"] += b
             elif name.startswith("wsm.h2d_param"):
                 entry["h2d_param_ms"] += dur
+                entry["h2d_param_bytes"] += b
             elif name.startswith("wsm.wait_group_ready"):
                 entry["wait_group_ready_ms"] += dur
 
-        # 2.3 合并 per-layer compute + IO
-        all_layer_ids = sorted(
-            set(list(perf_per_layer.keys()) + list(layer_io.keys()))
-        )
+        # 6.3 合并 per-layer compute + IO + 带宽
+        all_layer_ids = sorted(set(list(perf_per_layer.keys()) + list(layer_io.keys())))
         for lid in all_layer_ids:
             lp = perf_per_layer.get(lid, {})  # 来自 cuda_timer 的各类 us 统计
             li = layer_io.get(lid, {})
 
             attn_us = float(lp.get("attn_us", 0.0))
             ffn_us = float(lp.get("ffn_us", 0.0))
+            kv_us = float(lp.get("kv_fetch_us", 0.0))
             total_forward_us = float(lp.get("total_forward_us", 0.0))
-            if not total_forward_us and (attn_us or ffn_us):
-                total_forward_us = attn_us + ffn_us
+            if total_forward_us == 0.0 and (attn_us or ffn_us or kv_us):
+                total_forward_us = attn_us + ffn_us + kv_us
 
-            kv_fetch_us = float(lp.get("kv_fetch_us", 0.0))
             mem_us = float(lp.get("memory_alloc_us", 0.0))
             weights_hbm_us = float(lp.get("weights_hbm_us", 0.0))
 
-            io_total_ms = sum(li.values()) if li else 0.0
+            ssd_ms = float(li.get("ssd_to_cpu_ms", 0.0))
+            ssd_bytes = float(li.get("ssd_to_cpu_bytes", 0.0))
+            h2d_ms = float(li.get("h2d_param_ms", 0.0))
+            h2d_bytes = float(li.get("h2d_param_bytes", 0.0))
+            wait_ms = float(li.get("wait_group_ready_ms", 0.0))
+
+            io_total_ms = ssd_ms + h2d_ms + wait_ms
+
+            # 平均带宽 (GB/s, 1GB=1e9 bytes)，注意 ms -> s
+            ssd_gbps = (
+                ssd_bytes / ssd_ms / 1e6 if (ssd_ms > 0.0 and ssd_bytes > 0.0) else None
+            )
+            h2d_gbps = (
+                h2d_bytes / h2d_ms / 1e6 if (h2d_ms > 0.0 and h2d_bytes > 0.0) else None
+            )
 
             decoder_layers_per_layer[str(lid)] = {
+                # MHA / FFN / KV 的累计计算时间（us）
                 "compute_us": {
-                    "attn_us": attn_us,  # CUDA timer: 纯 attention 计算时间
-                    "ffn_us": ffn_us,  # CUDA timer: 纯 FFN 计算时间
-                    "kv_fetch_us": kv_fetch_us,  # CUDA timer: KV cache 获取时间
-                    "total_forward_us": total_forward_us,  # CUDA timer: 整个 forward 的 GPU 计算时间（不含 I/O 等待）
-                    "memory_alloc_us": mem_us,  # CUDA timer: 内存分配时间
-                    "weights_hbm_us": weights_hbm_us,  # CUDA timer: 权重 HBM 传输时间
+                    "attn_us": attn_us,
+                    "ffn_us": ffn_us,
+                    "kv_fetch_us": kv_us,
+                    "total_forward_us": total_forward_us,
+                    "memory_alloc_us": mem_us,
+                    "weights_hbm_us": weights_hbm_us,
                 },
-                "io_ms": li,  # WSM timeline: 该层的 I/O 时间（SSD→CPU, CPU→GPU, wait）
+                # 兼容老字段：只放时间（ms）
+                "io_ms": {
+                    "ssd_to_cpu_ms": ssd_ms,
+                    "h2d_param_ms": h2d_ms,
+                    "wait_group_ready_ms": wait_ms,
+                },
+                # 新增：IO 字节数
+                "io_bytes": {
+                    "ssd_to_cpu_bytes": ssd_bytes if ssd_bytes > 0 else None,
+                    "h2d_param_bytes": h2d_bytes if h2d_bytes > 0 else None,
+                },
+                # 新增：平均带宽（GB/s）
+                "io_bandwidth_gbps": {
+                    "ssd_to_cpu_gbps": ssd_gbps,
+                    "h2d_param_gbps": h2d_gbps,
+                },
                 "summary": {
-                    "compute_ms_pure": (
-                        total_forward_us / 1000.0 if total_forward_us else None
-                    ),  # 纯 GPU 计算时间（毫秒）
-                    "io_ms_total": io_total_ms,  # 总 I/O 时间（毫秒）
+                    # 单层累计前向时间（prefill+decode，近似）
+                    "compute_ms_pure": total_forward_us / 1000.0
+                    if total_forward_us
+                    else None,
+                    "io_ms_total": io_total_ms,
                 },
             }
+
+        # 6.4 全局 decode 阶段 IO-Compute overlap 估计
+        decoder_compute_ms_total = sum(
+            v["summary"]["compute_ms_pure"] or 0.0
+            for v in decoder_layers_per_layer.values()
+        )
+        decoder_io_ms_total = sum(
+            v["summary"]["io_ms_total"] for v in decoder_layers_per_layer.values()
+        )
+        decoder_wall_ms = float(decode_stats.get("sum_ms") or decode_total_ms or 0.0)
+
+        overlap_ratio = None
+        overlap_ms = None
+        uncovered_io_ms = None
+        if decoder_wall_ms > 0.0 and decoder_io_ms_total > 0.0:
+            # 理论：wall_time ≈ max(compute, io) + 其它开销
+            # 近似：compute + io - wall ≈ 被覆盖掉的 IO 时间
+            raw_overlap = decoder_compute_ms_total + decoder_io_ms_total - decoder_wall_ms
+            overlap_ms = max(0.0, raw_overlap)
+            overlap_ratio = max(0.0, min(1.0, overlap_ms / decoder_io_ms_total))
+            uncovered_io_ms = max(0.0, decoder_io_ms_total - overlap_ms)
+
+        decoder_layers_summary = {
+            "compute_ms_total": decoder_compute_ms_total,
+            "io_ms_total": decoder_io_ms_total,
+            "decode_wall_ms": decoder_wall_ms,
+            "overlap_ms_approx": overlap_ms,
+            "uncovered_io_ms_approx": uncovered_io_ms,
+            "overlap_ratio": overlap_ratio,
+        }
+
+        # 也把 overlap 信息塞进 decode 这块，方便 timings.decode.* 直接访问
+        if overlap_ratio is not None:
+            decode_stats["overlap_ratio"] = overlap_ratio
+            decode_stats["approx_compute_ms_total"] = decoder_compute_ms_total
+            decode_stats["approx_io_ms_total"] = decoder_io_ms_total
+            decode_stats["approx_overlap_ms"] = overlap_ms
+            decode_stats["approx_uncovered_io_ms"] = uncovered_io_ms
 
         decoder_layers = {
             "global": decoder_layers_global,
             "per_layer": decoder_layers_per_layer,
+            "summary": decoder_layers_summary,
         }
 
-        # -------- 最终 timings / throughput --------
-        # 计算 First Token Latency (FTL): prefill + 第一个 decode token
-        ftl_ms = None
-        if prefill_total_ms and decode_ms:
-            ftl_ms = prefill_total_ms + decode_ms[0]
-        elif prefill_total_ms:
-            ftl_ms = prefill_total_ms
 
+        # 也把 overlap_ratio 放进 decode 统计里，方便用 timings.decode.overlap_ratio 访问
+        if overlap_ratio is not None:
+            decode_stats["overlap_ratio"] = overlap_ratio
+            decode_stats["approx_compute_ms_total"] = decoder_compute_ms_total
+            decode_stats["approx_io_ms_total"] = decoder_io_ms_total
+
+        decoder_layers = {
+            "global": decoder_layers_global,
+            "per_layer": decoder_layers_per_layer,
+            "summary": decoder_layers_summary,
+        }
+
+        # -------- 8. throughput 统计 --------
+        # decode token 数（按每个 request）
+        decode_tokens_per_seq = (
+            max(tokens_out - tokens_in, 0)
+            if (tokens_out is not None and tokens_in is not None)
+            else len(decode_ms)
+        )
+        total_decode_tokens = decode_tokens_per_seq * bsz
+        total_decode_s = decode_total_ms / 1000.0 if decode_total_ms > 0 else None
+
+        decode_toks_per_s = (
+            (total_decode_tokens / total_decode_s) if (total_decode_s and total_decode_tokens > 0) else None
+        )
+
+        total_prefill_tokens = (tokens_in or 0) * bsz
+        total_prefill_s = prefill_total_ms / 1000.0 if prefill_total_ms > 0 else None
+        prefill_toks_per_s = (
+            (total_prefill_tokens / total_prefill_s)
+            if (total_prefill_s and total_prefill_tokens > 0)
+            else None
+        )
+
+        throughput = {
+            "prefill_toks_per_s": prefill_toks_per_s,
+            "decode_toks_per_s": decode_toks_per_s,
+        }
+
+        # -------- 9. TE2E / TTFT / TBT 等汇总到 timings --------
         timings: Dict[str, Any] = {
             "e2e_ms": e2e_ms,
+            "te2e_ms": e2e_ms,  # alias，方便直接在论文里引用
             "prefill_total_ms": prefill_total_ms,
-            "first_token_latency_ms": ftl_ms,
+            "ttft_ms": ttft_ms,
+            "first_token_latency_ms": ttft_ms,  # 保持向后兼容
             "decode": decode_stats,
+            "tbt_steady_ms": tbt_stats,
             "warmup_total_ms": warmup_total_ms,
             "warmup_calls": warmup_calls,
             "by_category_ms": sum_cat,
         }
 
-        throughput = {
-            "prefill_toks_per_s": (
-                tokens_in / (prefill_total_ms / 1000.0)
-                if prefill_total_ms and tokens_in > 0
-                else None
-            ),
-            "decode_toks_per_s": decode_stats.get("decode_toks_per_s"),
-        }
-
-        # -------- 内存峰值统计 --------
-        memory_stats = {}
+        # -------- 10. GPU 内存峰值 --------
+        memory_stats: Dict[str, Any] = {}
         if torch.cuda.is_available():
             try:
-                memory_stats["gpu_peak_allocated_gb"] = torch.cuda.max_memory_allocated() / (1 << 30)
-                memory_stats["gpu_peak_reserved_gb"] = torch.cuda.max_memory_reserved() / (1 << 30)
+                alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                reserved_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
+                memory_stats = {
+                    "gpu_peak_allocated_gb": float(alloc_gb),
+                    "gpu_peak_reserved_gb": float(reserved_gb),
+                }
             except Exception:
-                pass
+                memory_stats = {}
 
-        # -------- 汇总成 result --------
+        # -------- 11. 汇总成 result --------
         self.result = {
             "run": self.meta
             | {
@@ -521,20 +747,23 @@ class InferenceProfiler:
             "counts": {
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
+                "tokens_in_total": tokens_in * bsz if tokens_in is not None else None,
+                "tokens_out_total": tokens_out * bsz if tokens_out is not None else None,
             },
-            "timings": timings,  # e2e, prefill, decode 统计，warmup 时间等
-            "throughput": throughput,  # tokens/s 吞吐量
-            "wsm": wsm_stats,  # WSM I/O 和等待时间统计
-            "decoder_layers": decoder_layers,  # 每层的 CUDA 计算时间 + I/O 时间详细分解
-            "decode_step_ms": decode_ms,  # 每个 decode step 的耗时数组（CUDA events）
-            "timeline": self.timeline,  # 完整的事件时间线（用于详细分析）
-            "memory": memory_stats,  # GPU 内存峰值统计
+            "timings": timings,
+            "throughput": throughput,
+            "wsm": wsm_stats,
+            "decoder_layers": decoder_layers,
+            "decode_step_ms": decode_ms,
+            "timeline": self.timeline,
+            "memory": memory_stats,
         }
 
         if kv_stats is not None:
             self.result["kv_cache"] = kv_stats
 
         return self.result
+
 
 
 
@@ -559,10 +788,18 @@ class InferenceProfiler:
                 json.dump(self.result, f, ensure_ascii=False, indent=2)
 
 # ===== 路径与常量（按你的环境） =====
-PROMPT_TXT = Path("/home/roger/llama3-inference/prompts/prompts_batch512_len2048.txt")
-RAW_DEV    = "/dev/nvme0n1p4"
-MANIFEST   = "/data1/70b-fixed.runtime_manifest.json"
-CKPT_DIR   = "/home/roger/.llama/checkpoints/Llama3.1-70B"
+PROMPT_TXT = Path(os.getenv(
+    "PROMPT_TXT",
+    "/home/roger/llama3-inference/prompts/prompts_batch512_len2048.txt",
+))
+RAW_DEV  = os.getenv("RAW_DEV",  "/dev/nvme0n1p4")
+MANIFEST = os.getenv("MANIFEST", "/data1/70b-fixed.runtime_manifest.json")
+CKPT_DIR = os.getenv("CKPT_DIR", "/home/roger/.llama/checkpoints/Llama3.1-70B")
+
+# ===== Workload 配置：统一改 batch / 生成 token =====
+# 可以直接改这里的默认值，也可以用环境变量覆盖
+
+
 
 # ---------- 系统/GPU 内存快照 ----------
 def _read_status():
@@ -1180,10 +1417,18 @@ def main():
     # ⭐⭐⭐ P0 修复: 增加 warmup 层数，确保完整 overlap
     # 单层计算 100ms，可以 overlap 4 组 H2D (每组 25ms)
     # Warmup 至少需要覆盖: 初始层 + 预取深度 = 12 层
-    GPU_AHEAD_LAYERS = 6# 预取 6 组（3 层）- 适配 11 组容量
-    GPU_MAX_GROUPS   = 12
-    GPU_WARMUP_LAYERS = 6# ⭐ 6 → 12 层（24 组），确保前 12 层完全 overlap
-    CPU_CACHE_LAYERS = 47# CPU 缓存 50 层（79.5GB，安全余量）
+    GPU_AHEAD_LAYERS = 2# 预取 6 组（3 层）- 适配 11 组容量
+    GPU_MAX_GROUPS   = 6
+    GPU_WARMUP_LAYERS = 2# ⭐ 6 → 12 层（24 组），确保前 12 层完全 overlap
+    CPU_CACHE_LAYERS = 47# 
+    DEFAULT_BATCH_SIZE  = int(os.getenv("PROMPT_BATCH", "32"))   # 推理 batch size
+    DEFAULT_MAX_GEN_LEN = int(os.getenv("GEN_TOKENS", "32"))    # 每个样本生成 token 数
+    # ✅ 大 batch 时缩小 GPU group 预算，给激活和 KV 腾显存
+    if DEFAULT_BATCH_SIZE >= 64:
+        GPU_MAX_GROUPS = 2
+    elif DEFAULT_BATCH_SIZE >= 32:
+        GPU_MAX_GROUPS = 4
+
 
     # === H2D 并发控制（⭐⭐⭐ P0 优化：PCIe Gen5 + RTX 5080 高带宽配置） ===
     # PCIe Gen5 x16 带宽: 64GB/s (Gen4的2倍)
@@ -1204,7 +1449,7 @@ def main():
     os.environ.setdefault("WSM_GPU_AHEAD_GROUPS",      str(GPU_AHEAD_LAYERS))
 
     # 单层 100ms 可 overlap 4 组 H2D，设置 8 保证充足流水线
-    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH",  "6")  # ⭐ 6 → 8
+    os.environ.setdefault("WSM_GROUP_PREFETCH_DEPTH",  "4")  
     os.environ.setdefault("WSM_GPU_AHEAD",             str(GPU_AHEAD_LAYERS))
     os.environ.setdefault("WSM_GPU_BEHIND",            "2")    # 保留最近 2 层
 
@@ -1227,7 +1472,7 @@ def main():
     os.environ.setdefault("WSM_REBALANCE_SYNC",        "0")    # 异步重平衡
 
     # === SSD→CPU 流水线 ===
-    os.environ.setdefault("WSM_CPU_PREFETCH_DISTANCE", str(CPU_CACHE_LAYERS))   # CPU 预取 50 层
+    os.environ.setdefault("WSM_CPU_PREFETCH_DISTANCE", str(CPU_CACHE_LAYERS))   
     os.environ.setdefault("WSM_SSD_CONCURRENCY",       "12")    # SSD 并发读取
 
     # === Prefill 特定优化 ===
@@ -1237,8 +1482,11 @@ def main():
     os.environ.setdefault("WSM_WARMUP_LAYERS_GPU",     str(GPU_WARMUP_LAYERS))  # ⭐ 6 → 12 层
     os.environ.setdefault("WSM_WRAPAROUND_WARMUP",     str(GPU_WARMUP_LAYERS))  # ⭐ 6 → 12 层
     
-    
-  
+    # chunk & micro-batch 大小（与并发匹配）
+    os.environ.setdefault("PREFILL_T_CHUNK", str(CHUNK_SIZE)) 
+    os.environ.setdefault("FFN_MICRO_B", str(MIRCO_BATCH_SIZE)) 
+    os.environ.setdefault("ATTN_MICRO_B", str(ATTN_MICRO_B)) 
+
 
     # ============================================================
     # CPU 窗口额外配置（复用上面的 CPU_CACHE_LAYERS）
@@ -1280,7 +1528,7 @@ def main():
         probe("after runtime clamp")
 
     # 2) WSM（SSD 流式）构造参数
-    PRIME_WINDOW = int(os.getenv("WSM_PRIME_WINDOW", "12"))  # 从环境变量读取，默认6
+    PRIME_WINDOW = int(os.getenv("WSM_PRIME_WINDOW", "6"))  # 从环境变量读取，默认6
     mode_config = {
         "raw_device": RAW_DEV,
         "ssd_manifest_path": MANIFEST,
@@ -1289,6 +1537,7 @@ def main():
         "warmup_layers": max(PRIME_WINDOW, GPU_AHEAD_LAYERS + 2),  # ✅ Fix: 至少预热 GPU_AHEAD + 2 层
         "staging_mb": 64,
         "verbose": True,
+        "gpu_max_groups": GPU_MAX_GROUPS,
     }
 
     # 3) 构建（meta + SSD 流式）
@@ -1356,8 +1605,8 @@ def main():
     PROFILER.wrap_model_forward(llama.model)
 
     # 4) 读取 prompt + 安全裁剪（max_gen_len=32）
-    batch_size = 1
-    max_gen_len = 32
+    batch_size = DEFAULT_BATCH_SIZE
+    max_gen_len = DEFAULT_MAX_GEN_LEN
 
     with PROFILER.span("read_prompt_file", "prompt"):
         try:
@@ -1465,7 +1714,7 @@ def main():
     PROFILER.finalize(
         tokens_in=tokens_in_count,
         tokens_out=tokens_out_count,
-        extra_meta={"llama_mode": mode, "device_str": str(device)},
+        extra_meta={"llama_mode": mode, "device_str": str(device), "batch_size": batch_size},
         kv_stats=kv_stats or None,
         wsm_runtime=wsm_runtime,
     )

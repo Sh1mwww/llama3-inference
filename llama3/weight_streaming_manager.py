@@ -152,7 +152,7 @@ class WeightStreamingManager:
         self.prefill_gpu_layers = max(0, int(os.getenv("PREFILL_GPU_LAYERS", "5")))
 
         self._cpu_protect_set: set[int] = set()
-        self.decoder_protect_layers: int = int(os.getenv("WSM_DECODER_PROTECT_LAYERS", "12"))  # 預設保護前 4 層
+        self.decoder_protect_layers: int = int(os.getenv("WSM_DECODER_PROTECT_LAYERS", "4"))  # 預設保護前 4 層
 
         # ⭐ 统一在初始化早期解析环境变量，避免后续覆盖导致配置漂移
         # 优先级：环境变量 WSM_CPU_CACHE_LAYERS > 构造参数 cpu_cache_layers
@@ -3214,27 +3214,48 @@ class WeightStreamingManager:
         except Exception:
             pass
         
-    # --- inside class WeightStreamingManager ---
 
     def enter_decode_mode(self, *, protect_layers: int = 6, prime_window: int = 8):
         """
         进入 decode 模式：
+        - 切换 phase = "decoder"，调整 prefetch_distance / H2D 并发
         - 清理 prefill 遗留的占位事件/半途 inflight
         - 设置解码期保护窗口
         - 预热 prime_window 个 (attn, ffn) group
         """
+        # 1) 切 phase + 预取距离
+        self._phase = "decoder"
+        try:
+            self._set_prefetch_distance_for_phase("decoder")
+        except Exception as e:
+            if self.verbose:
+                print(f"[WSM] enter_decode_mode: failed to switch prefetch distance: {e}")
+
         self._decode_mode = True
 
-        # 1) 清理所有占位与未记录事件，清空 inflight，避免 prefill 垃圾状态影响 decode
-        self._clear_stale_group_events()     # 清空 _placeholder_keys, 移除没有 host_record 的 event
-        self._gpu_group_inflight.clear()     # 彻底清空 inflight 标记
-        self._rebalance_and_topoff()         # 把 GPU ring 清到合理容量
+        # 2) 清理 prefill 垃圾状态
+        self._clear_stale_group_events()
+        self._gpu_group_inflight.clear()
 
-        # 2) 建立 decode 保护窗口（避免刚切换就被回收）
-        self._ensure_decoder_protect_window(protect_layers)
+        # 3) 视情况做一次 wrap-around 的预热（老接口）
+        try:
+            # rebalance_and_topoff 现在是 def rebalance_and_topoff(self, current_layer)
+            if hasattr(self, "rebalance_and_topoff"):
+                self.rebalance_and_topoff(0)
+        except Exception as e:
+            if self.verbose:
+                print(f"[WSM] enter_decode_mode: rebalance_and_topoff failed: {e}")
 
-        # 3) 一次性 prime 后续 prime_window 层（attn/ffn 成对）
-        self._prime_decoder_window(prime_window)
+        # 4) 建立 decoder 保护窗口
+        self._ensure_decoder_protect_window(protect_layers, reason="decoder-enter")
+
+        # 5) prime 后续 prime_window 层（attn/ffn 成对）
+        try:
+            self._prime_decoder_window(prime_window)
+        except Exception as e:
+            if self.verbose:
+                print(f"[WSM] enter_decode_mode: _prime_decoder_window failed: {e}")
+
 
         
     def _cpu_trim_to_window_if_needed(

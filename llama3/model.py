@@ -124,7 +124,12 @@ class Transformer(nn.Module):
         self.kv_times: List[float] = [0.0] * args.n_layers
         self.attn_times: List[float] = [0.0] * args.n_layers
 
-    def _forward_pipelined(self, tokens: torch.Tensor, start_pos: int) -> torch.Tensor:
+    def _forward_pipelined(
+        self,
+        tokens: torch.Tensor,
+        start_pos: int,
+        return_logits: bool = True,
+    ) -> torch.Tensor | None:
         """
         跨层事件串接：全程异步提交 + 仅在最后等待。
 
@@ -133,6 +138,9 @@ class Transformer(nn.Module):
         2) L+1 的 forward_async 在提交时对 prev_done_evt 做 wait_event
         3) CPU 不在每层同步，而是在所有层排完后再等待最后一个事件
         4) 这样即使下一层不能提前算（数据依赖），CPU 也能提前把权重 H2D 挂到计算流
+
+        Args:
+            return_logits: 是否返回 logits。False 时只构建 KV cache，不计算输出（节省显存）
         """
         # ⭐ 关键修复：使用 embed_tokens 的设备（已在 _verify_and_fix_device_placement 中确保在 CUDA）
         # 而不是 self.args.device（可能还是字符串 "cuda" 或被错误设置为 "cpu"）
@@ -197,12 +205,25 @@ class Transformer(nn.Module):
                 pass
 
         h = self.norm(h)
+
+        # ⭐ 关键改动：prefill 可以只构建 KV，不输出 logits
+        if not return_logits:
+            return None
+
         out = self.output(h).float()
         return out
 
-    def forward(self, tokens: torch.Tensor, start_pos: int) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        start_pos: int,
+        return_logits: bool = True,
+    ) -> torch.Tensor | None:
         """
         保留原 forward 语义；当开关打开时，走 pipelined 包装（内部仍保证正确性）。
+
+        Args:
+            return_logits: 是否返回 logits。False 时只构建 KV cache，不计算输出（节省显存）
         """
         # 检查是否使用管线化模式
         use_pipe = getattr(self, "_runtime_switch", None)
@@ -212,7 +233,7 @@ class Transformer(nn.Module):
             use_pipe = self._runtime_switch
 
         if use_pipe.PIPELINED:
-            return self._forward_pipelined(tokens, start_pos)
+            return self._forward_pipelined(tokens, start_pos, return_logits=return_logits)
 
         # === 原 forward 的安全版（保持现有逻辑；如需保留，可继续使用）===
         bsz, seqlen = tokens.shape
@@ -283,5 +304,7 @@ class Transformer(nn.Module):
             self.attn_times[idx] = blk.attention.attn_time
 
         h = self.norm(h)                  # 确认 norm 模块常驻 GPU
+        if not return_logits:
+            return None
         out = self.output(h).float()      # 输出用 float 以便后续 logits 运算
         return out

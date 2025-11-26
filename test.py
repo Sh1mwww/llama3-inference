@@ -25,6 +25,7 @@ from types import SimpleNamespace
 os.environ.setdefault("LLM_PROFILE", "1")              # 打开 cuda_timer
 os.environ.setdefault("KV_DECODE_WINDOW_TOKENS", "512")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("FFN_MICRO_B", "8")              # FFN微批处理，避免大batch OOM
 
 # Create a mock stream_mnt module that returns None for get_streams to avoid compute_stream path bug
 mock_stream_mnt = SimpleNamespace(get_streams=lambda device: None)
@@ -184,8 +185,12 @@ def run_decode(block: EncoderBlock,
     kv_ms_total = kv_us / 1000.0
     total_ms_total = total_us / 1000.0
 
-    print(f"Wall time (decode {decode_len} steps): {wall_ms:.3f} ms")
-    print(f"  wall per-token   : {wall_ms / decode_len:.4f} ms/token\n")
+    # 这里提前算好总 token 数
+    total_tokens = decode_len * batch_size  # 实际生成的 token 数
+
+    # 注意这里 wall per-token 要除 total_tokens，而不是 decode_len
+    print(f"Wall time (decode {decode_len} steps, B={batch_size}): {wall_ms:.3f} ms")
+    print(f"  wall per-token   : {wall_ms / total_tokens:.4f} ms/token\n")
 
     print("Per-layer (DECODE, total over all tokens):")
     print(f"  attn_compute_ms_total  : {attn_ms_total:.3f}")
@@ -193,7 +198,19 @@ def run_decode(block: EncoderBlock,
     print(f"  kv_fetch_ms_total      : {kv_ms_total:.3f}")
     print(f"  total_forward_ms_total : {total_ms_total:.3f}")
 
-    total_tokens = decode_len * batch_size  # 实际生成的 token 数
+    print("\nPer-step (DECODE, averaged over all steps):")
+    print(f"  attn_compute_ms_per_step : {attn_ms_total / decode_len:.4f}")
+    print(f"  ffn_compute_ms_per_step  : {ffn_ms_total / decode_len:.4f}")
+    print(f"  kv_fetch_ms_per_step     : {kv_ms_total / decode_len:.4f}")
+    print(f"  total_forward_ms_per_step: {total_ms_total / decode_len:.4f}")
+
+    print(f"\nPer-token (DECODE, total {total_tokens} tokens = {decode_len} steps × {batch_size} batch):")
+    print(f"  attn_compute_ms_per_tok : {attn_ms_total / total_tokens:.4f}")
+    print(f"  ffn_compute_ms_per_tok  : {ffn_ms_total / total_tokens:.4f}")
+    print(f"  kv_fetch_ms_per_tok     : {kv_ms_total / total_tokens:.4f}")
+    print(f"  total_forward_ms_per_tok: {total_ms_total / total_tokens:.4f}")
+    print(f"  throughput (tokens/sec) : {total_tokens / (wall_ms / 1000.0):.2f}")
+
 
     print("\nPer-step (DECODE, averaged over all steps):")
     print(f"  attn_compute_ms_per_step : {attn_ms_total / decode_len:.4f}")

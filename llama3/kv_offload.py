@@ -616,27 +616,65 @@ class KVOffloader:
 
     # ---------------- 公共 API ----------------
 
-    def push(self, layer: int, blk: int, k: torch.Tensor, v: torch.Tensor,
-             token_idx: int, batch_idx: int = 0, **kwargs):
+    # ---------------- 公共 API ----------------
+
+    def push(
+        self,
+        layer: int,
+        blk: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        token_idx: int,
+        batch_idx: int = 0,
+        batch_offset: int = 0,
+        **kwargs,
+    ):
         """
         把单个 token 的 K/V 从 GPU 复制到 pinned CPU（增量写），并可异步镜像到 SSD。
+
+        参数：
+            layer, blk : 第几层 / 第几个 block
+            k, v       : (bsz, n_heads, head_dim)
+            token_idx  : 这是第几个 token（用于定位到 block 内的 t_in_blk）
+            batch_idx  : 统计用（importance / tracker），不影响实际存放位置
+            batch_offset:
+                - 默认 0：兼容原来的行为，写到 [0:bsz]
+                - 非 0：写到 [batch_offset : batch_offset + bsz]，用于 batch micro-batch
         """
         assert k.dim() == 3 and v.dim() == 3, "KV must be (bsz, heads, dim)"
         bsz = int(k.size(0))
+        if bsz == 0:
+            return
+
+        # 防御：确保不会越界
+        if batch_offset < 0 or batch_offset + bsz > self.max_batch:
+            raise ValueError(
+                f"[KV.push] invalid batch_offset={batch_offset}, "
+                f"bsz={bsz}, max_batch={self.max_batch}"
+            )
+
         t_in_blk = int(token_idx) % BLOCK
 
-        self._alloc_block(layer, blk)
+        # self._alloc_block(layer, blk)
         lock = self._blk_locks[layer][blk]
         with lock:
+            
+            self._alloc_block(layer, blk)
+            
             stream = self.d2h_stream or torch.cuda.current_stream()
             with torch.cuda.stream(stream):
-                self.k_cpu[layer][blk][:bsz, :, t_in_blk, :].copy_(k, non_blocking=True)
-                self.v_cpu[layer][blk][:bsz, :, t_in_blk, :].copy_(v, non_blocking=True)
-            d2h_evt = torch.cuda.Event(blocking=False); d2h_evt.record(stream)
+                # ✅ micro-batch: 写入 [batch_offset : batch_offset+bsz]
+                dst_k = self.k_cpu[layer][blk][batch_offset:batch_offset + bsz, :, t_in_blk, :]
+                dst_v = self.v_cpu[layer][blk][batch_offset:batch_offset + bsz, :, t_in_blk, :]
+                dst_k.copy_(k, non_blocking=True)
+                dst_v.copy_(v, non_blocking=True)
+
+            d2h_evt = torch.cuda.Event(blocking=False)
+            d2h_evt.record(stream)
             self._last_d2h_evt[(layer, blk)] = d2h_evt
 
-        # 重要性/统计
-        bi = min(batch_idx, self.max_batch-1)
+        # 重要性/统计（这里 batch_idx 只是“代表”这个 block 用在谁身上，用一个就行）
+        bi = min(batch_idx, self.max_batch - 1)
         self.importance[bi, layer, blk] = max(self.importance[bi, layer, blk], 1e-6)
         self.global_importance[layer, blk] = max(self.global_importance[layer, blk], 1e-6)
         if self.global_tracker:
@@ -645,13 +683,14 @@ class KVOffloader:
 
         self._maybe_evict()
 
-        # 可选镜像到 SSD：投递到打包线程（由打包线程等待 d2h 事件）
+        # 镜像到 SSD 的部分保持不变（在 _alloc_block / _maybe_evict 之后）
         if self.ssd is not None and getattr(KVCacheArgs, "mirror_on_push", True):
             try:
                 self._pack_queue.put_nowait((layer, blk, d2h_evt))
             except Full:
                 if getattr(KVCacheArgs, "verbose_pool", False):
                     print(f"[KV][WARN] drop mirror (pack queue full) @L{layer} B{blk}")
+
 
     def eager_spill_layer(self, layer: int, upto_token: int, async_write: bool = True, include_partial: bool = True):
         end_blk = (int(upto_token) - 1) // BLOCK if upto_token > 0 else -1
@@ -753,37 +792,92 @@ class KVOffloader:
             return k_cur, v_cur
         return k_cur, v_cur
 
-    def fetch(self, layer: int, blocks: Union[List[int], torch.Tensor],
-              batch_idx: int = 0, bsz: Optional[int] = None, stream=None):
+    def fetch(
+        self,
+        layer: int,
+        blocks: Union[List[int], torch.Tensor],
+        batch_idx: int = 0,
+        bsz: Optional[int] = None,
+        stream=None,
+        batch_offset: int = 0,
+    ):
+        """
+        从 KV 缓存中取出指定 blocks，对应当前 batch 的一段样本。
+
+        参数：
+            layer   : 第几层
+            blocks  : block 列表（或 tensor）
+            batch_idx : 统计用，不影响数据
+            bsz     : 这次要取的 batch 大小（micro-batch 大小）
+            stream  : 计算流
+            batch_offset:
+                - 0（默认）：兼容旧逻辑，相当于取 [0:bsz]
+                - 非 0：只取全局 batch 维度的 [batch_offset : batch_offset+bsz]
+        返回：
+            k_full, v_full : (bsz, n_heads, Tk, head_dim)
+        """
         # blocks 规格化
         if isinstance(blocks, (list, tuple)):
             uniq = sorted(set(int(b) for b in blocks))
         else:
             uniq = blocks.to(torch.long).unique(sorted=True).tolist()
 
+        if not uniq:
+            raise ValueError("[KV.fetch] empty blocks")
+
         use_bsz = int(bsz) if bsz is not None else self.max_batch
+        if use_bsz <= 0:
+            raise ValueError(f"[KV.fetch] invalid bsz={bsz}")
+
+        # 防御：确保不会越界
+        if batch_offset < 0 or batch_offset + use_bsz > self.max_batch:
+            raise ValueError(
+                f"[KV.fetch] invalid batch_offset={batch_offset}, "
+                f"bsz={use_bsz}, max_batch={self.max_batch}"
+            )
+
         shape = (use_bsz, self.heads, BLOCK, self.dim)
+
+        # micro-mode：表示我们在做 batch 方向的 micro-batch，
+        # 不再复用 gpu_k/gpu_v 缓存，也不走 prefetch_map 的"整组"快路径。
+        micro_mode = (batch_offset != 0)
 
         # ---- KV cache 统计：本次 fetch 请求的 block 数（按 uniq 计）----
         num_blocks = len(uniq)
         self._fetch_blocks_total += num_blocks
 
-        # -------- 1) 全 GPU 快路径 --------
-        all_gpu = True
-        for b in uniq:
-            with self._blk_locks[layer][b]:
-                kg = self.gpu_k[layer][b]; vg = self.gpu_v[layer][b]
-                evt = self._blk_ready_evt.get((layer, b))
-            if (kg is None) or (vg is None) or kg.device.type != "cuda" or tuple(kg.shape) != shape:
-                all_gpu = False
-                break
-        if all_gpu:
-            return self._gather_from_gpu_cache_strict(layer, uniq, use_bsz, stream=stream)
+        # -------- 1) 全 GPU 快路径（只在非 micro_mode 下启用） --------
+        if not micro_mode:
+            all_gpu = True
+            for b in uniq:
+                with self._blk_locks[layer][b]:
+                    kg = self.gpu_k[layer][b]
+                    vg = self.gpu_v[layer][b]
+                    evt = self._blk_ready_evt.get((layer, b))
+                if (
+                    kg is None
+                    or vg is None
+                    or kg.device.type != "cuda"
+                    or tuple(kg.shape) != shape
+                ):
+                    all_gpu = False
+                    break
+            if all_gpu:
+                return self._gather_from_gpu_cache_strict(
+                    layer, uniq, use_bsz, stream=stream
+                )
 
-        # -------- 2) 预取组命中（整组在 GPU 上） --------
-        dev = self.device if isinstance(self.device, (str, torch.device)) else torch.device(self.device)
-        with self._prefetch_lock:
-            rec = self._prefetch_map.get((int(layer), tuple(uniq), int(use_bsz)))
+        # -------- 2) 预取组命中（整组在 GPU 上，仅非 micro_mode 时使用） --------
+        dev = (
+            self.device
+            if isinstance(self.device, (str, torch.device))
+            else torch.device(self.device)
+        )
+        rec = None
+        if not micro_mode:
+            with self._prefetch_lock:
+                rec = self._prefetch_map.get((int(layer), tuple(uniq), int(use_bsz)))
+
         if rec is not None:
             evt_group = rec.get("evt")
             k_list = rec.get("k") or []
@@ -803,42 +897,78 @@ class KVOffloader:
                     v_full = v_full.to(dev, non_blocking=True)
                 return k_full, v_full
 
-        # -------- 3) SSD→DRAM（仅对缺失块） + DRAM→HBM --------
+        # -------- 3) SSD→DRAM：只对缺失块进行同步加载 --------
         need_load = []
         for b in uniq:
             with self._blk_locks[layer][b]:
                 if self.k_cpu[layer][b] is None or self.v_cpu[layer][b] is None:
                     need_load.append(b)
 
-        # 统计：这次 fetch 中有多少 block 在 CPU 里缺失，需要同步从 SSD 读取
         if need_load:
             self._fetch_miss_blocks += len(need_load)
+            for b in need_load:
+                self._load_from_ssd(layer, b)
 
-        for b in need_load:
-            self._load_from_ssd(layer, b)
-
-        # 2) DRAM→HBM：逐块拷贝并记录事件
+        # -------- 4) DRAM→HBM：根据 micro_mode 走两套逻辑 --------
         h2d_stream = stream or self.h2d_stream or torch.cuda.current_stream()
         k_parts, v_parts = [], []
+
         with torch.cuda.stream(h2d_stream):
             for b in uniq:
                 with self._blk_locks[layer][b]:
-                    kg = self.gpu_k[layer][b]; vg = self.gpu_v[layer][b]
-                    if kg is not None and vg is not None and tuple(kg.shape) == shape:
-                        # 仍需等上次 H2D 的完成事件
-                        evt = self._blk_ready_evt.get((layer, b))
-                        if evt is not None:
-                            (stream or torch.cuda.current_stream()).wait_event(evt)
-                        k_parts.append(kg[:use_bsz]); v_parts.append(vg[:use_bsz])
+                    kc_full = self.k_cpu[layer][b]
+                    vc_full = self.v_cpu[layer][b]
+                    if kc_full is None or vc_full is None:
+                        raise RuntimeError(f"[KV] L{layer} B{b} missing in DRAM")
+
+                    if micro_mode:
+                        # ---------- micro-batch：不复用缓存，按 offset 切片 ----------
+                        kc = kc_full[batch_offset:batch_offset + use_bsz]
+                        vc = vc_full[batch_offset:batch_offset + use_bsz]
+
+                        kg = torch.empty(shape, dtype=kc.dtype, device=self.device)
+                        vg = torch.empty(shape, dtype=vc.dtype, device=self.device)
+                        kg.copy_(kc, non_blocking=True)
+                        vg.copy_(vc, non_blocking=True)
+                        # 这里不写入 self.gpu_k/self.gpu_v，不记录 _blk_ready_evt
+                        k_parts.append(kg)
+                        v_parts.append(vg)
                     else:
-                        kc = self.k_cpu[layer][b][:use_bsz]; vc = self.v_cpu[layer][b][:use_bsz]
-                        self.gpu_k[layer][b] = torch.empty(shape, dtype=kc.dtype, device=self.device)
-                        self.gpu_v[layer][b] = torch.empty(shape, dtype=vc.dtype, device=self.device)
-                        kg = self.gpu_k[layer][b]; vg = self.gpu_v[layer][b]
-                        kg.copy_(kc, non_blocking=True); vg.copy_(vc, non_blocking=True)
-                        evt_b = torch.cuda.Event(blocking=False); evt_b.record(h2d_stream)
-                        self._blk_ready_evt[(layer, b)] = evt_b
-                        k_parts.append(kg); v_parts.append(vg)
+                        # ---------- 旧逻辑：可以复用 per-block GPU 缓存 ----------
+                        kg = self.gpu_k[layer][b]
+                        vg = self.gpu_v[layer][b]
+                        if (
+                            kg is not None
+                            and vg is not None
+                            and tuple(kg.shape) == shape
+                            and kg.device.type == "cuda"
+                        ):
+                            # 已经在 GPU 上，等 per-block 事件
+                            evt = self._blk_ready_evt.get((layer, b))
+                            if evt is not None:
+                                (stream or torch.cuda.current_stream()).wait_event(evt)
+                            k_parts.append(kg[:use_bsz])
+                            v_parts.append(vg[:use_bsz])
+                        else:
+                            kc = kc_full[:use_bsz]
+                            vc = vc_full[:use_bsz]
+                            self.gpu_k[layer][b] = torch.empty(
+                                shape, dtype=kc.dtype, device=self.device
+                            )
+                            self.gpu_v[layer][b] = torch.empty(
+                                shape, dtype=vc.dtype, device=self.device
+                            )
+                            kg = self.gpu_k[layer][b]
+                            vg = self.gpu_v[layer][b]
+                            kg.copy_(kc, non_blocking=True)
+                            vg.copy_(vc, non_blocking=True)
+
+                            evt_b = torch.cuda.Event(blocking=False)
+                            evt_b.record(h2d_stream)
+                            self._blk_ready_evt[(layer, b)] = evt_b
+
+                            k_parts.append(kg)
+                            v_parts.append(vg)
 
         current = stream or torch.cuda.current_stream()
         if h2d_stream is not current:
@@ -851,6 +981,7 @@ class KVOffloader:
         if v_full.device.type != "cuda":
             v_full = v_full.to(self.device, non_blocking=True)
         return k_full, v_full
+
 
     # ---- 仅从 GPU 缓存拼接（严格语义） ----
     def _gather_from_gpu_cache_strict(self, layer: int, blocks: List[int], bsz: int, stream=None):
@@ -895,6 +1026,8 @@ class KVOffloader:
             with torch.cuda.stream(s):
                 for b in uniq:
                     with self._blk_locks[layer][b]:
+                        if self.k_cpu[layer][b] is None or self.v_cpu[layer][b] is None and self.on_ssd[layer][b]:
+                            self._load_from_ssd(layer, b)
                         kc = self.k_cpu[layer][b]; vc = self.v_cpu[layer][b]
                         if kc is None or vc is None:
                             raise RuntimeError(f"[KV] block {b} missing in DRAM")
@@ -955,13 +1088,17 @@ class KVOffloader:
         return list(range(blk_lo, blk_hi + 1))
 
     def prefetch_for_next_layer(self, *, current_layer: int, start_pos: int, seqlen: int,
-                                bsz: int, window_tokens: int = BLOCK):
+                                bsz: int, window_tokens: int = BLOCK, is_decode: bool = False):
         nxt = int(current_layer) + 1
         if nxt >= self.layers:
             return
-        blocks = self.plan_tail_window_blocks(start_pos, seqlen, window_tokens)
-        if blocks:
-            self.prefetch_async(layer=nxt, blocks=blocks, bsz=bsz, device=self.device)
+
+        if is_decode:
+            # 真正 decode：预取尾部窗口
+            blocks = self.plan_tail_window_blocks(start_pos, seqlen, window_tokens)
+            if blocks:
+                self.prefetch_async(layer=nxt, blocks=blocks, bsz=bsz, device=self.device)
+        # else:  prefill/chunk-prefill 不做 KV 预取，避免和 push/写盘的状态打架
 
     # ------------- importance 统计（原样） -------------
     def update_importances(self, layer: int, block_indices: List[int], block_scores: List[float],

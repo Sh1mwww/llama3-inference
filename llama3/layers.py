@@ -33,6 +33,9 @@ from concurrent.futures import ThreadPoolExecutor
 _EXECUTOR_SINGLETON = None
 _EXECUTOR_LOCK = threading.Lock()
 
+ATTN_MICRO_B = int(os.getenv("ATTN_MICRO_B", "0") or 0)
+
+
 def _get_executor():
     """
     获取全局线程池单例，用于 forward_async 的异步收尾。
@@ -70,40 +73,78 @@ def make_stub_linear(in_features, out_features, bias=False, dtype=torch.bfloat16
         linear.bias = stub_bias
 
     return linear
+
 # ---------- Enhanced timing util ----------
 class PerformanceTracker:
     def __init__(self):
+        # 全局累计（保持原来的字段，避免 break 现有逻辑）
         self.stats = {
             "weights_hbm_us": 0,
-            "kv_fetch_us": 0, 
+            "kv_fetch_us": 0,
             "attn_us": 0,
             "ffn_us": 0,
             "total_forward_us": 0,
             "memory_alloc_us": 0,
         }
-        self.layer_stats = {}  # per-layer statistics
+        # 每层累计（跨整个 run）
+        # layer_stats[layer_id][stat_name] = us
+        self.layer_stats: Dict[int, Dict[str, float]] = {}
+
+        # 新增：按 phase + step + layer 的细粒度统计
+        # step_stats[phase]["prefill"/"decode"][step_idx][layer_id][stat_name] = us
+        # 目前我们只会在 decoder 里设置 step_idx
+        self.step_stats: Dict[str, Dict[int, Dict[int, Dict[str, float]]]] = {}
+
+        # 当前 forward 调用的上下文（由 InferenceProfiler 设置）
+        self.current_phase: Optional[str] = None  # "prefill" / "decode" / None
+        self.current_step: Optional[int] = None   # decode token idx，prefill 时为 None
+
         self.lock = threading.Lock()
-    
+
     def reset(self):
         with self.lock:
             for key in self.stats:
                 self.stats[key] = 0
             self.layer_stats.clear()
-    
+            self.step_stats.clear()
+            self.current_phase = None
+            self.current_step = None
+
     def get_stats(self) -> Dict:
         with self.lock:
+            # 返回 shallow copy，避免外面修改内部 dict
             return {
                 "global": self.stats.copy(),
-                "per_layer": self.layer_stats.copy()
+                "per_layer": {lid: stats.copy() for lid, stats in self.layer_stats.items()},
+                "per_step": {
+                    phase: {
+                        step: {lid: s.copy() for lid, s in per_layer.items()}
+                        for step, per_layer in steps.items()
+                    }
+                    for phase, steps in self.step_stats.items()
+                },
             }
-    
+
     def add_layer_stat(self, layer_id: int, stat_name: str, value: float):
+        # 这个接口保持不动，给别的地方补充统计用
         with self.lock:
             if layer_id not in self.layer_stats:
                 self.layer_stats[layer_id] = {}
             if stat_name not in self.layer_stats[layer_id]:
-                self.layer_stats[layer_id][stat_name] = 0
-            self.layer_stats[layer_id][stat_name] += value
+                self.layer_stats[layer_id][stat_name] = 0.0
+            self.layer_stats[layer_id][stat_name] += float(value)
+
+    def set_step_context(self, phase: Optional[str], step_idx: Optional[int]):
+        """
+        由 InferenceProfiler.wrap_model_forward 在每次 model.forward 入口/出口调用。
+
+        phase: "prefill" / "decode" / None
+        step_idx: decode 的 token index（0-based），prefill/非 decode 时为 None
+        """
+        with self.lock:
+            self.current_phase = phase
+            self.current_step = step_idx
+
 
 PERF_TRACKER = PerformanceTracker()
 
@@ -112,7 +153,7 @@ PROFILE = os.getenv("LLM_PROFILE", "0") == "1"
 
 @contextmanager
 def cuda_timer(key: str, layer_id: Optional[int] = None):
-    # No-op when profiling is disabled (避免任何同步开销)
+    # No-op when profiling is disabled（避免任何同步开销）
     if not PROFILE:
         yield
         return
@@ -139,7 +180,7 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
 
         start_event.record()
         yield
-        
+
     except torch.cuda.OutOfMemoryError as e:
         logger.error(f"CUDA OOM in timer for {key}: {e}")
         cuda_error_occurred = True
@@ -159,25 +200,40 @@ def cuda_timer(key: str, layer_id: Optional[int] = None):
             try:
                 # Check if CUDA context is still valid
                 torch.cuda.current_device()
-                
+
                 end_event.record()
-                # 只同步当前流的事件，避免全局阻塞其它流（尤其是H2D）
+                # 只同步当前流的事件，避免全局阻塞其它流（尤其是 H2D）
                 end_event.synchronize()
 
                 elapsed_us = int(start_event.elapsed_time(end_event) * 1000)
 
                 with PERF_TRACKER.lock:
+                    # 1) 全局统计（保持原来的逻辑）
+                    if key not in PERF_TRACKER.stats:
+                        PERF_TRACKER.stats[key] = 0
                     PERF_TRACKER.stats[key] += elapsed_us
+
+                    # 2) 每层累计（保持原来的逻辑）
                     if layer_id is not None:
-                        # 直接更新，避免嵌套锁
                         if layer_id not in PERF_TRACKER.layer_stats:
                             PERF_TRACKER.layer_stats[layer_id] = {}
                         if key not in PERF_TRACKER.layer_stats[layer_id]:
                             PERF_TRACKER.layer_stats[layer_id][key] = 0
                         PERF_TRACKER.layer_stats[layer_id][key] += elapsed_us
+
+                        # 3) 新增：按 phase + step 细分（只在 current_phase/current_step 有值时记录）
+                        phase = PERF_TRACKER.current_phase
+                        step_idx = PERF_TRACKER.current_step
+                        if phase is not None and step_idx is not None:
+                            phase_dict = PERF_TRACKER.step_stats.setdefault(phase, {})
+                            step_dict = phase_dict.setdefault(int(step_idx), {})
+                            layer_dict = step_dict.setdefault(int(layer_id), {})
+                            layer_dict[key] = layer_dict.get(key, 0.0) + float(elapsed_us)
+
             except Exception as e:
                 logger.warning(f"Error in cuda_timer cleanup for {key}: {e}")
-                # Don't re-raise exceptions in cleanup
+                # 不要在清理阶段再抛异常
+
 
 def set_weight_manager(manager):
     global WEIGHT_MANAGER
@@ -291,14 +347,31 @@ def apply_rotary_embeddings(x: torch.Tensor,
 
     # ---- 设备与 dtype 对齐 ----
     # x_被转为 float 做复数视图，最终再转换回 x.dtype
-    x_ = x.to(torch.float32).reshape(B, Lx, H, D // 2, 2)       # (B,L,H,D/2,2)
-    x_complex = torch.view_as_complex(x_)                       # (B,L,H,D/2)
-    fc = fc.to(dtype=x_complex.dtype, device=x.device)          # (Lx,D/2)
-
-    # ---- 广播到 (1,Lx,1,D/2) 与 x_complex 相乘 ----
+    fc = fc.to(dtype=torch.complex64, device=x.device)          # (Lx,D/2)
     fc = fc.unsqueeze(0).unsqueeze(2)                           # (1,Lx,1,D/2)
-    out = torch.view_as_real(x_complex * fc)                    # (B,L,H,D/2,2)
-    out = out.reshape(B, Lx, H, D).to(dtype=x.dtype)
+
+    # ---- 分块处理以节省内存 ----
+    # 当 batch size 大时，分块处理避免峰值内存过高
+    chunk_size = 16  # 每次处理16个batch
+    if B <= chunk_size:
+        # 小batch直接处理
+        x_ = x.to(torch.float32).reshape(B, Lx, H, D // 2, 2)       # (B,L,H,D/2,2)
+        x_complex = torch.view_as_complex(x_)                       # (B,L,H,D/2)
+        out = torch.view_as_real(x_complex * fc)                    # (B,L,H,D/2,2)
+        out = out.reshape(B, Lx, H, D).to(dtype=x.dtype)
+    else:
+        # 大batch分块处理
+        out_chunks = []
+        for i in range(0, B, chunk_size):
+            end_i = min(i + chunk_size, B)
+            x_chunk = x[i:end_i]                                    # (chunk,L,H,D)
+            x_chunk_ = x_chunk.to(torch.float32).reshape(end_i - i, Lx, H, D // 2, 2)
+            x_chunk_complex = torch.view_as_complex(x_chunk_)
+            out_chunk = torch.view_as_real(x_chunk_complex * fc)
+            out_chunk = out_chunk.reshape(end_i - i, Lx, H, D).to(dtype=x.dtype)
+            out_chunks.append(out_chunk)
+        out = torch.cat(out_chunks, dim=0)
+
     return out
 
 
@@ -370,6 +443,8 @@ class SelfAttention(nn.Module):
             dtype_bytes=2,  # float16
             streams=streams
         )
+        
+        self.attn_micro_batch = ATTN_MICRO_B
         
         self.layer_id = -1
         self.attention_history = []  # 用于分析注意力模式
@@ -475,53 +550,57 @@ class SelfAttention(nn.Module):
                 f"L{self.layer_id}.wq still stub after _ensure_weights_cuda()"
 
 
-    def _kv_gather_after_prefetch(self, blocks, bsz: int, stream=None):
+    def _kv_gather_after_prefetch(
+        self,
+        blocks,
+        bsz: int,
+        stream: Optional[torch.cuda.Stream] = None,
+        window_tokens: Optional[int] = None,
+        batch_offset: int = 0,
+    ):
         """
-        安全版 KV gather：
-        1) 在 kv_h2d 流上异步预取当前层所需 blocks（如果已经预取过，这步是 no-op）
-        2) 在 compute 流上为这些 blocks 挂接已有的 per-block ready 事件（非阻塞 CPU）
-        3) 调用 offloader.fetch()：
-           - 若所有块已在 GPU，直接 zero-copy 拼接
-           - 否则由 fetch 内部按需触发 DRAM→HBM，仍使用事件保证正确性
-        返回: (k_full, v_full)，形状与旧实现相同
+        在完成 prefetch 之后，从 KVOffloader 把指定 blocks 的 K/V 拉回到 GPU。
+
+        Args:
+            blocks: 需要拉取的 block indices（list[int]）
+            bsz: 本次要用的 batch 大小（micro-batch 大小）
+            stream: 用于 H2D 的 CUDA stream
+            window_tokens: 如果不为 None，则只保留最后 window_tokens 个 token
+            batch_offset: 在 KVOffloader 里写入/读取的 batch 偏移
+                          也就是这次 micro-batch 对应全局 batch 里的起始行号
         """
-        import torch
+        if getattr(self, "offloader", None) is None:
+            raise RuntimeError("SelfAttention._kv_gather_after_prefetch called without offloader")
 
-        off = getattr(self, "offloader", None)
-        if off is None:
-            raise RuntimeError("SelfAttention.offloader is not set")
+        if stream is None and torch.cuda.is_available():
+            streams = getattr(self, "streams", None)
+            stream = getattr(streams, "kv_h2d", None) or torch.cuda.current_stream()
 
-        # 选用专用的 kv_h2d stream（如无则回退当前流）
-        kv_stream = stream or getattr(getattr(self, "streams", None), "kv_h2d", None)
+        # 规范化 blocks，去重排序
+        blocks_t = torch.as_tensor(blocks, dtype=torch.long, device=self.device)
+        uniq_blocks = blocks_t.unique(sorted=True)
 
-        # 统一为 Python int 列表
-        if not isinstance(blocks, (list, tuple)):
-            blocks = [int(blocks)]
-        blocks = [int(b) for b in blocks]
+        # 等待这些 block 的 H2D 事件完成（如果 prefetch 时已经设置）
+        self.offloader.wait_blocks_ready(self.layer_id, uniq_blocks.tolist(), stream=stream)
 
-        if not blocks:
-            raise ValueError("_kv_gather_after_prefetch: empty blocks")
+        # 从 offloader.fetch 拉到 GPU 上
+        with torch.cuda.stream(stream):
+            k_full, v_full = self.offloader.fetch(
+                layer=self.layer_id,
+                blocks=uniq_blocks,
+                batch_idx=0,
+                bsz=bsz,
+                stream=stream,
+                batch_offset=batch_offset,   # ⭐ 关键：带上 batch_offset
+            )
 
-        # 1) 提交预取（异步）：SSD→DRAM→HBM 在线程池 + kv_h2d 流中执行
-        if hasattr(off, "prefetch_blocks_async"):
-            try:
-                off.prefetch_blocks_async(self.layer_id, blocks, bsz=bsz, stream=kv_stream)
-            except Exception as e:
-                if os.getenv("KV_VERBOSE", "0") == "1":
-                    print(f"[KV][L{self.layer_id}] prefetch_blocks_async failed: {e}")
+        # 可选窗口裁剪：仅 decode 使用
+        if window_tokens is not None:
+            kv_len = k_full.size(2)
+            if kv_len > window_tokens:
+                k_full = k_full[..., -window_tokens:, :].contiguous()
+                v_full = v_full[..., -window_tokens:, :].contiguous()
 
-        # 2) 在 compute 流上挂接已有的 per-block ready 事件（不阻塞 CPU）
-        compute_stream = getattr(self.streams, "compute_mha", None)
-        s = compute_stream or torch.cuda.current_stream()
-        if hasattr(off, "wait_blocks_ready"):
-            try:
-                off.wait_blocks_ready(self.layer_id, blocks, stream=s)
-            except Exception as e:
-                if os.getenv("KV_VERBOSE", "0") == "1":
-                    print(f"[KV][L{self.layer_id}] wait_blocks_ready failed: {e}")
-
-        # 3) fetch：优先走全 GPU 快路径；必要时从 DRAM 拉补到 HBM
-        k_full, v_full = off.fetch(self.layer_id, blocks, bsz=bsz, stream=s)
         return k_full, v_full
 
 
@@ -576,8 +655,180 @@ class SelfAttention(nn.Module):
                     logger.error(f"GPU OOM during buffer allocation: batch={batch_size}, seq={seq_len}")
                     torch.cuda.empty_cache()
                     raise RuntimeError(f"GPU OOM: Cannot allocate attention buffers. Try reducing batch_size (current: {batch_size}) or max sequence length.") from e
+
+    def forward_with_microbatch(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_complex: torch.Tensor,
+        kv_cache=None,
+        mask=None,
+        batch_idx: int = 0,
+    ) -> torch.Tensor:
+        bsz = x.size(0)
+        micro_b = int(getattr(self, "attn_micro_batch", 0) or 0)
+
+        if micro_b <= 0 or micro_b >= bsz:
+            return self.forward(
+                x,
+                start_pos,
+                freqs_complex,
+                kv_cache=kv_cache,
+                mask=mask,
+                batch_idx=batch_idx,
+                batch_offset=0,
+            )
+
+        out = torch.empty_like(x)
+        offset = 0
+        while offset < bsz:
+            end = min(bsz, offset + micro_b)
+            x_chunk = x[offset:end]
+
+            out_chunk = self.forward(
+                x_chunk,
+                start_pos,
+                freqs_complex,
+                kv_cache=kv_cache,
+                mask=mask,
+                batch_idx=batch_idx,
+                batch_offset=offset,  
+            )
+            out[offset:end] = out_chunk
+            offset = end
+
+        return out
+
+
     
-    def forward(self, x: torch.Tensor, start_pos: int, freqs_complex: torch.Tensor) -> torch.Tensor:
+    # def _forward_prefill_micro_batch(
+    #     self,
+    #     x: torch.Tensor,
+    #     start_pos: int,
+    #     freqs_complex: torch.Tensor,
+    #     micro_b: int,
+    # ) -> torch.Tensor:
+    #     """
+    #     只在 prefill 阶段(start_pos == 0)使用的按 batch 维 micro-batch 的 attention 实现。
+    #     - 整个前向仍然算完 B 个样本的输出，
+    #     - 但每次只在 GPU 上放 micro_b 个样本的 Q/K/V 和 attention，
+    #       其余样本顺序串行，从而降低峰值显存。
+    #     - KV 缓存在计算完每个 micro-batch 时写入 offloader（使用 batch_offset）。
+    #     """
+    #     assert start_pos == 0, "_forward_prefill_micro_batch 只用于 prefill"
+
+    #     import torch.nn.functional as F
+    #     from .global_state_tracker import get_global_tracker
+
+    #     device = x.device
+    #     dtype = x.dtype
+    #     B, T, _ = x.shape
+
+    #     if B <= micro_b:
+    #         # B 本身就不大，没必要走这个分支
+    #         raise RuntimeError("micro_b >= batch_size, 不应该进 _forward_prefill_micro_batch")
+
+    #     offloader = getattr(self, "offloader", None)
+    #     if offloader is None:
+    #         raise RuntimeError("需要 KVOffloader 才有意义（要把 prefill 的 KV 存起来）")
+
+    #     # 当前“批次 id”用于 global tracker 统计（不是 batch 维索引）
+    #     tracker = get_global_tracker()
+    #     if tracker:
+    #         batch_idx = tracker.current_batch
+    #     else:
+    #         batch_idx = 0
+
+    #     # 确保本层 attn 权重已经在 CUDA 上（走你原来封装好的逻辑）
+    #     self._ensure_weights_cuda()
+
+    #     # 结果缓冲区：最终返回 [B, T, dim]
+    #     out = torch.empty(B, T, self.n_heads_q * self.head_dim, dtype=dtype, device=device)
+
+    #     # 是否使用 causal mask
+    #     is_causal = getattr(self, "apply_causal_mask", True)
+
+    #     # 为了用 Flash Attention，统一转成 (B, H, T, D)
+    #     def _repeat_kv_for_q_heads(k_or_v: torch.Tensor) -> torch.Tensor:
+    #         # k_or_v: [mb, T, n_kv_heads, head_dim]
+    #         k_or_v = k_or_v.transpose(1, 2).contiguous()  # [mb, n_kv_heads, T, D]
+    #         if self.n_rep != 1:
+    #             # 重复 KV head 到 Q head
+    #             k_or_v = k_or_v.repeat_interleave(self.n_rep, dim=1)  # [mb, n_heads_q, T, D]
+    #         return k_or_v
+
+    #     # 主循环：沿 batch 维分块
+    #     for b0 in range(0, B, micro_b):
+    #         b1 = min(B, b0 + micro_b)
+    #         mb = b1 - b0
+    #         xb = x[b0:b1]                     # [mb, T, dim]
+
+    #         # -------- Q/K/V 投影 + RoPE（只在这一小块上）--------
+    #         # 注意：这里不再一次性对全 B 做 Q/K/V，从而避免大 tensor
+    #         q = self.wq(xb).view(mb, T, self.n_heads_q, self.head_dim)
+    #         k = self.wk(xb).view(mb, T, self.n_kv_heads, self.head_dim)
+    #         v = self.wv(xb).view(mb, T, self.n_kv_heads, self.head_dim)
+
+    #         # RoPE：仍然用你文件里已经优化过的 apply_rotary_embeddings（它内部有 B 维 chunk）
+    #         q = apply_rotary_embeddings(q, freqs_complex, start_pos=start_pos)
+    #         k = apply_rotary_embeddings(k, freqs_complex, start_pos=start_pos)
+
+    #         # -------- 把当前 micro-batch 的 KV 写入 offloader（用 batch_offset=b0）--------
+    #         # 这样每个样本的 KV 都被放在 [batch_offset : batch_offset+mb) 这一段，
+    #         # 整体 pinned KV 的 batch 维大小仍然是 max_batch（比如 64/128）
+    #         for t in range(T):
+    #             token_idx = start_pos + t
+    #             blk_idx   = token_idx // self.block_sz
+    #             offloader.push(
+    #                 layer=self.layer_id,
+    #                 blk=blk_idx,
+    #                 k=k[:, t, :, :],           # [mb, n_kv_heads, head_dim]
+    #                 v=v[:, t, :, :],
+    #                 token_idx=token_idx,
+    #                 batch_idx=batch_idx,       # 统计用
+    #                 batch_offset=b0,           # 关键：在 KV 中的 batch 偏移
+    #             )
+
+    #         # -------- 注意力计算（仅用当前 micro-batch 的 Q / K / V）--------
+    #         # 这里不从 offloader 取 KV，而是直接用刚算出的 k/v，
+    #         # 因为 prefill 阶段 K/V 就是当前层刚算出来的值
+    #         q_t = q.transpose(1, 2)                      # [mb, n_heads_q, T, D]
+    #         k_full = _repeat_kv_for_q_heads(k)           # [mb, n_heads_q, T, D]
+    #         v_full = _repeat_kv_for_q_heads(v)           # [mb, n_heads_q, T, D]
+
+    #         # Flash Attention（和你原来的实现保持一致）
+    #         from contextlib import nullcontext
+    #         try:
+    #             from torch.backends.cuda import sdp_kernel as sdpa_kernel
+    #             sdpa_ctx = sdpa_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True)
+    #         except Exception:
+    #             sdpa_ctx = nullcontext()
+
+    #         with sdpa_ctx:
+    #             attn_out = torch.nn.functional.scaled_dot_product_attention(
+    #                 q_t, k_full, v_full,
+    #                 attn_mask=None,
+    #                 dropout_p=0.0,
+    #                 is_causal=is_causal,
+    #             )  # [mb, n_heads_q, T, D]
+
+    #         # 回到 [mb, T, dim]
+    #         attn_out = attn_out.transpose(1, 2).contiguous().view(mb, T, self.n_heads_q * self.head_dim)
+    #         out[b0:b1] = self.wo(attn_out)
+
+    #     return out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_complex: torch.Tensor,
+        kv_cache=None,
+        mask=None,
+        batch_idx: int = 0,
+        batch_offset: int = 0,
+    ) -> torch.Tensor:
+
         # ============================================================
         # ⭐ 回绕通知 + 事件等待（彻底不兜底）
         # ============================================================
@@ -621,6 +872,20 @@ class SelfAttention(nn.Module):
 
         assert x.dim()==3, f"x dim={x.dim()}, shape={x.shape}"
         bsz, seqlen, _ = x.shape
+        
+        # micro_env = os.getenv("ATTN_MICRO_B", "0").strip()
+        # micro_b = int(micro_env) if micro_env.isdigit() else 0
+
+        # # 只在 prefill（start_pos==0）且 B > micro_b 时启用
+        # if start_pos == 0 and micro_b > 0 and micro_b < bsz:
+        #     return self._forward_prefill_micro_batch(
+        #         x=x,
+        #         start_pos=start_pos,
+        #         freqs_complex=freqs_complex,
+        #         micro_b=micro_b,
+        #     )
+        is_prefill = seqlen > 1
+        is_decode  = (seqlen == 1 and start_pos > 0)
 
 
         def _ensure_cpu_scalar_attr(mod, name: str):
@@ -709,10 +974,11 @@ class SelfAttention(nn.Module):
                 except Exception: pass
 
             # ⭐ 可选：等待 KV 块 ready 事件（如果有预取）
-            # 在 decode 阶段（start_pos > 0），等待本层所需的 KV 块 H2D 完成
-            if start_pos > 0 and self.offloader is not None and hasattr(self.offloader, "wait_blocks_ready"):
-                # 计算本层需要的块：最近窗口 tokens
-                blocks = self.offloader.plan_tail_window_blocks(start_pos, seqlen, window_tokens=BLOCK)
+            # 在 decode 阶段等待本层所需的 KV 块 H2D 完成
+            if is_decode and self.offloader is not None and hasattr(self.offloader, "wait_blocks_ready"):
+                # 计算本层需要的块：decode 时使用最近窗口 tokens
+                decode_window_tokens = int(os.getenv("KV_DECODE_WINDOW_TOKENS", str(getattr(self, "_win_tokens", 128))))
+                blocks = self.offloader.plan_tail_window_blocks(start_pos, seqlen, window_tokens=decode_window_tokens)
                 if blocks:
                     self.offloader.wait_blocks_ready(self.layer_id, blocks, stream=self.compute_stream)
 
@@ -731,16 +997,19 @@ class SelfAttention(nn.Module):
 
             # ⭐ KV prefetch (仅保留 KV offloading 相关的预取)
             try:
-                # --- KV：为"下一层注意力"预拉最近窗口的历史 KV 到 HBM（仅 decode 阶段） ---
-                # 注意：start_pos==0 为 prefill，此时下一层当前块可能尚不存在，故跳过
+                # --- KV：为"下一层注意力"预拉 KV 到 HBM ---
+                # decode: 预取窗口; prefill: 不预取（避免和 push/写盘打架）
                 if (start_pos > 0) and getattr(self, "offloader", None) is not None:
+                    decode_window_tokens = int(os.getenv("KV_DECODE_WINDOW_TOKENS", str(getattr(self, "_win_tokens", 128))))
                     # 该方法会：必要时先 SSD->DRAM，再在 kv_h2d 流发起 DRAM->HBM；并记录事件，fetch() 将命中
+                    # prefetch_for_next_layer 内部已经做了 is_decode 判断，只在 decode 时才预取
                     self.offloader.prefetch_for_next_layer(
                         current_layer=self.layer_id,
                         start_pos=int(start_pos),
                         seqlen=int(seqlen),
                         bsz=int(bsz),
-                        window_tokens=BLOCK,
+                        window_tokens=decode_window_tokens,
+                        is_decode=is_decode,
                     )
             except Exception as e:
                 # 非致命：任何预取异常都不影响主计算路径
@@ -853,11 +1122,10 @@ class SelfAttention(nn.Module):
                         v=v_curr,
                         token_idx=token_idx,
                         batch_idx=batch_idx,
+                        batch_offset=batch_offset, 
                     )
 
-                    # ⭐ 增量 H2D：在 decode 阶段（seqlen==1），立即把新 token 追加到 GPU 缓冲
-                    # 这样 fetch() 可以命中 GPU 快取，避免从 CPU 整块 .to()
-                    if start_pos > 0 and seqlen == 1:
+                    if is_decode:
                         self.offloader.append_token_to_gpu(
                             layer=self.layer_id,
                             blk=blk_idx,
@@ -880,54 +1148,56 @@ class SelfAttention(nn.Module):
                     fetch_evt_end = torch.cuda.Event(enable_timing=True)
                     fetch_evt_start.record()
 
-                if getattr(self, "offloader", None) is not None:
-                    # ⭐ 使用尾窗策略代替 Top-K
-                    # 配置窗口大小（默认使用环境变量，回退到 topk_blk 配置）
-                    # window_tokens = int(os.getenv("KV_DECODE_WINDOW_TOKENS", str(self.topk_blk * BLOCK)))
-                    # ⭐ 尾窗策略：首次进入 decode 时估一遍窗口；之后复用
-                    if start_pos > 0 and not hasattr(self, "_win_tokens"):
-                        # 显存预算（默认 40% 可调）：KV 每 token 字节 = bsz * heads_kv * dim * 2(dtypebytes) * 2(K+V)
-                        free_bytes, _ = torch.cuda.mem_get_info(x.device)
-                        frac = float(os.getenv("KV_DECODE_WINDOW_FRAC", "0.4"))
+                if getattr(self, "offloader", None) is not None and is_decode:
+                    # ⭐ 只在真正 decode 时才根据显存估算 window size 并 fetch KV
+                    if not hasattr(self, "_win_tokens"):
+                        # 显存预算（默认 20% 可调）：KV 每 token 字节 = bsz * heads_kv * dim * 2(dtypebytes) * 2(K+V)
+                        try:
+                            free_bytes, _ = torch.cuda.mem_get_info(x.device)
+                        except Exception:
+                            free_bytes = 2 * (1024 ** 3)  # 回退到 2GB
+
+                        frac = float(os.getenv("KV_DECODE_WINDOW_FRAC", "0.20"))
                         budget = int(free_bytes * max(0.1, min(frac, 0.9)))
                         dtype_bytes = getattr(self.offloader, "dtype_bytes", 2)
                         per_tok = int(bsz * self.n_kv_heads * self.head_dim * dtype_bytes * 2)
                         layers = int(getattr(self.offloader, "layers", 1))
-                        tokens = max(BLOCK, (budget // max(1, per_tok * layers)))
+                        tokens = max(128, min((budget // max(1, per_tok * layers)), 8192))
                         self._win_tokens = (tokens // BLOCK) * BLOCK
-                    window_tokens = int(os.getenv("KV_DECODE_WINDOW_TOKENS", str(getattr(self, "_win_tokens", 128))))
 
-                    # 计算尾窗覆盖的 blocks
+                        if os.getenv("DEBUG_KV_WINDOW", "0") == "1":
+                            print(
+                                f"[KV][L{self.layer_id}] Init decode window tokens = {self._win_tokens}, "
+                                f"free_bytes={free_bytes/1e9:.2f}GB, per_token≈{per_tok/1024:.1f}KB"
+                            )
+
+                    decode_window_tokens = int(os.getenv("KV_DECODE_WINDOW_TOKENS", str(getattr(self, "_win_tokens", 128))))
+
+                    # ✅ 真正 decode：只取尾部 window
                     blocks = self.offloader.plan_tail_window_blocks(
-                        start_pos=start_pos,
-                        seqlen=seqlen,
-                        window_tokens=window_tokens
+                            start_pos=start_pos,
+                            seqlen=seqlen,
+                            window_tokens=decode_window_tokens
+                        )
+
+                    # ⭐ 统一在 _kv_gather_after_prefetch 中处理窗口裁剪
+                    # 传入 window_tokens 让 fetch 逻辑直接返回裁剪好的 KV
+                    k_full, v_full = self._kv_gather_after_prefetch(
+                        blocks, bsz,
+                        window_tokens=decode_window_tokens,
+                        batch_offset=batch_offset,
                     )
-
-                    # 确保当前 block 一定在列表内（防御性编程）
-                    cur_blk = int((start_pos + seqlen - 1) // BLOCK)
-                    if cur_blk not in blocks:
-                        blocks.append(cur_blk)
-                        blocks = sorted(blocks)
-
-                    k_full, v_full = self._kv_gather_after_prefetch(blocks, bsz)
-                    want = int(os.getenv("KV_DECODE_WINDOW_TOKENS", "0") or 0)                    
-                    if start_pos > 0 and want > 0 and k_full.dim() == 4:
-                        # k_full/v_full: (B, H, T, D)
-                        T = k_full.size(2)
-                        if T > want:
-                            k_full = k_full[:, :, T - want:, :]
-                            v_full = v_full[:, :, T - want:, :]
                 else:
-                    # 无 offloader：直接使用当前序列窗口（转为 (B,H,T,D)）
+                    # prefill 或无 offloader：直接使用当前序列的 K/V（转为 (B,H,T,D)）
+                    # prefill 时不 fetch，避免和 push/写盘的状态打架
                     k_full = k.transpose(1, 2).contiguous()
                     v_full = v.transpose(1, 2).contiguous()
                     blocks = [blk_idx]  # 为后续 update_importances 提供 blocks 列表
 
                 if do_profile_gpu:
                     fetch_evt_end.record()
-                    if not fetch_evt_end.query():
-                        fetch_evt_end.synchronize()
+                    # if not fetch_evt_end.query():
+                    #     fetch_evt_end.synchronize()
                     self.kv_elapsed_time = fetch_evt_start.elapsed_time(fetch_evt_end) * 1000
                     PERF_TRACKER.add_layer_stat(self.layer_id, "kv_fetch_us", self.kv_elapsed_time)
                 else:
@@ -968,16 +1238,7 @@ class SelfAttention(nn.Module):
                     k_full = k_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
                     v_full = v_full.transpose(1, 2)  # (bsz, n_heads, seq_len, head_dim)
 
-            # === 仅在 decode 阶段进行“逻辑子块”裁剪（不改变物理 BLOCK）===
-            if start_pos > 0:
-                try:
-                    _win = int(os.getenv("KV_DECODE_WINDOW_TOKENS", "128"))
-                except Exception:
-                    _win = 0
-                if _win and k_full.size(2) > _win:
-                    Tk = k_full.size(2)
-                    k_full = k_full[:, :, Tk - _win : , :].contiguous()
-                    v_full = v_full[:, :, Tk - _win : , :].contiguous()
+            # ⭐ 窗口裁剪已统一在 _kv_gather_after_prefetch 中处理，此处不再重复裁剪
 
             # 确保k_full和v_full与q的batch维度一致
             if k_full.size(0) == 1 and bsz > 1:
@@ -1204,37 +1465,47 @@ class SelfAttention(nn.Module):
                 wm.notify_group_compute_done(self.layer_id, "attn", evt)
 
             # ============================================================
-            # 3.2) Eager KV Spill: 在 prefill 分支结束前，将本层生成的 KV 异步写入 SSD
-            # 在 prefill 阶段（start_pos==0），本层的 KV 已用于注意力计算，可立即下放到 SSD
+            # 3.2) Eager KV Spill: prefill 阶段（含 chunk prefill）将本层生成的 KV 异步写入 SSD
+            # chunk prefill 也会逐步推进 eager spill，保证 KV 会被及时写出到 SSD，不挤爆 CPU/GPU
             # ============================================================
-            if start_pos == 0 and getattr(self, "offloader", None) is not None and (os.getenv("KV_EAGER_SPILL", "1") != "0"):
-                # 把本层刚生成的 KV 覆盖到的 token 全部甩到 SSD
-                # upto_token = start_pos + seqlen 表示当前层已处理到的 token 位置
-                self.offloader.eager_spill_layer(
-                    self.layer_id,
-                    upto_token=start_pos + seqlen,
-                    async_write=True
-                )
+            if self.offloader is not None and os.getenv("KV_EAGER_SPILL", "1") != "0":
+                if is_prefill:
+                    try:
+                        # 把本层刚生成的 KV 覆盖到的 token 全部甩到 SSD
+                        # upto_token = start_pos + seqlen 表示当前层已处理到的 token 位置
+                        self.offloader.eager_spill_layer(
+                            self.layer_id,
+                            upto_token=start_pos + seqlen,
+                            async_write=True
+                        )
+                    except Exception as e:
+                        if os.getenv("DEBUG_KV_WINDOW", "0") == "1":
+                            print(f"[KV][WARN] eager_spill_layer failed at layer {self.layer_id}: {e}")
 
             # ============================================================
-            # 3.3) Decode 阶段边走边"落 SSD"：保持"尾窗"在 DRAM，其余立即下放
-            # 在 decode 阶段（start_pos > 0），每生成若干 token 就主动下放老 block
+            # 3.3) Decode 阶段的快速 eviction：维持 decode window
+            # 只在单 token decode 时做 window 内的 eviction，保持 tail window 大小稳定
             # ============================================================
-            if start_pos > 0 and getattr(self, "offloader", None) is not None:
-                # 每隔 N 个 token 调用一次（避免过于频繁；可配置）
-                spill_interval = int(os.getenv("KV_DECODE_SPILL_INTERVAL", "1024"))  # 默认每个 block 下放一次
-                current_token = start_pos + seqlen
+            if getattr(self, "offloader", None) is not None and os.getenv("KV_EAGER_DECODE_EVICT", "1") != "0":
+                if is_decode:
+                    try:
+                        # 每隔 N 个 token 调用一次（避免过于频繁；可配置）
+                        spill_interval = int(os.getenv("KV_DECODE_SPILL_INTERVAL", "1024"))
+                        current_token = start_pos + seqlen
 
-                # 简单策略：当 current_token 是 spill_interval 的倍数时触发下放
-                if current_token % spill_interval == 0:
-                    # 保留最近 1 个 block 在 DRAM，其余下放到 SSD
-                    keep_tail_blocks = int(os.getenv("KV_DECODE_KEEP_TAIL_BLOCKS", "2"))
-                    self.offloader.eager_spill_decode_window(
-                        upto_token=current_token,
-                        keep_tail_blocks=keep_tail_blocks,
-                        include_partial=False,  # 只下放完整块，避免反复写
-                        layers=[self.layer_id]  # 只下放当前层
-                    )
+                        # 简单策略：当 current_token 是 spill_interval 的倍数时触发下放
+                        if current_token % spill_interval == 0:
+                            # 保留最近 N 个 block 在 DRAM，其余下放到 SSD
+                            keep_tail_blocks = int(os.getenv("KV_DECODE_KEEP_TAIL_BLOCKS", "2"))
+                            self.offloader.eager_spill_decode_window(
+                                upto_token=current_token,
+                                keep_tail_blocks=keep_tail_blocks,
+                                include_partial=False,  # 只下放完整块，避免反复写
+                                layers=[self.layer_id]  # 只下放当前层
+                            )
+                    except Exception as e:
+                        if os.getenv("DEBUG_KV_WINDOW", "0") == "1":
+                            print(f"[KV][WARN] eager_spill_decode_window failed at layer {self.layer_id}: {e}")
 
             return result
         finally:
@@ -1329,7 +1600,7 @@ class FeedForward(nn.Module):
 
         # 没有 WSM 时直接执行计算
         if wm is None:
-            micro = int(os.getenv("FFN_MICRO_B", "0") or 8)
+            micro = int(os.getenv("FFN_MICRO_B") )
             bsz = int(x.size(0))
             with cuda_timer("ffn_us", self.layer_id):
                 if micro <= 0 or micro >= bsz:
@@ -1415,7 +1686,7 @@ class FeedForward(nn.Module):
             #     del gate
             #     result = self.w2(up)
             #     del up
-            micro = int(os.getenv("FFN_MICRO_B", "0") or 0)
+            micro = int(os.getenv("FFN_MICRO_B") )
             bsz   = int(x.size(0))
             result = (torch.empty(bsz, x.size(1), self.w2.out_features,
                                   dtype=x.dtype, device=dev)
@@ -1600,12 +1871,18 @@ class EncoderBlock(nn.Module):
                     streams.compute_mha.wait_event(wait_on)
 
                 attn_in = self.attention_norm(x)
-                attn_out = self.attention(attn_in, start_pos, freqs_complex)
+                # attn_out = self.attention(attn_in, start_pos, freqs_complex)
+                attn_out = self.attention.forward_with_microbatch(
+                    attn_in, start_pos, freqs_complex
+                )
             mha_eid, mha_evt = stream_mnt.record_event_on(streams.compute_mha, device=device)
         else:
             if wait_on is not None:
                 torch.cuda.current_stream().wait_event(wait_on)
-            attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
+            # attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
+            attn_out = self.attention.forward_with_microbatch(
+                self.attention_norm(x), start_pos, freqs_complex
+            )
             mha_eid, mha_evt = None, None
 
         # 残差（在 MHA 流完成后）
@@ -1649,18 +1926,23 @@ class EncoderBlock(nn.Module):
         del ffn_out
         out = h
 
-        # -------- 3) （可选）预取 L+1 的 KV 窗口 --------
+        # -------- 3) （可选）预取 L+1 的 KV --------
         try:
             offloader = getattr(self.attention, "offloader", None)
             kv_stream = getattr(streams, "kv_h2d", None)
             nxt = self.layer_id + 1
             if (offloader is not None) and (nxt < self.n_layer) and (kv_stream is not None):
-                window = int(getattr(offloader, "block_size", 256))
                 seqlen = int(x.size(1))
-                blocks = offloader.plan_tail_window_blocks(start_pos, seqlen, window_tokens=window)
-                if hasattr(offloader, "prefetch_blocks_async"):
-                    bsz = int(x.size(0))
-                    offloader.prefetch_blocks_async(nxt, blocks, bsz=bsz, stream=kv_stream)
+                is_decode = (seqlen == 1 and start_pos > 0)
+
+                if is_decode:
+                    # decode: 预取窗口
+                    window = int(getattr(offloader, "block_size", 256))
+                    blocks = offloader.plan_tail_window_blocks(start_pos, seqlen, window_tokens=window)
+                    if hasattr(offloader, "prefetch_blocks_async") and blocks:
+                        bsz = int(x.size(0))
+                        offloader.prefetch_blocks_async(nxt, blocks, bsz=bsz, stream=kv_stream)
+                # else:  prefill/chunk-prefill 不做 KV 预取，避免和 push/写盘的状态打架
         except Exception:
             pass
 
@@ -1721,13 +2003,19 @@ class EncoderBlock(nn.Module):
                 print(f"[Layer {self.layer_id}] MHA using stream: {streams.compute_mha}")
             with torch.cuda.stream(streams.compute_mha):
                 attn_in  = self.attention_norm(x)
-                attn_out = self.attention(attn_in, start_pos, freqs_complex)
+                # attn_out = self.attention(attn_in, start_pos, freqs_complex)
+                attn_out = self.attention.forward_with_microbatch(
+                    x=attn_in, start_pos=start_pos, freqs_complex=freqs_complex
+                )
             # 记录 MHA 完成事件
             mha_eid, mha_evt = stream_mnt.record_event_on(streams.compute_mha, device=device)
         else:
             if os.getenv("DEBUG_STREAM_USAGE", "0") == "1":
                 print(f"[Layer {self.layer_id}] MHA fallback to default stream (streams={streams})")
-            attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
+            # attn_out = self.attention(self.attention_norm(x), start_pos, freqs_complex)
+            attn_out = self.attention.forward_with_microbatch(
+                self.attention_norm(x), start_pos, freqs_complex
+            )
             mha_eid, mha_evt = None, None  # 无独立流则不产生命名事件
 
         # 残差最好也在 MHA 流完成后再落到默认流
@@ -1765,21 +2053,27 @@ class EncoderBlock(nn.Module):
         del ffn_out
         out = h  # 最终残差复用了 x 的存储
 
-        # -------- 3) （可选）在 FFN 期间预取 L+1、L+2 的 KV 窗口 --------
+        # -------- 3) （可选）在 FFN 期间预取 L+1、L+2 的 KV --------
         # 与 vLLM PagedAttention 思路一致：提前搬热点 KV 页到 HBM，减少解码步等待
         try:
             offloader = getattr(self.attention, "offloader", None)
             kv_stream = getattr(streams, "kv_h2d", None)
             if offloader is not None and kv_stream is not None:
-                for nxt in (self.layer_id + 1, self.layer_id + 2):
-                    if nxt >= self.n_layer:
-                        break
-                    window = int(getattr(offloader, "block_size", 256))
-                    seqlen = int(x.size(1))
-                    blocks = offloader.plan_tail_window_blocks(start_pos, seqlen, window_tokens=window)
-                    if hasattr(offloader, "prefetch_blocks_async"):
-                        bsz = int(x.size(0))
-                        offloader.prefetch_blocks_async(nxt, blocks, bsz=bsz, stream=kv_stream)
+                seqlen = int(x.size(1))
+                is_decode = (seqlen == 1 and start_pos > 0)
+
+                if is_decode:
+                    for nxt in (self.layer_id + 1, self.layer_id + 2):
+                        if nxt >= self.n_layer:
+                            break
+                        window = int(getattr(offloader, "block_size", 256))
+                        blocks = offloader.plan_tail_window_blocks(
+                            start_pos, seqlen, window_tokens=window
+                        )
+                        if hasattr(offloader, "prefetch_blocks_async") and blocks:
+                            bsz = int(x.size(0))
+                            offloader.prefetch_blocks_async(nxt, blocks, bsz=bsz, stream=kv_stream)
+                # else:  prefill/chunk-prefill 不做 KV 预取，避免和 push/写盘的状态打架
         except Exception:
             pass
 

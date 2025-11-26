@@ -33,112 +33,6 @@ except ImportError:
 # ================================
 
 class LLaMA:
-    # def __init__(self, tokenizer, checkpoint, args: ModelArgs):
-    #     """
-    #     Initialize model and (optionally) load checkpoint weights.
-    #     Model is first constructed on the device specified in `args.device` (may be 'cpu' or 'cuda:X').
-    #     """
-    #     self.tokenizer = tokenizer
-    #     self.args = args
-
-    #     # (Optional) Global tracker init (left commented — keep original code)
-    #     # from .global_state_tracker import init_global_tracker, get_global_tracker
-    #     # from .kv_offload import BLOCK
-    #     # if get_global_tracker() is None:
-    #     #     print(f"[INFO] Initializing global state tracker...")
-    #     #     n_blocks = (args.max_seq_len + BLOCK - 1) // BLOCK
-    #     #     tracker = init_global_tracker(
-    #     #         max_batch=args.max_batch_size,
-    #     #         layers=args.n_layers,
-    #     #         n_blocks=n_blocks
-    #     #     )
-    #     #     print(f"[INFO] Global state tracker initialized, waiting for actual batch registration")
-
-    #     # print(f"[INFO] Initializing model on device: {args.device}")
-    #     # self.model = Transformer(args)
-
-    #     # print(f"[INFO] Moving model to {args.device}...")
-    #     # self.model = self.model.to(args.device)
-        
-    #     use_meta_init = (
-    #     getattr(args, "param_init_device", None) == "meta"
-    #         or getattr(args, "init_on_meta", False)
-    #         or str(getattr(args, "device", "")) == "meta"
-    #     )
-    #     if use_meta_init:
-    #         meta_args = copy.copy(args)
-    #         # 避免在构造期把 freqs_complex 等建在真实设备
-    #         meta_args.device = "meta"
-    #         print("[INFO] Initializing model skeleton on device: meta")
-    #         with torch.device("meta"):
-    #             self.model = Transformer(meta_args)
-    #     else:
-    #         print(f"[INFO] Initializing model on device: {args.device}")
-    #         self.model = Transformer(args)
-    #         print(f"[INFO] Moving model to {args.device}...")
-    #         self.model = self.model.to(args.device)
-
-    #     # print(f"[INFO] Converting to half precision...")
-    #     # self.model = self.model.half()
-
-    #     import re
-    #     def _remap_ckpt_keys(sd):
-    #         out = {}
-    #         for k, v in sd.items():
-    #             nk = k
-    #             nk = re.sub(r"^layers\.(\d+)\.input_layernorm\.(weight|bias)$",
-    #                         r"layers.\1.attn_norm.\2", nk)
-    #             nk = re.sub(r"^layers\.(\d+)\.post_attention_layernorm\.(weight|bias)$",
-    #                         r"layers.\1.ffn_norm.\2", nk)
-    #             nk = nk.replace("model.embed_tokens.", "embed_tokens.")
-    #             nk = nk.replace("model.norm.", "norm.")
-    #             out[nk] = v
-    #         return out
-
-
-    #     if checkpoint is not None:
-    #         checkpoint = _remap_ckpt_keys(checkpoint)
-    #         print(f"[INFO] Loading state dict...")
-
-    #         has_meta = False
-    #         try:
-    #             has_meta = any(getattr(p, "is_meta", False) or (p.device.type == "meta")
-    #                            for p in self.model.parameters())
-    #         except Exception:
-    #             pass
-
-    #         if has_meta:
-    #             try:
-    #                 self.model = self.model.to_empty("cpu")
-    #             except Exception as e:
-    #                 print(f"[WARN] to_empty('cpu') failed on meta model: {e}")
-
-    #         # 重要：assign=True 避免"copy 到 meta 是 no-op"的警告
-    #         missing_keys, unexpected_keys = self.model.load_state_dict(
-    #             checkpoint, strict=False, assign=has_meta
-    #         )
-
-    #         if missing_keys:
-    #             print(f"[WARNING] Missing keys: {len(missing_keys)} keys")
-    #         if unexpected_keys:
-    #             print(f"[WARNING] Unexpected keys: {len(unexpected_keys)} keys")
-    #         print(f"[INFO] Model weights loaded successfully")
-            
-    #     for name, p in self.model.named_parameters():
-    #         if getattr(p, "is_meta", False):
-    #             if name.endswith("norm.weight"):
-    #                 p.data = torch.ones(p.shape, dtype=p.dtype, device="cpu")
-    #             elif name.endswith("bias"):
-    #                 p.data = torch.zeros(p.shape, dtype=p.dtype, device="cpu")
-    #             else:
-    #                 buf = torch.empty(p.shape, dtype=p.dtype, device="cpu")
-    #                 nn.init.normal_(buf, mean=0.0, std=0.02)
-    #                 p.data = buf
-
-    #     for name, b in self.model.named_buffers():
-    #         if getattr(b, "is_meta", False):
-    #             b.data = torch.zeros(b.shape, dtype=b.dtype, device="cpu")
-    
     
     def __init__(self, tokenizer, checkpoint, args: ModelArgs):
         """
@@ -1043,9 +937,11 @@ class LLaMA:
                         if tchunk and prefill_len > tchunk:
                             for s in range(0, prefill_len, tchunk):
                                 e = min(prefill_len, s + tchunk)
-                                _ = self.model(tokens[:, s:e], start_pos=s)
+                                # ⭐ 关键改动：只建 KV，不要 logits
+                                _ = self.model(tokens[:, s:e], start_pos=s, return_logits=False)
                         else:
-                            _ = self.model(tokens[:, :prefill_len], start_pos=0)
+                            # ⭐ 关键改动：只建 KV，不要 logits
+                            _ = self.model(tokens[:, :prefill_len], start_pos=0, return_logits=False)
                 except torch.cuda.OutOfMemoryError as e:
                     print(f"❌ CUDA OOM during prefill of batch {batch_idx + 1}: {e}")
                     torch.cuda.empty_cache()
@@ -1077,10 +973,11 @@ class LLaMA:
                     if hasattr(wsm, 'enter_decode_mode'):
                         import os
                         # WSM_DECODER_PROTECT_LAYERS: 保护前 N 层不被驱逐（默认 6 层）
-                        protect = int(os.getenv("WSM_DECODER_PROTECT_LAYERS", "40"))
+                        protect = int(os.getenv("WSM_DECODER_PROTECT_LAYERS", "6"))
                         # WSM_PRIME_WINDOW: 预热窗口大小（默认 6 层）
                         prime_w = int(os.getenv("WSM_PRIME_WINDOW", "6"))
-                        wsm.enter_decode_mode(first_layer=0, protect_layers=protect, prime_window=prime_w)
+                        # wsm.enter_decode_mode(first_layer=0, protect_layers=protect, prime_window=prime_w)
+                        wsm.enter_decode_mode(protect_layers=protect, prime_window=prime_w)
                         self._prime_kv_for_first_decode_step(prefill_len=prefill_len, bsz=int(tokens.size(0)))
                         # ⭐ 解码前的"首层屏障"：显式确保 L0 事件已就绪
                         # 这能把"偶发行程波动"变成确定性等待
